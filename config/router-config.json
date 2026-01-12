@@ -1,0 +1,46 @@
+{
+  "routingDefaults": {
+    "bicycle": {
+      "speed": 5.0,
+      "reluctance": 1.0,
+      "boardCost": 0
+    },
+    "transfer": {
+      "cost": 0,
+      "slack": 600,
+      "maxTransfers": 5
+    },
+    "accessEgress": {
+      "maxDurationForMode": {
+        "BIKE": "90m"
+      },
+      "maxStopCount": 10000
+    },
+    "itineraryFilters": {
+      "transitGeneralizedCostLimit": "180m + 5.0 x",
+      "filterItinerariesWithSameFirstOrLastTrip": false
+    },
+    "streetRoutingTimeout": "300s"
+  },
+  "updaters": [
+    {
+      "type": "stop-time-updater",
+      "frequency": "10s",
+      "url": "https://svc.metrotransit.org/mtgtfs/tripupdates.pb",
+      "feedId": "1",
+      "fuzzyTripMatching": true
+    },
+    {
+      "type": "vehicle-positions",
+      "frequency": "10s",
+      "url": "https://svc.metrotransit.org/mtgtfs/vehiclepositions.pb",
+      "feedId": "1"
+    },
+    {
+      "type": "real-time-alerts",
+      "frequency": "30s",
+      "url": "https://svc.metrotransit.org/mtgtfs/alerts.pb",
+      "feedId": "1"
+    }
+  ]
+}

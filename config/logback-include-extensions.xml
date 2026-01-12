@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<included>
+  <!-- Enable debug logging for street routing and bicycle-specific issues -->
+
+  <!-- Vertex linking - shows if origins/destinations can connect to bicycle streets -->
+  <logger name="org.opentripplanner.routing.linking.VertexLinker" level="debug"/>
+
+  <!-- Street edge traversal - shows which streets can be traversed by bicycle -->
+  <logger name="org.opentripplanner.street.model.edge.StreetEdge" level="debug"/>
+
+  <!-- OSM tag mapping - shows bicycle permissions during graph build -->
+  <logger name="org.opentripplanner.osm.tagmapping" level="debug"/>
+
+  <!-- Street search and routing -->
+  <logger name="org.opentripplanner.street.search" level="debug"/>
+
+  <!-- A* algorithm for street routing -->
+  <logger name="org.opentripplanner.astar" level="info"/>
+
+  <!-- Default routing service - shows request/response -->
+  <logger name="org.opentripplanner.routing.service.DefaultRoutingService" level="debug"/>
+
+  <!-- Graph path finder -->
+  <logger name="org.opentripplanner.routing.impl.GraphPathFinder" level="debug"/>
+
+  <!-- Transit data provider filter - shows bikes_allowed filtering -->
+  <logger name="org.opentripplanner.routing.algorithm.raptoradapter.transit.request.DefaultTransitDataProviderFilter" level="debug"/>
+
+  <!-- Transit request mapping -->
+  <logger name="org.opentripplanner.routing.algorithm.raptoradapter.transit" level="debug"/>
+</included>

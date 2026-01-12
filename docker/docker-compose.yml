@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  # OpenTripPlanner service
+  otp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: otp-minneapolis
+    ports:
+      - "8090:8080"
+    volumes:
+      # Mount data directory (read-only for graph/GTFS/OSM)
+      - ../data:/var/opentripplanner:ro
+      # Mount config directory (read-only)
+      - ../config:/etc/otp:ro
+    environment:
+      # Override Java memory settings if needed
+      - JAVA_OPTS=-Xmx2G
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/otp/routers/default"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - otp-network
+
+  # Optional: Caddy reverse proxy with automatic HTTPS
+  caddy:
+    image: caddy:2-alpine
+    container_name: otp-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - otp
+    restart: unless-stopped
+    networks:
+      - otp-network
+    # Uncomment to enable Caddy
+    # profiles:
+    #   - with-ssl
+
+networks:
+  otp-network:
+    driver: bridge
+
+volumes:
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local

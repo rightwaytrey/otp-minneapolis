@@ -1,0 +1,40 @@
+# Data files (downloaded at deploy time)
+data/*.zip
+data/*.pbf
+data/*.obj
+data/graph.obj
+
+# Build artifacts
+*.jar
+target/
+build/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.iws
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Node modules (if building client)
+node_modules/
+
+# Temp files
+*.tmp
+*.swp
+*~
+
+# Keep data directory structure
+!data/.gitkeep
+!data/README.md

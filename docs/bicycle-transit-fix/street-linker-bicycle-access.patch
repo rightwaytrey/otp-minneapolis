@@ -1,0 +1,35 @@
+diff --git a/application/src/main/java/org/opentripplanner/graph_builder/module/StreetLinkerModule.java b/application/src/main/java/org/opentripplanner/graph_builder/module/StreetLinkerModule.java
+index 2e1251f528..109d14057e 100644
+--- a/application/src/main/java/org/opentripplanner/graph_builder/module/StreetLinkerModule.java
++++ b/application/src/main/java/org/opentripplanner/graph_builder/module/StreetLinkerModule.java
+@@ -50,6 +50,10 @@ public class StreetLinkerModule implements GraphBuilderModule {
+   private static final Logger LOG = LoggerFactory.getLogger(StreetLinkerModule.class);
+   private static final TraverseModeSet CAR_ONLY = new TraverseModeSet(TraverseMode.CAR);
+   private static final TraverseModeSet WALK_ONLY = new TraverseModeSet(TraverseMode.WALK);
++  private static final TraverseModeSet WALK_AND_BICYCLE = new TraverseModeSet(
++    TraverseMode.WALK,
++    TraverseMode.BICYCLE
++  );
+   private final Graph graph;
+   private final VehicleParkingRepository parkingRepository;
+   private final TimetableRepository timetableRepository;
+@@ -154,14 +158,15 @@ public class StreetLinkerModule implements GraphBuilderModule {
+   /**
+    * Link a stop to the nearest "relevant" edges.
+    * <p>
+-   * These are mostly walk edges but if a stop is used by a flex pattern it also needs to be
+-   * car-accessible. Therefore, flex stops are ensured to be connected to the car-accessible
+-   * edge. This may lead to several links being created.
++   * Stops are linked with both walk and bicycle modes to allow bicycle+transit trips to access
++   * stops. If a stop is used by a flex pattern it also needs to be car-accessible. Therefore,
++   * flex stops are ensured to be connected to the car-accessible edge. This may lead to several
++   * links being created.
+    */
+   private void linkStopToStreetNetwork(TransitStopVertex tStop, StopLinkType linkType) {
+     vertexLinker.linkVertexPermanently(
+       tStop,
+-      WALK_ONLY,
++      WALK_AND_BICYCLE,
+       LinkingDirection.BIDIRECTIONAL,
+       (transitVertex, streetVertex) -> {
+         var linkEdges = createStopLinkEdges((TransitStopVertex) transitVertex, streetVertex);

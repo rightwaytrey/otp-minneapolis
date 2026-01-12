@@ -1,0 +1,49 @@
+# Caddyfile for OTP Minneapolis
+# Replace 'otp.example.com' with your actual domain
+
+# Automatic HTTPS with Let's Encrypt
+{$OTP_DOMAIN:otp.example.com} {
+    # Reverse proxy to OTP container
+    reverse_proxy otp:8080
+
+    # Logging
+    log {
+        output file /data/logs/otp.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        format json
+    }
+
+    # Security headers
+    header {
+        # Enable HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        # Prevent clickjacking
+        X-Frame-Options "SAMEORIGIN"
+        # Prevent MIME sniffing
+        X-Content-Type-Options "nosniff"
+        # XSS Protection
+        X-XSS-Protection "1; mode=block"
+        # Referrer policy
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+
+    # Enable gzip compression
+    encode gzip
+
+    # CORS headers (if needed for external clients)
+    @cors {
+        path /otp/*
+    }
+    header @cors {
+        Access-Control-Allow-Origin "*"
+        Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        Access-Control-Allow-Headers "Content-Type, Authorization"
+    }
+}
+
+# Redirect www to non-www (optional)
+www.{$OTP_DOMAIN:otp.example.com} {
+    redir https://{$OTP_DOMAIN:otp.example.com}{uri} permanent
+}
