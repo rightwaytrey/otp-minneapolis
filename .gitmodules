@@ -1,0 +1,4 @@
+[submodule "OpentripPlanner"]
+	path = OpentripPlanner
+	url = https://github.com/rightwaytrey/OpenTripPlanner.git
+	branch = dev-2.x
