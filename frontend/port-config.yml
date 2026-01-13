@@ -238,7 +238,7 @@ geocoder:
 # Use this mode config for the enhanced Transit+ config
 modes:
   ### Optional number of itineraries to return by default - Defaults to 3.
-  # numItineraries: 3
+  numItineraries: 10
   # Definition for the mode buttons to display in trip form
   modeButtons:
     - iconName: bus
@@ -404,7 +404,7 @@ itinerary:
   # Whether to merge groups of itineraries with the same primary mode (Bike, Walk, etc)
   groupTransitModes: true
   # Whether to merge itineraries with the same origin, destination, and transit modes
-  mergeItineraries: true
+  mergeItineraries: false
   # Whether to show the first itinerary on the map. If this is set to false, routes
   # will only show on the map on hover or click
   showFirstResultByDefault: false

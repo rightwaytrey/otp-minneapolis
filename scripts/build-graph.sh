@@ -14,6 +14,22 @@ echo "OTP Graph Build"
 echo "======================================"
 echo ""
 
+# Sync config files to data directory
+echo "Syncing config files..."
+CONFIG_DIR="$REPO_ROOT/config"
+if [ -d "$CONFIG_DIR" ]; then
+    cp "$CONFIG_DIR/"*.json "$DATA_DIR/" 2>/dev/null || true
+    echo "✓ Config files synced to data directory"
+else
+    echo "Warning: No config directory found at $CONFIG_DIR"
+fi
+
+# Validate build-config exists
+if [ ! -f "$DATA_DIR/build-config.json" ]; then
+    echo "Warning: No build-config.json found. Graph may not have bike+transit support."
+fi
+echo ""
+
 # Check if data files exist
 if [ ! -f "$DATA_DIR/gtfs.zip" ]; then
     echo "Error: GTFS data not found at $DATA_DIR/gtfs.zip"

@@ -41,6 +41,12 @@ done
 # Set data directory (default: ./data, override with first non-flag argument)
 DATA_DIR="${FILTERED_ARGS[0]:-$REPO_ROOT/data}"
 
+# Sync config files to data directory
+CONFIG_DIR="$REPO_ROOT/config"
+if [ -d "$CONFIG_DIR" ]; then
+    cp "$CONFIG_DIR/"*.json "$DATA_DIR/" 2>/dev/null || true
+fi
+
 echo "======================================"
 echo "Starting OpenTripPlanner..."
 echo "Using JAR: $JAR"
