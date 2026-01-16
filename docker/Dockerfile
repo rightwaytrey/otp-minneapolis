@@ -6,6 +6,11 @@ FROM eclipse-temurin:21-jdk AS builder
 
 WORKDIR /build
 
+# Install Maven
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends maven && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy OTP source code
 COPY OpentripPlanner .
 

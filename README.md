@@ -2,6 +2,27 @@
 
 OpenTripPlanner deployment configured for Minneapolis-St. Paul Metro Transit with bicycle+transit routing enhancements.
 
+## Project Structure
+
+This is the **primary authoritative project** for OTP Minneapolis deployment. The project structure is:
+
+```
+/home/rwt/projects/
+├── otp-minneapolis/           # PRIMARY - Full deployment project (this repo)
+│   ├── OpentripPlanner/       # OTP backend source (git submodule)
+│   ├── config/                # OTP configs (build-config.json, router-config.json)
+│   ├── data/                  # GTFS, OSM, graph.obj
+│   ├── scripts/               # Build, run, update scripts
+│   └── frontend/              # Frontend config (port-config.yml)
+│
+├── otprr/                     # FRONTEND - otp-react-redux UI
+│   └── otp-react-redux/       # React frontend app
+│
+└── _archived/                 # ARCHIVED - Old redundant copies
+```
+
+**Note**: The old `opentripplanner/` directory has been archived. All OTP source code, scripts, and configurations should now be managed through this `otp-minneapolis/` repository.
+
 ## Features
 
 - **Bicycle+Transit Fix**: Enhanced routing that allows bicycles to access transit stops via pedestrian infrastructure
@@ -83,13 +104,56 @@ This deployment includes a critical fix that enables bicycle+transit routing to 
 
 ## Docker Deployment
 
+### Quick Start
+
 ```bash
 # Build and run with Docker Compose
-docker-compose -f docker/docker-compose.yml up -d
+cd docker
+docker-compose up -d
+
+# Check status
+docker-compose ps
+
+# View logs
+docker-compose logs -f
 
 # With SSL proxy (Caddy)
-OTP_DOMAIN=otp.example.com docker-compose -f docker/docker-compose.yml --profile with-ssl up -d
+OTP_DOMAIN=otp.example.com docker-compose --profile with-ssl up -d
 ```
+
+### Services
+
+The Docker deployment includes:
+- **OTP Backend**: Port 8090 (mapped to host)
+- **Frontend**: Port 9967 (mapped to host)
+- **Caddy** (optional): HTTPS reverse proxy with automatic SSL
+
+### Nginx Reverse Proxy (Recommended for Production)
+
+For production deployments, use nginx as a reverse proxy with SSL:
+
+1. Copy nginx configuration:
+```bash
+sudo cp config/nginx/otp.conf /etc/nginx/sites-available/otp
+sudo ln -s /etc/nginx/sites-available/otp /etc/nginx/sites-enabled/
+```
+
+2. Update server name and SSL certificate paths in the config
+
+3. Test and reload:
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+The nginx config includes:
+- SSL/TLS termination with HTTP/2
+- Proxy to OTP backend (port 8090) at `/otp`
+- Proxy to frontend (port 9967) at `/`
+- **Geocoder CORS proxy** at `/photon/api` - proxies to photon.komoot.io with CORS headers to avoid browser blocking
+- WebSocket support for frontend hot reload
+
+See `config/nginx/otp.conf` for the complete configuration.
 
 ## Data Sources
 
@@ -104,22 +168,66 @@ OTP_DOMAIN=otp.example.com docker-compose -f docker/docker-compose.yml --profile
 
 ## Frontend Setup
 
-The frontend configuration is in `frontend/port-config.yml`:
+### Integrated Startup (Recommended)
 
-1. Clone otp-react-redux:
+The easiest way to run both backend and frontend together:
+
+```bash
+# Start both OTP backend and frontend in one command
+./scripts/run.sh --with-frontend
+
+# The script will:
+# - Start OTP on port 8090
+# - Start frontend on port 9967 (from ../otprr/otp-react-redux)
+# - Kill frontend when OTP is stopped
+```
+
+Access points:
+- **OTP Backend**: http://localhost:8090
+- **Frontend**: http://localhost:9967
+- **Nginx Proxy** (if configured): https://tre.hopto.org:9966
+
+### Frontend Configuration (`frontend/port-config.yml`)
+
+The frontend is configured to work with the nginx proxy for production deployments:
+
+- **OTP API**: Routes through nginx at `/otp` (port 9966)
+- **Geocoder**: Uses PHOTON via nginx CORS proxy at `/photon/api`
+  - Configured with `baseUrl: https://tre.hopto.org:9966/photon`
+  - PhotonGeocoder automatically appends `/api`, making requests to `/photon/api`
+  - Nginx proxies to photon.komoot.io and adds CORS headers
+- **Search bounds**: Minneapolis-St. Paul metro area (44.85-45.05 lat, -93.35 to -93.0 lon)
+
+This configuration avoids CORS blocking issues when accessing the geocoder from mobile browsers.
+
+### Manual Frontend Setup
+
+If you prefer to run the frontend separately:
+
+1. Clone otp-react-redux (if not already in ../otprr/):
 ```bash
 cd ..
+mkdir -p otprr
+cd otprr
 git clone https://github.com/opentripplanner/otp-react-redux.git
 cd otp-react-redux
 ```
 
 2. Copy config and start:
 ```bash
-cp ../otp-minneapolis/frontend/port-config.yml ./
+cp ../../otp-minneapolis/frontend/port-config.yml ./
 YAML_CONFIG=port-config.yml yarn start
 ```
 
 Frontend will be at `http://localhost:9967`
+
+### Custom Frontend Location
+
+If your frontend is at a different location, set the `OTPRR_DIR` environment variable:
+
+```bash
+OTPRR_DIR=/path/to/otp-react-redux ./scripts/run.sh --with-frontend
+```
 
 ## Configuration
 

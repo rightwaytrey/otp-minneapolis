@@ -11,7 +11,7 @@ api:
   host: https://tre.hopto.org
   # Path will be deprecated once the REST API is deprecated, which will be soon.
   # If the OTP server is hosted at /otp, then no path needs to be configured
-  path: /otp/routers/default
+  # path: /otp/routers/default  # Not used in OTP 2.x
   # If your OTP server is at a path other than "/otp" (usually due to a proxy)
   # Then you can set the OPTIONAL property basePath. The default is "/otp"
   basePath: /otp
@@ -188,28 +188,22 @@ map:
 # Until you have deployed or subscribed to a geocoder service, a short-term temporary
 # geocoder test account can be obtained from the Pelias maintainers at geocode.earth.
 geocoder:
-  apiKey: PELIAS_API_KEY
-  # Pass an array of geocoder result types to control the order in which they are displayed.
-  # The default order is ['STATIONS', 'STOPS', 'OTHER'].
-  geocoderResultsOrder: ['STATIONS', 'STOPS', 'OTHER']
   boundary:
     rect:
-      minLon: -93.8
-      maxLon: -92.8
-      minLat: 44.7
-      maxLat: 45.2
+      minLon: -93.35
+      maxLon: -93.0
+      minLat: 44.85
+      maxLat: 45.05
   focusPoint:
     lat: 44.98
     lon: -93.27
-  # Custom fetch options to pass to geocoder resource.
-  # options:
-  #   headers:
-  #     x-custom-header: abc123
   # required geocoder type.
-  type: PELIAS
-  # This base URL is required as the libraries will default to using now-defunct
-  # mapzen urls
-  baseUrl: https://geocoder.example.com/pelias/v1
+  type: PHOTON
+  # PHOTON base URL (proxied through nginx to avoid CORS issues)
+  # Note: PhotonGeocoder automatically appends "/api" to this URL
+  baseUrl: https://tre.hopto.org:9966/photon
+  # Override the default number (3) of suggestions returned per category
+  resultsCount: 5
   # This allows the location field dropdown headers to be colored based on Pelias layer
   #resultsColors:
   #  stops: "#007fae"
@@ -340,16 +334,15 @@ modes:
 itinerary:
   # Provides an array of valid mode combinations that returned itineraries will be filtered against
   # If left blank, all itineraries deemed valid by OTP will be returned
-  validModeCombinations: [ 
-    ['WALK'],
-    ['WALK', 'PERSONAL'],
-    ['WALK', 'TRANSIT', 'SHARED'],
-    ['WALK', 'SHARED'],
-    ['WALK', 'TRANSIT'],
-    ['WALK', 'TRANSIT', 'PERSONAL'],
-    ['WALK', 'TRANSIT', 'CAR'],
-    ['CAR'] 
-  ]
+  validModeCombinations:
+    - ['WALK']
+    - ['WALK', 'PERSONAL']
+    - ['WALK', 'TRANSIT', 'SHARED']
+    - ['WALK', 'SHARED']
+    - ['WALK', 'TRANSIT']
+    - ['WALK', 'TRANSIT', 'PERSONAL']
+    - ['WALK', 'TRANSIT', 'CAR']
+    - ['CAR']
   # Show fares for each transit leg (false if omitted).
   # (Requires using LineItinerary.)
   showRouteFares: false

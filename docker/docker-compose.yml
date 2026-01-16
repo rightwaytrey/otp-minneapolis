@@ -19,11 +19,32 @@ services:
       - JAVA_OPTS=-Xmx2G
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/otp/routers/default"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/otp/"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
+    networks:
+      - otp-network
+
+  # Frontend (otp-react-redux)
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: otp-frontend
+    ports:
+      - "9967:9967"
+    volumes:
+      # Mount frontend config
+      - ../frontend/port-config.yml:/app/port-config.yml:ro
+    environment:
+      - YAML_CONFIG=/app/port-config.yml
+      - NODE_ENV=development
+    depends_on:
+      otp:
+        condition: service_healthy
+    restart: unless-stopped
     networks:
       - otp-network
 
@@ -45,8 +66,8 @@ services:
     networks:
       - otp-network
     # Uncomment to enable Caddy
-    # profiles:
-    #   - with-ssl
+    profiles:
+      - with-ssl
 
 networks:
   otp-network:
