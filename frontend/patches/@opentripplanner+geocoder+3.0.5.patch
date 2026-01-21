@@ -1,0 +1,32 @@
+diff --git a/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js b/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js
+index 9471e10..4af4f14 100644
+--- a/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js
++++ b/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js
+@@ -32,11 +32,25 @@ Object.defineProperty(exports, "__esModule", { value: true });
+ var abstract_geocoder_1 = __importDefault(require("./abstract-geocoder"));
+ var generateLabel = function (properties) {
+     var propertyList = [];
++    // Combine housenumber with street for better address formatting
++    var housenumber = properties.housenumber ? "".concat(properties.housenumber) : "";
++    var street = properties.street ? "".concat(properties.street) : "";
++    var streetAddress = "";
++    if (housenumber && street) {
++        streetAddress = "".concat(housenumber, " ").concat(street);
++    }
++    else if (street) {
++        streetAddress = street;
++    }
++    else if (housenumber) {
++        streetAddress = housenumber;
++    }
++    var modifiedProperties = __assign(__assign({}, properties), { street: streetAddress });
+     ["name", "street", "district", "state", "postcode", "city", "country"].forEach(function (propertyName) {
+-        if (typeof properties[propertyName] === "undefined") {
++        if (typeof modifiedProperties[propertyName] === "undefined") {
+             return;
+         }
+-        var value = "".concat(properties[propertyName]);
++        var value = "".concat(modifiedProperties[propertyName]);
+         if (value.length > 0) {
+             propertyList.push(value);
+         }

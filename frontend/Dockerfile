@@ -12,6 +12,10 @@ RUN git clone https://github.com/rightwaytrey/otp-react-redux.git .
 # Install dependencies
 RUN yarn install
 
+# Copy patches and apply them
+COPY patches /app/patches
+RUN npx patch-package
+
 # Copy the custom configuration
 COPY port-config.yml /app/port-config.yml
 

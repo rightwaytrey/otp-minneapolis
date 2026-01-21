@@ -28,17 +28,48 @@ api:
 #   key: BUGSNAG_KEY
 
 # Add suggested locations to be shown as options in the form view.
+# Suggested locations for Minneapolis area
 # locations:
-#   - id: 'airport'
+#   - id: 'msp-airport'
 #     icon: 'plane'
-#     name: 'Portland International Airport (PDX)'
-#     lat: 45.587579
-#     lon: -122.593084
-#   - id: 'zoo'
-#     icon: building
-#     lat: 45.51010444232195
-#     lon: -122.71607145667079
-#     name: Oregon Zoo, Portland, OR
+#     name: 'Minneapolis-St. Paul International Airport (MSP)'
+#     lat: 44.8848
+#     lon: -93.2223
+#   - id: 'us-bank-stadium'
+#     icon: 'building'
+#     name: 'US Bank Stadium'
+#     lat: 44.9738
+#     lon: -93.2575
+#   - id: 'target-center'
+#     icon: 'building'
+#     name: 'Target Center'
+#     lat: 44.9795
+#     lon: -93.2761
+#   - id: 'mall-of-america'
+#     icon: 'building'
+#     name: 'Mall of America'
+#     lat: 44.8549
+#     lon: -93.2422
+#   - id: 'minneapolis-city-hall'
+#     icon: 'building'
+#     name: 'Minneapolis City Hall'
+#     lat: 44.9773
+#     lon: -93.2655
+#   - id: 'umn-campus'
+#     icon: 'graduation-cap'
+#     name: 'University of Minnesota - Minneapolis'
+#     lat: 44.9740
+#     lon: -93.2277
+#   - id: 'target-field'
+#     icon: 'building'
+#     name: 'Target Field'
+#     lat: 44.9817
+#     lon: -93.2776
+#   - id: 'st-paul-union-depot'
+#     icon: 'train'
+#     name: 'St. Paul Union Depot'
+#     lat: 44.9469
+#     lon: -93.0862
 
 ### Define the strategies for how to handle auto-planning of a new trip when
 ### different query parameters are changes in the form. The default config is
@@ -122,6 +153,7 @@ dateTime:
 map:
   initLat: 44.98
   initLon: -93.27
+  initZoom: 12
   # autoFlyOnTripFormUpdate: false
   # navigationControlPosition: "bottom-right"
 
@@ -190,10 +222,10 @@ map:
 geocoder:
   boundary:
     rect:
-      minLon: -93.35
-      maxLon: -93.0
-      minLat: 44.85
-      maxLat: 45.05
+      minLon: -93.5
+      maxLon: -92.9
+      minLat: 44.75
+      maxLat: 45.2
   focusPoint:
     lat: 44.98
     lon: -93.27
