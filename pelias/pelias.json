@@ -1,0 +1,34 @@
+{
+  "logger": { "level": "info" },
+  "esclient": {
+    "hosts": [{ "host": "elasticsearch" }]
+  },
+  "elasticsearch": {
+    "settings": {
+      "index": {
+        "number_of_replicas": "0",
+        "number_of_shards": "1"
+      }
+    }
+  },
+  "acceptance-tests": { "endpoints": { "local": "http://api:4000/v1/" } },
+  "api": { "host": "api", "textAnalyzer": "libpostal" },
+  "imports": {
+    "adminLookup": { "enabled": true },
+    "openstreetmap": {
+      "download": [
+        { "sourceURL": "https://download.geofabrik.de/north-america/us/minnesota-latest.osm.pbf" }
+      ],
+      "leveldbpath": "/tmp",
+      "import": [{ "filename": "minnesota-latest.osm.pbf" }]
+    },
+    "openaddresses": {
+      "files": ["us/mn/statewide.csv"]
+    },
+    "whosonfirst": {
+      "datapath": "/data/whosonfirst",
+      "importPostalcodes": true,
+      "importPlace": ["85688727"]
+    }
+  }
+}

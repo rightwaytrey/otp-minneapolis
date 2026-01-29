@@ -1,0 +1,112 @@
+version: '3.8'
+
+services:
+  libpostal:
+    image: pelias/libpostal-service
+    container_name: pelias-libpostal
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  schema:
+    image: pelias/schema:master
+    container_name: pelias-schema
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  api:
+    image: pelias/api:master
+    container_name: pelias-api
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+    depends_on:
+      - libpostal
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  elasticsearch:
+    image: pelias/elasticsearch:7.16.1
+    container_name: pelias-elasticsearch
+    restart: unless-stopped
+    ports:
+      - "9200:9200"
+    volumes:
+      - ${DATA_DIR}/elasticsearch:/usr/share/elasticsearch/data
+    environment:
+      - ES_JAVA_OPTS=-Xms2g -Xmx3g
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    cap_add: [IPC_LOCK]
+    deploy:
+      resources:
+        limits:
+          memory: 5G
+        reservations:
+          memory: 3G
+
+  placeholder:
+    image: pelias/placeholder:master
+    container_name: pelias-placeholder
+    restart: unless-stopped
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+      - ${DATA_DIR}:/data:ro
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  whosonfirst:
+    image: pelias/whosonfirst:master
+    container_name: pelias-whosonfirst
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+      - ${DATA_DIR}:/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  openstreetmap:
+    image: pelias/openstreetmap:master
+    container_name: pelias-openstreetmap
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+      - ${DATA_DIR}:/data
+      - ${DATA_DIR}:/mnt/pelias
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  openaddresses:
+    image: pelias/openaddresses:master
+    container_name: pelias-openaddresses
+    volumes:
+      - ./pelias.json:/code/pelias.json:ro
+      - ${DATA_DIR}:/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+

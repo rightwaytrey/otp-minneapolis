@@ -12,7 +12,9 @@ cd "$REPO_ROOT"
 # Configuration
 OTP_PORT="${OTP_PORT:-8090}"
 FRONTEND_PORT=9967
+NOMINATIM_PROXY_PORT=8001
 DATA_DIR="${DATA_DIR:-$REPO_ROOT/data}"
+BACKEND_DIR="$REPO_ROOT/backend"
 # Frontend can be in several locations - check in order:
 # 1. OTPRR_DIR environment variable
 # 2. ../otprr/otp-react-redux (user's fork)
@@ -70,12 +72,13 @@ echo "Starting OTP Minneapolis"
 echo "======================================"
 echo "Backend JAR:  $JAR"
 echo "Data dir:     $DATA_DIR"
+echo "Backend dir:  $BACKEND_DIR"
 echo "Frontend dir: $FRONTEND_DIR"
 echo "Config file:  $FRONTEND_CONFIG"
 echo "======================================"
 echo ""
 
-# Cleanup function to stop both services
+# Cleanup function to stop all services
 cleanup() {
     echo ""
     echo -e "${YELLOW}Stopping services...${NC}"
@@ -83,6 +86,11 @@ cleanup() {
         echo "Stopping OTP backend (PID: $OTP_PID)..."
         kill $OTP_PID 2>/dev/null
         wait $OTP_PID 2>/dev/null
+    fi
+    if [ ! -z "$NOMINATIM_PID" ] && kill -0 $NOMINATIM_PID 2>/dev/null; then
+        echo "Stopping Nominatim proxy (PID: $NOMINATIM_PID)..."
+        kill $NOMINATIM_PID 2>/dev/null
+        wait $NOMINATIM_PID 2>/dev/null
     fi
     if [ ! -z "$FRONTEND_PID" ] && kill -0 $FRONTEND_PID 2>/dev/null; then
         echo "Stopping frontend (PID: $FRONTEND_PID)..."
@@ -96,7 +104,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 # Start OTP backend in background
-echo -e "${YELLOW}[1/3] Starting OTP backend...${NC}"
+echo -e "${YELLOW}[1/4] Starting OTP backend...${NC}"
 java ${JAVA_OPTS:--Xmx2G} -jar "$JAR" --load "$DATA_DIR" --port "$OTP_PORT" > /tmp/otp-backend.log 2>&1 &
 OTP_PID=$!
 
@@ -105,7 +113,7 @@ echo "Logs: /tmp/otp-backend.log"
 echo ""
 
 # Wait for OTP to be ready (health check)
-echo -e "${YELLOW}[2/3] Waiting for OTP to load graph (~30 seconds)...${NC}"
+echo -e "${YELLOW}[2/4] Waiting for OTP to load graph (~30 seconds)...${NC}"
 MAX_ATTEMPTS=60
 ATTEMPT=0
 HEALTH_URL="http://localhost:$OTP_PORT/otp"
@@ -131,8 +139,53 @@ fi
 
 echo ""
 
+# Start Nominatim proxy
+echo -e "${YELLOW}[3/4] Starting Nominatim geocoding proxy...${NC}"
+
+# Check if backend directory and requirements exist
+if [ ! -d "$BACKEND_DIR" ]; then
+    echo -e "${RED}Error: Backend directory not found at $BACKEND_DIR${NC}"
+    kill $OTP_PID 2>/dev/null
+    exit 1
+fi
+
+# Setup virtual environment if needed
+if [ ! -d "$BACKEND_DIR/venv" ]; then
+    echo "Creating Python virtual environment..."
+    python3 -m venv "$BACKEND_DIR/venv"
+fi
+
+# Activate venv and install dependencies
+source "$BACKEND_DIR/venv/bin/activate"
+if [ -f "$BACKEND_DIR/requirements.txt" ]; then
+    echo "Installing Python dependencies..."
+    pip install -q --upgrade pip
+    pip install -q -r "$BACKEND_DIR/requirements.txt"
+fi
+
+# Start the proxy in background
+cd "$BACKEND_DIR"
+python nominatim_proxy.py > /tmp/nominatim-proxy.log 2>&1 &
+NOMINATIM_PID=$!
+cd "$REPO_ROOT"
+
+echo "Nominatim proxy started (PID: $NOMINATIM_PID)"
+echo "Logs: /tmp/nominatim-proxy.log"
+echo ""
+
+# Wait for proxy to be ready
+echo "Waiting for Nominatim proxy to start..."
+sleep 2
+if curl -sf "http://localhost:$NOMINATIM_PROXY_PORT/health" > /dev/null 2>&1; then
+    echo -e "${GREEN}Nominatim proxy is ready!${NC}"
+else
+    echo -e "${YELLOW}Warning: Nominatim proxy health check failed, but continuing...${NC}"
+fi
+
+echo ""
+
 # Start frontend
-echo -e "${YELLOW}[3/3] Starting frontend...${NC}"
+echo -e "${YELLOW}[4/4] Starting frontend...${NC}"
 
 # Copy the latest Minneapolis config to frontend directory
 echo "Using config from: $FRONTEND_CONFIG"
@@ -154,6 +207,10 @@ echo "======================================"
 echo ""
 echo "Backend API:"
 echo "  http://localhost:$OTP_PORT"
+echo ""
+echo "Nominatim Geocoding Proxy:"
+echo "  http://localhost:$NOMINATIM_PROXY_PORT"
+echo "  Health: http://localhost:$NOMINATIM_PROXY_PORT/health"
 echo ""
 echo "Frontend:"
 echo "  http://localhost:$FRONTEND_PORT"
