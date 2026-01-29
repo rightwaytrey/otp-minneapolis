@@ -7,7 +7,7 @@ WORKDIR /app
 RUN apk add --no-cache git
 
 # Clone otp-react-redux (using rightwaytrey's fork with custom changes)
-RUN git clone https://github.com/rightwaytrey/otp-react-redux.git .
+RUN git clone --branch feature/go-mode https://github.com/rightwaytrey/otp-react-redux.git .
 
 # Install dependencies
 RUN yarn install
