@@ -35,6 +35,19 @@ node_modules/
 *.swp
 *~
 
+# Data backups
+data/*.backup-*
+
+# Python virtualenvs
+backend/venv/
+
+# Environment files
+.env
+pelias/.env
+
+# Claude Code local config
+.claude/
+
 # Keep data directory structure
 !data/.gitkeep
 !data/README.md

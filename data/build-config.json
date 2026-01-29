@@ -1,0 +1,17 @@
+{
+  "transitFeeds": [
+    {
+      "type": "gtfs",
+      "source": "gtfs.zip"
+    }
+  ],
+  "osm": [
+    {
+      "source": "minneapolis-saint-paul_minnesota.osm.pbf"
+    }
+  ],
+  "transferRequests": [
+    { "modes": "WALK" },
+    { "modes": "BICYCLE" }
+  ]
+}

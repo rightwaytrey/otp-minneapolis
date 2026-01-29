@@ -220,6 +220,8 @@ map:
 # Until you have deployed or subscribed to a geocoder service, a short-term temporary
 # geocoder test account can be obtained from the Pelias maintainers at geocode.earth.
 geocoder:
+  type: PELIAS
+  baseUrl: https://tre.hopto.org:9966/pelias
   boundary:
     rect:
       minLon: -93.5
@@ -229,12 +231,6 @@ geocoder:
   focusPoint:
     lat: 44.98
     lon: -93.27
-  # required geocoder type.
-  type: PHOTON
-  # PHOTON base URL (proxied through nginx to avoid CORS issues)
-  # Note: PhotonGeocoder automatically appends "/api" to this URL
-  baseUrl: https://tre.hopto.org:9966/photon
-  # Override the default number (3) of suggestions returned per category
   resultsCount: 5
   # This allows the location field dropdown headers to be colored based on Pelias layer
   #resultsColors:

@@ -1,3 +1,113 @@
+diff --git a/node_modules/@opentripplanner/geocoder/esm/apis/photon/index.js b/node_modules/@opentripplanner/geocoder/esm/apis/photon/index.js
+index 8f15cf1..cc5a03f 100644
+--- a/node_modules/@opentripplanner/geocoder/esm/apis/photon/index.js
++++ b/node_modules/@opentripplanner/geocoder/esm/apis/photon/index.js
+@@ -69,28 +69,17 @@ function _autocomplete() {
+             limit: size,
+             q: text
+           };
+-          if (!focusPoint) {
+-            _context.next = 10;
+-            break;
++          // Add focusPoint if provided (bias toward this location)
++          if (focusPoint) {
++            _normalize3 = normalize(focusPoint), lat = _normalize3.lat, lon = _normalize3.lon;
++            query.lat = lat.toString();
++            query.lon = lon.toString();
+           }
+-          _normalize3 = normalize(focusPoint), lat = _normalize3.lat, lon = _normalize3.lon;
+-          query.lat = lat.toString();
+-          query.lon = lon.toString();
+-          _context.next = 8;
+-          return run({
+-            options: options,
+-            query: query,
+-            url: url
+-          });
+-        case 8:
+-          res = _context.sent;
+-          return _context.abrupt("return", res);
+-        case 10:
++          // Add boundary filter if provided (restrict to this area)
+           if (boundary) {
+             country = boundary.country, rect = boundary.rect;
+-            if (country) query["in"] = "countryCode:".concat(country);
+             if (rect) {
+-              query["in"] = "bbox:".concat([rect.minLon, rect.minLat, rect.maxLon, rect.maxLat].join(","));
++              query.bbox = [rect.minLon, rect.minLat, rect.maxLon, rect.maxLat].join(",");
+             }
+           }
+           return _context.abrupt("return", run({
+diff --git a/node_modules/@opentripplanner/geocoder/esm/geocoders/photon.js b/node_modules/@opentripplanner/geocoder/esm/geocoders/photon.js
+index 8825cf4..287ea55 100644
+--- a/node_modules/@opentripplanner/geocoder/esm/geocoders/photon.js
++++ b/node_modules/@opentripplanner/geocoder/esm/geocoders/photon.js
+@@ -14,11 +14,23 @@ import Geocoder from "./abstract-geocoder";
+ 
+ var generateLabel = function generateLabel(properties) {
+   var propertyList = [];
++  // Combine housenumber with street for better address formatting
++  var housenumber = properties.housenumber ? "".concat(properties.housenumber) : "";
++  var street = properties.street ? "".concat(properties.street) : "";
++  var streetAddress = "";
++  if (housenumber && street) {
++    streetAddress = "".concat(housenumber, " ").concat(street);
++  } else if (street) {
++    streetAddress = street;
++  } else if (housenumber) {
++    streetAddress = housenumber;
++  }
++  var modifiedProperties = _objectSpread(_objectSpread({}, properties), {}, { street: streetAddress });
+   ["name", "street", "district", "state", "postcode", "city", "country"].forEach(function (propertyName) {
+-    if (typeof properties[propertyName] === "undefined") {
++    if (typeof modifiedProperties[propertyName] === "undefined") {
+       return;
+     }
+-    var value = "".concat(properties[propertyName]);
++    var value = "".concat(modifiedProperties[propertyName]);
+     if (value.length > 0) {
+       propertyList.push(value);
+     }
+diff --git a/node_modules/@opentripplanner/geocoder/lib/apis/photon/index.js b/node_modules/@opentripplanner/geocoder/lib/apis/photon/index.js
+index 48aedf7..043b9ef 100644
+--- a/node_modules/@opentripplanner/geocoder/lib/apis/photon/index.js
++++ b/node_modules/@opentripplanner/geocoder/lib/apis/photon/index.js
+@@ -82,26 +82,22 @@ function autocomplete(_a) {
+             switch (_e.label) {
+                 case 0:
+                     query = { limit: size, q: text };
+-                    if (!focusPoint) return [3 /*break*/, 2];
+-                    _d = (0, lonlat_1.normalize)(focusPoint), lat = _d.lat, lon = _d.lon;
+-                    query.lat = lat.toString();
+-                    query.lon = lon.toString();
+-                    return [4 /*yield*/, run({ options: options, query: query, url: url })];
+-                case 1:
+-                    res = _e.sent();
+-                    return [2 /*return*/, res];
+-                case 2:
++                    // Add focusPoint if provided (bias toward this location)
++                    if (focusPoint) {
++                        _d = (0, lonlat_1.normalize)(focusPoint), lat = _d.lat, lon = _d.lon;
++                        query.lat = lat.toString();
++                        query.lon = lon.toString();
++                    }
++                    // Add boundary filter if provided (restrict to this area)
+                     if (boundary) {
+                         country = boundary.country, rect = boundary.rect;
+-                        if (country)
+-                            query.in = "countryCode:".concat(country);
+                         if (rect) {
+-                            query.in = "bbox:".concat([
++                            query.bbox = [
+                                 rect.minLon,
+                                 rect.minLat,
+                                 rect.maxLon,
+                                 rect.maxLat
+-                            ].join(","));
++                            ].join(",");
+                         }
+                     }
+                     return [2 /*return*/, run({ options: options, query: query, url: url })];
 diff --git a/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js b/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js
 index 9471e10..4af4f14 100644
 --- a/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js
@@ -30,3 +140,16 @@ index 9471e10..4af4f14 100644
          if (value.length > 0) {
              propertyList.push(value);
          }
+diff --git a/node_modules/@opentripplanner/geocoder/src/apis/photon/index.ts b/node_modules/@opentripplanner/geocoder/src/apis/photon/index.ts
+index 12fd2ca..508457e 100644
+--- a/node_modules/@opentripplanner/geocoder/src/apis/photon/index.ts
++++ b/node_modules/@opentripplanner/geocoder/src/apis/photon/index.ts
+@@ -68,8 +68,6 @@ async function autocomplete({
+     const { lat, lon }: LonLatOutput = normalize(focusPoint);
+     query.lat = lat.toString();
+     query.lon = lon.toString();
+-    const res = await run({ options, query, url });
+-    return res;
+   }
+   if (boundary) {
+     const { country, rect } = boundary;
