@@ -8,7 +8,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: otp-minneapolis
     ports:
-      - "8090:8080"
+      - "127.0.0.1:8090:8080"
     volumes:
       # Mount data directory (read-only for graph/GTFS/OSM)
       - ../data:/var/opentripplanner:ro
@@ -34,7 +34,7 @@ services:
       dockerfile: Dockerfile
     container_name: otp-nominatim-proxy
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
@@ -45,14 +45,14 @@ services:
     networks:
       - otp-network
 
-  # Frontend (otp-react-redux)
+  # Frontend (otp-react-redux) - Production build
   frontend:
     build:
       context: ../frontend
       dockerfile: Dockerfile
     container_name: otp-frontend
     ports:
-      - "9967:9967"
+      - "127.0.0.1:9967:9967"
     volumes:
       # Mount frontend config
       - ../frontend/port-config.yml:/app/port-config.yml:ro
@@ -65,6 +65,26 @@ services:
     restart: unless-stopped
     networks:
       - otp-network
+    profiles:
+      - production
+
+  # Frontend Dev (local code with hot reload)
+  frontend-dev:
+    image: node:20-alpine
+    container_name: otp-frontend-dev
+    working_dir: /app
+    network_mode: "host"
+    volumes:
+      # Mount local otp-react-redux code for hot reload
+      - /home/rwt/projects/otprr/otp-react-redux:/app
+      # Mount frontend config
+      - ../frontend/port-config.yml:/app/port-config.yml:ro
+    environment:
+      - YAML_CONFIG=/app/port-config.yml
+      - NODE_ENV=development
+      - HOST=127.0.0.1
+    command: sh -c "apk add --no-cache git && yarn install && yarn start"
+    restart: unless-stopped
 
   # Optional: Caddy reverse proxy with automatic HTTPS
   caddy:
