@@ -1,5 +1,6 @@
 {
   "logger": { "level": "info" },
+  "datapath": "/data",
   "esclient": {
     "hosts": [{ "host": "elasticsearch" }]
   },
@@ -12,7 +13,14 @@
     }
   },
   "acceptance-tests": { "endpoints": { "local": "http://api:4000/v1/" } },
-  "api": { "host": "api", "textAnalyzer": "libpostal" },
+  "api": {
+    "host": "api",
+    "textAnalyzer": "libpostal",
+    "services": {
+      "libpostal": { "url": "http://libpostal:4400" },
+      "placeholder": { "url": "http://placeholder:3000" }
+    }
+  },
   "imports": {
     "adminLookup": { "enabled": true },
     "openstreetmap": {
@@ -23,6 +31,7 @@
       "import": [{ "filename": "minnesota-latest.osm.pbf" }]
     },
     "openaddresses": {
+      "datapath": "/data/openaddresses",
       "files": ["us/mn/statewide.csv"]
     },
     "whosonfirst": {
