@@ -263,14 +263,9 @@ modes:
     - mode: BUS
       label: Metro Transit Bus
       color: "#0053a0"  # Metro Transit blue
-    - mode: RAIL
+    - mode: TRAM
       label: Light Rail (Blue/Green Line)
       color: "#78be20"  # Metro Transit green
-    ## Additional modes - uncomment if your network has these
-    # - mode: SUBWAY
-    #   label: Subway
-    # - mode: FERRY
-    #   label: Ferry
 
   # Potentially deprecated
   accessModes:
