@@ -3,7 +3,7 @@
     "numItineraries": 10,
     "bicycle": {
       "speed": 5.0,
-      "reluctance": 0.3,
+      "reluctance": 0.5,
       "boardCost": 0
     },
     "transfer": {
