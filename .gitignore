@@ -37,6 +37,21 @@ node_modules/
 
 # Data backups
 data/*.backup-*
+data/*.prebuild-*
+
+# Debug screenshots (root-level only — keep folder PNGs in docs/, etc.)
+/*.png
+
+# Scratch debug notes
+/FIX_*.md
+/GEOCODER_*.md
+/CONSOLIDATION.md
+/RESTART_GEOCODER.md
+/console-errors.txt
+/geocoder-requests.txt
+
+# Tooling caches
+.playwright-mcp/
 
 # Python virtualenvs
 backend/venv/
