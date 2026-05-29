@@ -38,6 +38,39 @@ index 8f15cf1..cc5a03f 100644
              }
            }
            return _context.abrupt("return", run({
+diff --git a/node_modules/@opentripplanner/geocoder/esm/geocoders/pelias.js b/node_modules/@opentripplanner/geocoder/esm/geocoders/pelias.js
+index 701ebff..629f6f5 100644
+--- a/node_modules/@opentripplanner/geocoder/esm/geocoders/pelias.js
++++ b/node_modules/@opentripplanner/geocoder/esm/geocoders/pelias.js
+@@ -30,6 +30,28 @@ var PeliasGeocoder = /*#__PURE__*/function (_Geocoder) {
+   }
+   _inherits(PeliasGeocoder, _Geocoder);
+   return _createClass(PeliasGeocoder, [{
++    key: "autocomplete",
++    value:
++    /**
++     * Override autocomplete to fall back to /v1/search (which uses libpostal)
++     * when autocomplete returns no results.
++     */
++    function autocomplete(query) {
++      var _this = this;
++      return this.api
++        .autocomplete(this.getAutocompleteQuery(query))
++        .then(this.rewriteAutocompleteResponse.bind(this))
++        .then(function (response) {
++          var features = response === null || response === void 0 ? void 0 : response.features;
++          if (features && features.length === 0 && query.text && query.text.length >= 8) {
++            return _this.api
++              .search(_this.getSearchQuery({ text: query.text }))
++              .then(_this.rewriteAutocompleteResponse.bind(_this));
++          }
++          return response;
++        });
++    }
++  }, {
+     key: "getAutocompleteQuery",
+     value:
+     /**
 diff --git a/node_modules/@opentripplanner/geocoder/esm/geocoders/photon.js b/node_modules/@opentripplanner/geocoder/esm/geocoders/photon.js
 index 8825cf4..287ea55 100644
 --- a/node_modules/@opentripplanner/geocoder/esm/geocoders/photon.js
@@ -108,6 +141,175 @@ index 48aedf7..043b9ef 100644
                          }
                      }
                      return [2 /*return*/, run({ options: options, query: query, url: url })];
+diff --git a/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js b/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js
+index 2244aec..587f6eb 100644
+--- a/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js
++++ b/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js
+@@ -42,6 +42,25 @@ var PeliasGeocoder = /** @class */ (function (_super) {
+     function PeliasGeocoder() {
+         return _super !== null && _super.apply(this, arguments) || this;
+     }
++    /**
++     * Override autocomplete to fall back to /v1/search (which uses libpostal)
++     * when autocomplete returns no results.
++     */
++    PeliasGeocoder.prototype.autocomplete = function (query) {
++        var _this = this;
++        return this.api
++            .autocomplete(this.getAutocompleteQuery(query))
++            .then(this.rewriteAutocompleteResponse.bind(this))
++            .then(function (response) {
++                var features = response === null || response === void 0 ? void 0 : response.features;
++                if (features && features.length === 0 && query.text && query.text.length >= 8) {
++                    return _this.api
++                        .search(_this.getSearchQuery({ text: query.text }))
++                        .then(_this.rewriteAutocompleteResponse.bind(_this));
++                }
++                return response;
++            });
++    };
+     /**
+      * Generate an autocomplete query specifically for the Pelias API. The
+      * `sources` parameter is a Pelias-specific option.
+diff --git a/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js.orig b/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js.orig
+new file mode 100644
+index 0000000..2244aec
+--- /dev/null
++++ b/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js.orig
+@@ -0,0 +1,111 @@
++"use strict";
++var __extends = (this && this.__extends) || (function () {
++    var extendStatics = function (d, b) {
++        extendStatics = Object.setPrototypeOf ||
++            ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
++            function (d, b) { for (var p in b) if (Object.prototype.hasOwnProperty.call(b, p)) d[p] = b[p]; };
++        return extendStatics(d, b);
++    };
++    return function (d, b) {
++        if (typeof b !== "function" && b !== null)
++            throw new TypeError("Class extends value " + String(b) + " is not a constructor or null");
++        extendStatics(d, b);
++        function __() { this.constructor = d; }
++        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
++    };
++})();
++var __assign = (this && this.__assign) || function () {
++    __assign = Object.assign || function(t) {
++        for (var s, i = 1, n = arguments.length; i < n; i++) {
++            s = arguments[i];
++            for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
++                t[p] = s[p];
++        }
++        return t;
++    };
++    return __assign.apply(this, arguments);
++};
++var __importDefault = (this && this.__importDefault) || function (mod) {
++    return (mod && mod.__esModule) ? mod : { "default": mod };
++};
++Object.defineProperty(exports, "__esModule", { value: true });
++var abstract_geocoder_1 = __importDefault(require("./abstract-geocoder"));
++var DEFAULT_LAYERS = "address,venue,street,intersection";
++/**
++ * Geocoder implementation for the Pelias geocoder.
++ * See https://pelias.io
++ *
++ * @extends Geocoder
++ */
++var PeliasGeocoder = /** @class */ (function (_super) {
++    __extends(PeliasGeocoder, _super);
++    function PeliasGeocoder() {
++        return _super !== null && _super.apply(this, arguments) || this;
++    }
++    /**
++     * Generate an autocomplete query specifically for the Pelias API. The
++     * `sources` parameter is a Pelias-specific option.
++     * This function fills in some more fields of the query
++     * from the existing values in the GeocoderConfig.
++     */
++    PeliasGeocoder.prototype.getAutocompleteQuery = function (query) {
++        var _a = this.geocoderConfig, apiKey = _a.apiKey, baseUrl = _a.baseUrl, boundary = _a.boundary, focusPoint = _a.focusPoint, _b = _a.layers, layers = _b === void 0 ? DEFAULT_LAYERS : _b, options = _a.options, sources = _a.sources;
++        return __assign({ apiKey: apiKey, boundary: boundary, focusPoint: focusPoint, layers: layers, options: options, 
++            // explicitly send over null for sources if provided sources is not truthy
++            // in order to avoid default isomorphic-mapzen-search sources form being
++            // applied
++            sources: sources || null, url: baseUrl ? "".concat(baseUrl, "/autocomplete") : undefined }, query);
++    };
++    /**
++     * Generate a search query specifically for the Pelias API. The
++     * `sources` parameter is a Pelias-specific option.
++     * This function fills in some more fields of the query
++     * from the existing values in the GeocoderConfig.
++     */
++    PeliasGeocoder.prototype.getSearchQuery = function (query) {
++        var _a = this.geocoderConfig, apiKey = _a.apiKey, baseUrl = _a.baseUrl, boundary = _a.boundary, _b = _a.layers, layers = _b === void 0 ? DEFAULT_LAYERS : _b, focusPoint = _a.focusPoint, options = _a.options, sources = _a.sources;
++        return __assign({ apiKey: apiKey, boundary: boundary, layers: layers, focusPoint: focusPoint, options: options, 
++            // explicitly send over null for sources if provided sources is not truthy
++            // in order to avoid default isomorphic-mapzen-search sources form being
++            // applied
++            sources: sources || null, url: baseUrl ? "".concat(baseUrl, "/search") : undefined, format: false }, query);
++    };
++    /**
++     * Rewrite the response into an application-specific data format using the
++     * first feature returned from the geocoder.
++     */
++    PeliasGeocoder.prototype.rewriteReverseResponse = function (response) {
++        var _a;
++        if ((_a = this.geocoderConfig) === null || _a === void 0 ? void 0 : _a.reverseUseFeatureCollection)
++            return response;
++        var _b = response.isomorphicMapzenSearchQuery.point, lat = _b.lat, lon = _b.lon;
++        var firstFeature = response[0];
++        return {
++            lat: lat,
++            lon: lon,
++            name: firstFeature.label,
++            rawGeocodedFeature: firstFeature
++        };
++    };
++    /**
++     * Remove duplicates based on name, which Pelias sometimes creates
++     */
++    PeliasGeocoder.prototype.rewriteAutocompleteResponse = function (response) {
++        var features = response === null || response === void 0 ? void 0 : response.features;
++        var filtered = features === null || features === void 0 ? void 0 : features.filter(function (feature, index) {
++            return !features
++                .slice(index + 1)
++                .some(function (f) {
++                var _a, _b, _c, _d;
++                return ((_a = f === null || f === void 0 ? void 0 : f.properties) === null || _a === void 0 ? void 0 : _a.name) === ((_b = feature === null || feature === void 0 ? void 0 : feature.properties) === null || _b === void 0 ? void 0 : _b.name) &&
++                    // This is unclean, but we know geometry will never contain objects
++                    JSON.stringify((_c = feature === null || feature === void 0 ? void 0 : feature.geometry) === null || _c === void 0 ? void 0 : _c.coordinates) ===
++                        JSON.stringify((_d = f === null || f === void 0 ? void 0 : f.geometry) === null || _d === void 0 ? void 0 : _d.coordinates);
++            });
++        });
++        return __assign(__assign({}, response), { features: filtered });
++    };
++    return PeliasGeocoder;
++}(abstract_geocoder_1.default));
++exports.default = PeliasGeocoder;
++//# sourceMappingURL=pelias.js.map
+\ No newline at end of file
+diff --git a/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js.rej b/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js.rej
+new file mode 100644
+index 0000000..1d8a38f
+--- /dev/null
++++ b/node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js.rej
+@@ -0,0 +1,15 @@
++--- node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js
+++++ node_modules/@opentripplanner/geocoder/lib/geocoders/pelias.js
++@@ -54,7 +54,11 @@ var PeliasGeocoder = /** @class */ (function (_super) {
++             // in order to avoid default isomorphic-mapzen-search sources form being
++             // applied
++             sources: sources || null,
++-            url: baseUrl ? "".concat(baseUrl, "/autocomplete") : undefined }, query);
+++            url: baseUrl ? (baseUrl.includes('/v1') 
+++                ? "".concat(baseUrl, "/autocomplete")
+++                : "".concat(baseUrl, "/v1/autocomplete")
+++            ) : undefined
+++        }, query);
++     };
++     /**
++      * Generate a search query specifically for the Pelias API. The
 diff --git a/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js b/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js
 index 9471e10..4af4f14 100644
 --- a/node_modules/@opentripplanner/geocoder/lib/geocoders/photon.js
@@ -153,3 +355,35 @@ index 12fd2ca..508457e 100644
    }
    if (boundary) {
      const { country, rect } = boundary;
+diff --git a/node_modules/@opentripplanner/geocoder/src/geocoders/pelias.ts b/node_modules/@opentripplanner/geocoder/src/geocoders/pelias.ts
+index 4063035..d0968f4 100644
+--- a/node_modules/@opentripplanner/geocoder/src/geocoders/pelias.ts
++++ b/node_modules/@opentripplanner/geocoder/src/geocoders/pelias.ts
+@@ -16,6 +16,27 @@ const DEFAULT_LAYERS = "address,venue,street,intersection";
+  * @extends Geocoder
+  */
+ export default class PeliasGeocoder extends Geocoder {
++  /**
++   * Override autocomplete to fall back to /v1/search (which uses libpostal)
++   * when autocomplete returns no results. This handles cases where the
++   * simpler autocomplete parser can't normalize address variations
++   * (e.g. "West Old Shakopee Rd" vs "Old Shakopee Road West").
++   */
++  autocomplete(query: AutocompleteQuery): Promise<MultiGeocoderResponse> {
++    return this.api
++      .autocomplete(this.getAutocompleteQuery(query))
++      .then(this.rewriteAutocompleteResponse.bind(this))
++      .then((response: MultiGeocoderResponse) => {
++        const features = (response as any)?.features;
++        if (features && features.length === 0 && query.text && query.text.length >= 8) {
++          return this.api
++            .search(this.getSearchQuery({ text: query.text }))
++            .then(this.rewriteAutocompleteResponse.bind(this));
++        }
++        return response;
++      });
++  }
++
+   /**
+    * Generate an autocomplete query specifically for the Pelias API. The
+    * `sources` parameter is a Pelias-specific option.
