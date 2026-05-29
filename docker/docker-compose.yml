@@ -52,7 +52,7 @@ services:
       dockerfile: Dockerfile
     container_name: otp-frontend
     ports:
-      - "9967:9967"
+      - "127.0.0.1:9967:9967"
     volumes:
       # Mount frontend config
       - ../frontend/port-config.yml:/app/port-config.yml:ro
