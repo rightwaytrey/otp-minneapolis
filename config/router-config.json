@@ -6,11 +6,8 @@
       "reluctance": 0.5,
       "boardCost": 0
     },
-    "transfer": {
-      "cost": 0,
-      "slack": 600,
-      "maxTransfers": 5
-    },
+    "transferPenalty": 600,
+    "waitReluctance": 1.5,
     "accessEgress": {
       "maxDurationForMode": {
         "BIKE": "120m"
