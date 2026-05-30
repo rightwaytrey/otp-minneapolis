@@ -1,0 +1,4 @@
+# Passwordless sudo for the Claude Code agent on this host.
+# Scope: service control, firewall, docker, nginx (OTP / TransitNav ops).
+# Installed to /etc/sudoers.d/claude-otp (mode 0440). Remove that file to revoke.
+rwt ALL=(root) NOPASSWD: /usr/bin/systemctl, /usr/sbin/iptables, /usr/sbin/ip6tables, /usr/bin/docker, /usr/sbin/nginx
