@@ -181,7 +181,7 @@ map:
 # geocoder test account can be obtained from the Pelias maintainers at geocode.earth.
 geocoder:
   type: PELIAS
-  baseUrl: /pelias
+  baseUrl: /pelias/v1
   layers: address,venue
   boundary:
     rect:
@@ -381,7 +381,12 @@ itinerary:
   # Whether to merge groups of itineraries with the same primary mode (Bike, Walk, etc)
   groupTransitModes: true
   # Whether to merge itineraries with the same origin, destination, and transit modes
-  mergeItineraries: false
+  mergeItineraries: true
+  # When merging, only collapse itineraries that use the SAME route sequence (same
+  # routeIds), so same-route/different-departure trips fold into the soonest one
+  # (later departures shown as a clickable list), while different routes stay as
+  # separate results. Set false to fall back to stop/mode-based merging.
+  mergeByRouteSignature: true
   # Whether to show the first itinerary on the map. If this is set to false, routes
   # will only show on the map on hover or click
   showFirstResultByDefault: false
