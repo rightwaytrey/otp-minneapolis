@@ -23,6 +23,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="$REPO_ROOT/data"
 CONFIG_DIR="$REPO_ROOT/config"
 GTFS_URL="https://svc.metrotransit.org/mtgtfs/gtfs.zip"
+MVTA_GTFS_URL="https://srv.mvta.com/InfoPoint/gtfs-zip.ashx"
 CONTAINER="otp-minneapolis"
 OTP_URL="http://127.0.0.1:8090/otp/gtfs/v1"
 KEEP_BACKUPS=3
@@ -44,6 +45,10 @@ if [ -f "$DATA_DIR/gtfs.zip" ]; then
   cp -p "$DATA_DIR/gtfs.zip" "$DATA_DIR/gtfs.zip.backup-$TS"
   log "Backed up gtfs.zip -> gtfs.zip.backup-$TS"
 fi
+if [ -f "$DATA_DIR/mvta-gtfs.zip" ]; then
+  cp -p "$DATA_DIR/mvta-gtfs.zip" "$DATA_DIR/mvta-gtfs.zip.backup-$TS"
+  log "Backed up mvta-gtfs.zip -> mvta-gtfs.zip.backup-$TS"
+fi
 if [ -f "$DATA_DIR/graph.obj" ]; then
   cp -p "$DATA_DIR/graph.obj" "$DATA_DIR/graph.obj.backup-$TS"
   log "Backed up graph.obj -> graph.obj.backup-$TS"
@@ -61,6 +66,19 @@ fi
 FEED_END="$(unzip -p "$TMP_GTFS" feed_info.txt 2>/dev/null | awk -F, 'NR==2{print $6}')"
 log "Downloaded GTFS OK ($(du -h "$TMP_GTFS" | cut -f1)); feed_end_date=${FEED_END:-unknown}"
 mv -f "$TMP_GTFS" "$DATA_DIR/gtfs.zip"
+
+# 2b. Download fresh MVTA GTFS (second transit feed) the same way
+TMP_MVTA="$DATA_DIR/mvta-gtfs.zip.download-$TS"
+log "Downloading fresh MVTA GTFS from $MVTA_GTFS_URL ..."
+curl -fsSL --retry 3 --retry-delay 5 "$MVTA_GTFS_URL" -o "$TMP_MVTA"
+if ! unzip -tqq "$TMP_MVTA" >/dev/null 2>&1; then
+  log "ERROR: downloaded MVTA GTFS is not a valid zip. Aborting (existing data untouched)."
+  rm -f "$TMP_MVTA"
+  exit 1
+fi
+MVTA_FEED_END="$(unzip -p "$TMP_MVTA" feed_info.txt 2>/dev/null | awk -F, 'NR==2{print $5}')"
+log "Downloaded MVTA GTFS OK ($(du -h "$TMP_MVTA" | cut -f1)); feed_end_date=${MVTA_FEED_END:-unknown}"
+mv -f "$TMP_MVTA" "$DATA_DIR/mvta-gtfs.zip"
 
 # 3. Sync configs into data dir
 if [ -d "$CONFIG_DIR" ]; then
@@ -102,7 +120,7 @@ else
 fi
 
 # 7. Prune old backups, keeping the newest $KEEP_BACKUPS of each kind
-for pat in 'gtfs.zip.backup-*' 'graph.obj.backup-*'; do
+for pat in 'gtfs.zip.backup-*' 'mvta-gtfs.zip.backup-*' 'graph.obj.backup-*'; do
   # shellcheck disable=SC2012
   ls -1t "$DATA_DIR"/$pat 2>/dev/null | tail -n +"$((KEEP_BACKUPS + 1))" | while read -r f; do
     rm -f "$f" && log "Pruned old backup: $(basename "$f")"

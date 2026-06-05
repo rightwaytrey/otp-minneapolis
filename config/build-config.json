@@ -2,7 +2,13 @@
   "transitFeeds": [
     {
       "type": "gtfs",
+      "feedId": "1",
       "source": "gtfs.zip"
+    },
+    {
+      "type": "gtfs",
+      "feedId": "2",
+      "source": "mvta-gtfs.zip"
     }
   ],
   "osm": [
