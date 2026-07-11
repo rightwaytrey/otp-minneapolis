@@ -61,6 +61,10 @@ api:
 persistence:
   enabled: true
   strategy: localStorage
+  ### Remember recent places/searches without requiring the opt-in toggle
+  ### (which only exists on the desktop settings panel). An explicit user
+  ### toggle stored in localStorage still wins.
+  trackRecentByDefault: true
   ### This variable defines the default state of the terms of storage checkbox.
   ### Possible values: 'visible-unchecked' (default) | 'visible-checked' | 'hidden-unchecked' | 'hidden-checked'
   # termsOfStorageDefault: 'visible-unchecked'
