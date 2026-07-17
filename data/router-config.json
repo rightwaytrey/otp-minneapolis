@@ -22,7 +22,7 @@
       "groupSimilarityKeepThree": 0.85,
       "groupedOtherThanSameLegsMaxCostMultiplier": 100.0
     },
-    "streetRoutingTimeout": "300s"
+    "streetRoutingTimeout": "10s"
   },
   "updaters": [
     {

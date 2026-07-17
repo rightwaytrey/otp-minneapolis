@@ -16,7 +16,7 @@ services:
       - ../config:/etc/otp:ro
     environment:
       # Override Java memory settings if needed
-      - JAVA_OPTS=-Xmx2G
+      - JAVA_OPTS=-Xmx4G
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/otp/"]
