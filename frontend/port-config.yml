@@ -187,12 +187,9 @@ geocoder:
   type: PELIAS
   baseUrl: /pelias/v1
   layers: address,venue
-  boundary:
-    rect:
-      minLon: -93.5
-      maxLon: -92.9
-      minLat: 44.75
-      maxLat: 45.2
+  # No boundary rect: it was clipping legit metro-edge addresses (e.g. Ham Lake,
+  # 2km north of the old maxLat 45.2). focusPoint already ranks nearby results
+  # first, so local relevance is kept without hard-excluding anything.
   focusPoint:
     lat: 44.98
     lon: -93.27
