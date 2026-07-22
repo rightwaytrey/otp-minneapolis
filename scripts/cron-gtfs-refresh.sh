@@ -2,17 +2,25 @@
 #
 # cron-gtfs-refresh.sh
 #
-# Unattended refresh of the Metro Transit GTFS feed + OTP graph rebuild + container
-# restart. Intended to be run from cron (the Metro Transit GTFS feed expires roughly
-# monthly, so run this on the 1st and 15th).
+# Unattended refresh of the Metro Transit + MVTA GTFS feeds, OTP graph rebuild,
+# and container restart. Runs NIGHTLY from cron, but does real work only when a
+# publisher has released a new feed_version — see step 2. Nightly matters
+# because Metro Transit republishes about weekly and regenerates its trip_ids
+# each time, which silently breaks GTFS-RT matching until the graph catches up.
 #
 # Steps:
-#   1. Back up data/gtfs.zip and data/graph.obj (timestamped, keep last few)
-#   2. Download fresh GTFS from Metro Transit
-#   3. Sync config/*.json into data/
-#   4. Rebuild the graph (java --build --save) with the locally built shaded JAR
-#   5. docker restart otp-minneapolis
-#   6. Verify the backend's serviceTimeRange covers today
+#   1. Download both feeds to temp files and sanity-check the zips
+#   2. Compare feed_version against what the current graph was built from;
+#      exit early (nothing touched) if neither publisher has changed
+#   3. Back up gtfs.zip / mvta-gtfs.zip / graph.obj, then swap the feeds in
+#   4. Sync config/*.json into data/
+#   5. Rebuild the graph (java --build --save) with the locally built shaded JAR
+#   6. docker restart otp-minneapolis
+#   7. Verify the backend's serviceTimeRange covers today
+#   8. Prune old backups
+#
+# FORCE_REBUILD=1 skips the step-2 check (use after editing build-config.json,
+# which the version check cannot see).
 #
 # All output goes to stdout/stderr; the cron entry redirects it to a log file.
 
@@ -40,7 +48,67 @@ if [ -z "$JAR" ]; then
 fi
 log "Using JAR: $JAR"
 
-# 1. Backup current data
+# Read one named column out of a feed's feed_info.txt. The two publishers order
+# their columns differently (MVTA has no default_lang), so look the field up by
+# header name rather than by position.
+feed_field() {
+  unzip -p "$1" feed_info.txt 2>/dev/null | awk -F, -v want="$2" '
+    { gsub(/\r/, "") }
+    NR == 1 { for (i = 1; i <= NF; i++) if ($i == want) col = i; next }
+    NR == 2 && col { print $col; exit }
+  '
+}
+
+# 1. Download both feeds to temp files and sanity-check them. Nothing existing
+#    is touched until we know the downloads are good AND worth rebuilding for.
+TMP_GTFS="$DATA_DIR/gtfs.zip.download-$TS"
+log "Downloading fresh GTFS from $GTFS_URL ..."
+curl -fsSL --retry 3 --retry-delay 5 "$GTFS_URL" -o "$TMP_GTFS"
+if ! unzip -tqq "$TMP_GTFS" >/dev/null 2>&1; then
+  log "ERROR: downloaded GTFS is not a valid zip. Aborting (existing data untouched)."
+  rm -f "$TMP_GTFS"
+  exit 1
+fi
+FEED_END="$(feed_field "$TMP_GTFS" feed_end_date)"
+log "Downloaded GTFS OK ($(du -h "$TMP_GTFS" | cut -f1)); feed_end_date=${FEED_END:-unknown}"
+
+# 1b. Download fresh MVTA GTFS (second transit feed) the same way
+TMP_MVTA="$DATA_DIR/mvta-gtfs.zip.download-$TS"
+log "Downloading fresh MVTA GTFS from $MVTA_GTFS_URL ..."
+curl -fsSL --retry 3 --retry-delay 5 "$MVTA_GTFS_URL" -o "$TMP_MVTA"
+if ! unzip -tqq "$TMP_MVTA" >/dev/null 2>&1; then
+  log "ERROR: downloaded MVTA GTFS is not a valid zip. Aborting (existing data untouched)."
+  rm -f "$TMP_GTFS" "$TMP_MVTA"
+  exit 1
+fi
+MVTA_FEED_END="$(feed_field "$TMP_MVTA" feed_end_date)"
+log "Downloaded MVTA GTFS OK ($(du -h "$TMP_MVTA" | cut -f1)); feed_end_date=${MVTA_FEED_END:-unknown}"
+
+# 2. Rebuild only when a publisher has actually released a new feed_version.
+#    Metro Transit republishes roughly WEEKLY and regenerates its trip_ids every
+#    time, so a graph even a few days stale stops matching GTFS-RT: on
+#    2026-07-22 a graph built from the 2026-07-11 feed resolved only 756/924
+#    live vehicles (82%), while the then-current feed resolved 924/924. That is
+#    why this now runs nightly — this check makes the ~6 nights a week with no
+#    new feed cost two downloads instead of a 4-minute rebuild and a restart.
+#    Set FORCE_REBUILD=1 to rebuild anyway (e.g. after changing build-config).
+NEW_VERSION="$(feed_field "$TMP_GTFS" feed_version)"
+OLD_VERSION="$(feed_field "$DATA_DIR/gtfs.zip" feed_version)"
+NEW_MVTA_VERSION="$(feed_field "$TMP_MVTA" feed_version)"
+OLD_MVTA_VERSION="$(feed_field "$DATA_DIR/mvta-gtfs.zip" feed_version)"
+log "Metro Transit feed_version: have=${OLD_VERSION:-none} new=${NEW_VERSION:-none}"
+log "MVTA feed_version:          have=${OLD_MVTA_VERSION:-none} new=${NEW_MVTA_VERSION:-none}"
+if [ "${FORCE_REBUILD:-0}" != "1" ] &&
+   [ -f "$DATA_DIR/graph.obj" ] &&
+   [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" = "$OLD_VERSION" ] &&
+   [ -n "$NEW_MVTA_VERSION" ] && [ "$NEW_MVTA_VERSION" = "$OLD_MVTA_VERSION" ]; then
+  rm -f "$TMP_GTFS" "$TMP_MVTA"
+  log "Both feeds unchanged since the current graph was built — nothing to do."
+  log "===== OTP GTFS refresh complete (no rebuild needed) ====="
+  exit 0
+fi
+
+# 3. Back up what we are about to replace, then swap the new feeds in.
 if [ -f "$DATA_DIR/gtfs.zip" ]; then
   cp -p "$DATA_DIR/gtfs.zip" "$DATA_DIR/gtfs.zip.backup-$TS"
   log "Backed up gtfs.zip -> gtfs.zip.backup-$TS"
@@ -53,49 +121,25 @@ if [ -f "$DATA_DIR/graph.obj" ]; then
   cp -p "$DATA_DIR/graph.obj" "$DATA_DIR/graph.obj.backup-$TS"
   log "Backed up graph.obj -> graph.obj.backup-$TS"
 fi
-
-# 2. Download fresh GTFS to a temp file, sanity-check, then swap in
-TMP_GTFS="$DATA_DIR/gtfs.zip.download-$TS"
-log "Downloading fresh GTFS from $GTFS_URL ..."
-curl -fsSL --retry 3 --retry-delay 5 "$GTFS_URL" -o "$TMP_GTFS"
-if ! unzip -tqq "$TMP_GTFS" >/dev/null 2>&1; then
-  log "ERROR: downloaded GTFS is not a valid zip. Aborting (existing data untouched)."
-  rm -f "$TMP_GTFS"
-  exit 1
-fi
-FEED_END="$(unzip -p "$TMP_GTFS" feed_info.txt 2>/dev/null | awk -F, 'NR==2{print $6}')"
-log "Downloaded GTFS OK ($(du -h "$TMP_GTFS" | cut -f1)); feed_end_date=${FEED_END:-unknown}"
 mv -f "$TMP_GTFS" "$DATA_DIR/gtfs.zip"
-
-# 2b. Download fresh MVTA GTFS (second transit feed) the same way
-TMP_MVTA="$DATA_DIR/mvta-gtfs.zip.download-$TS"
-log "Downloading fresh MVTA GTFS from $MVTA_GTFS_URL ..."
-curl -fsSL --retry 3 --retry-delay 5 "$MVTA_GTFS_URL" -o "$TMP_MVTA"
-if ! unzip -tqq "$TMP_MVTA" >/dev/null 2>&1; then
-  log "ERROR: downloaded MVTA GTFS is not a valid zip. Aborting (existing data untouched)."
-  rm -f "$TMP_MVTA"
-  exit 1
-fi
-MVTA_FEED_END="$(unzip -p "$TMP_MVTA" feed_info.txt 2>/dev/null | awk -F, 'NR==2{print $5}')"
-log "Downloaded MVTA GTFS OK ($(du -h "$TMP_MVTA" | cut -f1)); feed_end_date=${MVTA_FEED_END:-unknown}"
 mv -f "$TMP_MVTA" "$DATA_DIR/mvta-gtfs.zip"
 
-# 3. Sync configs into data dir
+# 4. Sync configs into data dir
 if [ -d "$CONFIG_DIR" ]; then
   cp -f "$CONFIG_DIR/"*.json "$DATA_DIR/" 2>/dev/null || true
   log "Synced config/*.json into data/"
 fi
 
-# 4. Rebuild graph (overwrites data/graph.obj)
+# 5. Rebuild graph (overwrites data/graph.obj)
 log "Rebuilding OTP graph (java -Xmx4G --build --save) ... this takes a few minutes"
 java -Xmx4G -jar "$JAR" --build --save "$DATA_DIR"
 log "Graph rebuilt: $(du -h "$DATA_DIR/graph.obj" | cut -f1)"
 
-# 5. Restart the container so it loads the new graph
+# 6. Restart the container so it loads the new graph
 log "Restarting container $CONTAINER ..."
 docker restart "$CONTAINER"
 
-# 6. Wait for OTP to come back, then verify the loaded service range covers today
+# 7. Wait for OTP to come back, then verify the loaded service range covers today
 log "Waiting for OTP backend to come up ..."
 up=0
 for i in $(seq 1 60); do
@@ -119,7 +163,7 @@ else
   log "WARNING: loaded service range does not appear to cover today. start=$START_TS end=$END_TS now=$NOW_TS"
 fi
 
-# 7. Prune old backups, keeping the newest $KEEP_BACKUPS of each kind
+# 8. Prune old backups, keeping the newest $KEEP_BACKUPS of each kind
 for pat in 'gtfs.zip.backup-*' 'mvta-gtfs.zip.backup-*' 'graph.obj.backup-*'; do
   # shellcheck disable=SC2012
   ls -1t "$DATA_DIR"/$pat 2>/dev/null | tail -n +"$((KEEP_BACKUPS + 1))" | while read -r f; do
