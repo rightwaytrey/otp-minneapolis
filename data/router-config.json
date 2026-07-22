@@ -43,6 +43,25 @@
       "frequency": "30s",
       "url": "https://svc.metrotransit.org/mtgtfs/alerts.pb",
       "feedId": "1"
+    },
+    {
+      "type": "stop-time-updater",
+      "frequency": "10s",
+      "url": "https://srv.mvta.com/InfoPoint/GTFS-Realtime.ashx?&Type=TripUpdate",
+      "feedId": "2",
+      "fuzzyTripMatching": true
+    },
+    {
+      "type": "vehicle-positions",
+      "frequency": "10s",
+      "url": "https://srv.mvta.com/InfoPoint/GTFS-Realtime.ashx?&Type=VehiclePosition",
+      "feedId": "2"
+    },
+    {
+      "type": "real-time-alerts",
+      "frequency": "30s",
+      "url": "https://srv.mvta.com/InfoPoint/GTFS-Realtime.ashx?&Type=Alert",
+      "feedId": "2"
     }
   ]
 }
