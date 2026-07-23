@@ -19,7 +19,12 @@ REPO=/home/rwt/projects/otprr/otp-react-redux
 WEBROOT=/var/www/transitnav
 
 echo "==> Building production bundle in the frontend container..."
+# Same stamp convention as the app builds (VITE_BUILD_INFO, see transitnav-ios
+# CI): shown in the app menu and on every debug-log batch. "web:" marks this
+# deploy path, vs "1.0.<n>" TestFlight and "ci.<n>" ios-build.
+BUILD_INFO="web:$(git -C "$REPO" rev-parse --short HEAD) $(date -u '+%Y-%m-%d')"
 docker exec -w /app -e YAML_CONFIG=/app/port-config.yml -e NODE_ENV=production \
+  -e VITE_BUILD_INFO="$BUILD_INFO" \
   otp-frontend-dev yarn build
 
 echo "==> Publishing dist/ -> $WEBROOT ..."
