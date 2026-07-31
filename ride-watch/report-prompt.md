@@ -9,10 +9,16 @@ The environment variable `RIDE_WATCH_REQUEST` holds the path to a JSON file:
 
 ```
 {"session", "date", "startMs", "endMs", "findingsPath",
- "itinerarySummary", "findingsCount", "pagesSent", "endReason"}
+ "itinerarySummary", "findingsCount", "notesCount", "riderNotes",
+ "pagesSent", "endReason"}
 ```
 
 Read it first. Everything else follows from it.
+
+`riderNotes` is what the rider typed on the /ride console **during** the ride:
+`{tsMs, time, text, context}`, where `context` is the trip state at the moment
+they typed it (leg, progress, status, stopsRemaining, riding, secondsSinceFix).
+They also appear in `findingsPath` as `rule: "rider-note"`, severity `info`.
 
 ## What actually happened, and what you must decide
 
@@ -30,6 +36,32 @@ trigger-happy. Your job is to decide, per finding, which of these it is:
   itself should be tuned.
 
 Every verdict must cite telemetry. Do not guess.
+
+### The rider's notes outrank the rule engine
+
+A `rider-note` is not a suspicion. It is the one piece of evidence in this
+whole pipeline that comes from outside the app's own view of itself — the rule
+engine can only notice what the telemetry admits, and the rider can see out of
+the window. **Triage every note as its own finding**, at least as carefully as
+a `page`:
+
+1. Read the note's `context` — that is the app's story of that second.
+2. Slice the telemetry around `tsMs` (60s either side) and reconstruct what the
+   rider was actually being shown.
+3. Say whether the telemetry corroborates the note, contradicts it, or is
+   silent — and if it is **silent**, that is itself a finding: the rider saw a
+   failure the daemon has no rule for. Say what rule would have caught it.
+4. Correlate: a note within a minute or two of a machine finding is almost
+   certainly the rider describing the same event in their own words. Merge them
+   into one entry rather than reporting the incident twice.
+
+A note gets a verdict from the same three options as any finding, plus one:
+
+- **no-rule-covers-this** — the rider is right, the telemetry backs them up, and
+  no rule fired. Propose the rule (name, trigger condition, severity) in the
+  Rule tuning section.
+
+Quote the note verbatim. Do not paraphrase the rider.
 
 ## Method
 
@@ -49,7 +81,9 @@ Every verdict must cite telemetry. Do not guess.
    `CLEAR_RIDING`, `UPDATE_PROGRESS`, `UPDATE_ROUTE_MATCH`,
    `UPDATE_VEHICLE_MATCH`, `START_REROUTE` (check `reason` and `autoApply`),
    `REROUTE_SNAPSHOT`, `ADD_NOTIFICATION`, `SET_ACTIVE_ITINERARY` (an
-   explicit rider choice).
+   explicit rider choice), and `RIDER_NOTE` (`kind: "rider-note"`) — the
+   rider's own notes, interleaved in the same stream at the second they
+   were typed.
 3. Build the replay fixture so the ride can be re-run against the code:
    ```
    cd /home/rwt/projects/otprr/otp-react-redux
@@ -93,20 +127,31 @@ Structure:
 # Ride report — <date> (session <session>)
 
 **Trip:** <itinerary one-liner from itinerarySummary>
-**Window:** <local start>-<local end>  ·  **Findings:** N  ·  **Paged:** M
+**Window:** <local start>-<local end>  ·  **Findings:** N  ·  **Paged:** M  ·  **Rider notes:** K
 **Verdict:** <one sentence: what actually went wrong on this ride>
+
+## What the rider said
+<omit this section entirely if riderNotes is empty>
+### <local time> — "<note verbatim>" -> **<verdict>**
+<what the app was showing them at that second, from context + telemetry, with
+the actual numbers. Say plainly whether the telemetry backs them up.>
+**Evidence:** <action types + timestamps you read>
+**Fix:** <category> — <one or two sentences> · `<file>` (real-bug only)
 
 ## Timeline
 <the 5-15 telemetry moments that explain the ride, local times, one line each>
 
 ## Findings
+<machine findings only; a finding the rider already described belongs above,
+cross-referenced here in one line>
 ### <local time> — <rule> (<severity>) -> **<verdict>**
 <what the telemetry shows, with the actual numbers>
 **Evidence:** <action types + timestamps you read>
 **Fix:** <category> — <one or two sentences> · `<file>` (real-bug only)
 
 ## Rule tuning
-<any rule that misfired, and the threshold or guard that would stop it>
+<any rule that misfired, and the threshold or guard that would stop it; plus
+any rule that *should exist* because a note caught something no rule did>
 
 ## Fixture
 <path, or why it could not be built>

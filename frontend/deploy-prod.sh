@@ -36,3 +36,8 @@ chmod -R u=rwX,go=rX "$WEBROOT"
 
 echo "==> Deployed $(find "$WEBROOT" -type f | wc -l) files."
 echo "    Live at https://tre.hopto.org:9966 — the app loads it on next launch/refresh."
+
+# The rsync --delete above prunes anything that isn't part of the built app,
+# which includes the rider's mid-ride console at /ride. Put it back — it is a
+# separate page with its own source, not a build artifact.
+"$(dirname "$0")/../ride-watch/deploy-ride-console.sh"

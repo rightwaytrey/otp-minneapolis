@@ -129,6 +129,38 @@ limit. A ride with zero findings requests no report at all; it just updates
 Raw findings are also appended to
 `~/otp-debug-logs/ride-watch/<date>-<session>.findings.jsonl`.
 
+## Rider notes — the ride console
+
+The rule engine only notices what the telemetry admits. The rider can see out
+of the window. So there is a fourth input: a page at
+**https://tre.hopto.org:9966/ride** (add it to the phone's home screen) with a
+text box at the bottom and ride-watch's live view at the top.
+
+A note POSTs to `/api/ride-note` in the Flask sidecar, which appends it to the
+*same* daily JSONL as the telemetry:
+
+```json
+{"kind":"rider-note","event":"RIDER_NOTE","text":"...","t":1785...,"recv":1785...,"session":"...","ip":"..."}
+```
+
+The daemon picks it up in stream order and attaches it to the active trip —
+by session id, or by "there is only one ride happening" when the sidecar's
+session guess misses. Each note is stored with the trip state at that instant
+(leg, progress, status, stops remaining, whether the rider is aboard, GPS
+staleness), rendered in `current-ride.md` under **Rider notes**, and persisted
+as a finding with rule `rider-note` at severity `info`.
+
+Notes carry no push body, so they can **never page** the rider — buzzing
+someone about the note they just typed would be absurd — but they are the
+highest-value input to the post-ride report, which triages each one against
+what the telemetry says was happening at that second (`report-prompt.md`).
+
+The page also polls `/api/ride-status` (5s, paused when hidden) for the current
+`current-ride.md`, the newest findings, and today's notes. It is a single
+self-contained file, deployed by `ride-watch/deploy-ride-console.sh`; the
+frontend's `deploy-prod.sh` re-runs it, because that script's
+`rsync --delete` would otherwise sweep the page out of the web root.
+
 ## Running it
 
 Installed as a **user** service:

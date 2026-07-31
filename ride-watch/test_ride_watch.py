@@ -123,6 +123,15 @@ class StreamBuilder:
             "legIndex": leg, "distanceFromRoute": dist,
             "progressAlongLeg": 0.1, "isOnRoute": on_route})
 
+    def note(self, text, session=None):
+        """A rider note exactly as the Flask sidecar writes it to the JSONL."""
+        self.events.append({
+            "kind": "rider-note", "event": "RIDER_NOTE", "text": text,
+            "t": self.t, "recv": self.t / 1000.0,
+            "session": self.session if session is None else session,
+            "ip": "10.0.0.5"})
+        return self
+
 
 class RuleTestCase(unittest.TestCase):
     """Base: runs a synthetic stream through the real RideWatch code path."""
@@ -642,6 +651,109 @@ class TestSurfaces(RuleTestCase):
         watch.write_status(force=True)
         self.assertIn("clean ride",
                       read_text(os.path.join(self.tmp, "current-ride.md")))
+
+
+class TestRiderNotes(RuleTestCase):
+    """Notes typed on the /ride console land in the stream like any event.
+
+    They are the rider's own account of the ride — first-class input to the
+    post-ride report — but an observation, never an alarm.
+    """
+
+    def test_a_note_attaches_to_the_active_trip(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5, prog=30.0)
+        b.advance(1000).note("driver blew past my stop")
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips[SESSION]
+        self.assertEqual(len(trip.notes), 1)
+        self.assertEqual(trip.notes[0]["text"], "driver blew past my stop")
+        self.assertIn("rider-note", self.rules(watch))
+        fnd = self.find(watch, "rider-note")[0]
+        self.assertEqual(fnd["severity"], "info")
+        self.assertIn("driver blew past my stop", fnd["summary"])
+
+    def test_a_note_captures_the_trip_state_at_that_moment(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).progress(stops=3, prog=45.0, status="on_track")
+        b.advance(1000).note("bus is crawling")
+        watch = self.run_stream(b, finalize=False)
+        ctx = watch.trips[SESSION].notes[0]["context"]
+        self.assertEqual(ctx["legIndex"], 1)
+        self.assertEqual(ctx["legProgress"], 45.0)
+        self.assertEqual(ctx["stopsRemaining"], 3)
+        self.assertEqual(ctx["status"], "on_track")
+        self.assertTrue(ctx["onTransitLeg"])
+        self.assertEqual(ctx["riding"]["tripId"], "1:100")
+        self.assertEqual(ctx["text"], "bus is crawling")
+
+    def test_a_note_never_pages(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for text in ("this is broken", "PAGE ME", "stop count collapsed"):
+            b.advance(1000).note(text)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(watch.trips[SESSION].notes), 3)
+        self.assertEqual(watch.push_log, [])
+        self.assertEqual(watch.trips[SESSION].pages_sent, 0)
+        for fnd in self.find(watch, "rider-note"):
+            self.assertEqual(fnd["severity"], "info")
+            self.assertNotIn("paged", fnd)
+
+    def test_notes_render_in_the_status_file(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=3, prog=45.0)
+        b.advance(1000).note("wrong stop announced")
+        b.advance(1000).note("still wrong")
+        watch = self.run_stream(b, finalize=False)
+        watch.write_status(force=True)
+        text = read_text(os.path.join(self.tmp, "current-ride.md"))
+        self.assertIn("Rider notes (2, newest first)", text)
+        self.assertIn("wrong stop announced", text)
+        # Newest first, and each note says where in the trip it was written.
+        self.assertLess(text.index("still wrong"), text.index("wrong stop"))
+        self.assertIn("leg 1 at 45%, 3 stops left", text)
+
+    def test_notes_are_persisted_as_findings(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=3)
+        b.advance(1000).note("late again")
+        watch = self.run_stream(b, finalize=False)
+        path = [f for f in os.listdir(self.tmp) if f.endswith(".findings.jsonl")]
+        rows = [json.loads(l) for l in
+                read_text(os.path.join(self.tmp, path[0])).splitlines()
+                if l.strip()]
+        self.assertEqual(rows[0]["rule"], "rider-note")
+        self.assertEqual(rows[0]["severity"], "info")
+        self.assertEqual(rows[0]["context"]["text"], "late again")
+
+    def test_a_note_with_a_stale_session_id_still_finds_the_trip(self):
+        # The sidecar guesses the session from the log tail; when it guesses
+        # wrong there is still only one ride happening.
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).note("guessed wrong", session="some-other-session")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(watch.trips[SESSION].notes), 1)
+
+    def test_a_note_outside_any_trip_is_dropped(self):
+        b = StreamBuilder().at(0).note("thinking out loud")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.trips, {})
+        self.assertEqual(watch.all_findings, [])
+
+    def test_an_empty_note_is_ignored(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).note("   ")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.trips[SESSION].notes, [])
+
+    def test_the_report_request_carries_the_riders_notes(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).note("app said 1 stop left, it was 6")
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        req = json.loads(read_text(
+            os.path.join(self.tmp, "report-request-%s.json" % SESSION)))
+        self.assertEqual(req["notesCount"], 1)
+        self.assertEqual(req["riderNotes"][0]["text"],
+                         "app said 1 stop left, it was 6")
 
 
 class TestPushoverCreds(unittest.TestCase):

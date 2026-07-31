@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<!--
+  ride-console.html — the page the rider opens from their phone home screen
+  while actually riding.
+
+  Two jobs, nothing else:
+    TOP     what ride-watch currently sees (GET /api/ride-status, 5s poll)
+    BOTTOM  a plain text box that drops a note into the live telemetry stream
+            (POST /api/ride-note)
+
+  Deliberately absent: no agent chat, no reply channel, no quick-tag buttons.
+  The rider chose a plain text box. A rider on a bike at a stoplight types one
+  short sentence; anything that needs reading or choosing costs them the moment.
+
+  Constraints this file is built around:
+  - Self-contained. No external requests of any kind — the phone may be on
+    cell, in a tunnel, or on a dying battery.
+  - One-handed. Every tap target is at least 48px and the composer is pinned to
+    the bottom of the screen where a thumb reaches.
+  - 16px minimum font in the textarea, or iOS zooms the page on focus and the
+    rider has to pinch back out mid-ride.
+  - Nothing is lost. A failed send is queued in localStorage and retried; the
+    note keeps the timestamp of the tap, not of the eventual delivery.
+  - Sunlight-readable: heavy contrast, large type, no thin grey-on-grey.
+
+  Source of truth lives in the repo at ride-watch/ride-console.html; deploy with
+  ride-watch/deploy-ride-console.sh.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Ride">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<title>Ride</title>
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' fill='%23111'/%3E%3Ccircle cx='55' cy='120' r='26' fill='none' stroke='%2300c853' stroke-width='9'/%3E%3Ccircle cx='125' cy='120' r='26' fill='none' stroke='%2300c853' stroke-width='9'/%3E%3Cpath d='M55 120 L82 76 L120 76 M92 76 L125 120' fill='none' stroke='%2300c853' stroke-width='9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%9A%B2%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    /* Named, because the `font:` shorthand cannot take `inherit` as the family
+       — doing so drops the whole declaration and the textarea silently falls
+       back to 13px monospace. */
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --bg: #ffffff;
+    --panel: #f1f3f5;
+    --panel-2: #e7ebef;
+    --fg: #000000;
+    --fg-dim: #45505a;
+    --line: #b9c2cb;
+    --accent: #0b5cd5;
+    --ok: #0a6b2e;
+    --ok-bg: #d6f5e0;
+    --page: #a4000f;
+    --page-bg: #ffdcdd;
+    --warn: #7a4a00;
+    --warn-bg: #ffe9c2;
+    --info: #204a86;
+    --info-bg: #dbe8ff;
+    --note-bg: #e6dcff;
+    --note-fg: #4423a0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --panel: #16191d;
+      --panel-2: #22272d;
+      --fg: #ffffff;
+      --fg-dim: #b6c0ca;
+      --line: #39424c;
+      --accent: #5aa3ff;
+      --ok: #4ade80;
+      --ok-bg: #0d2a18;
+      --page: #ff6b6b;
+      --page-bg: #3a0d0f;
+      --warn: #ffc453;
+      --warn-bg: #3a2a08;
+      --info: #8fb9ff;
+      --info-bg: #10203a;
+      --note-bg: #241a45;
+      --note-fg: #c4b0ff;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font: 17px/1.45 var(--font);
+    -webkit-text-size-adjust: 100%;
+  }
+  body { display: flex; flex-direction: column; }
+
+  /* --- status (top, scrolls) ------------------------------------------- */
+  #scroll {
+    flex: 1 1 auto; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: max(12px, env(safe-area-inset-top)) 12px 12px;
+  }
+  #state {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 10px; flex-wrap: wrap;
+    padding: 14px 16px; border-radius: 14px; margin-bottom: 12px;
+    background: var(--panel-2); border: 3px solid var(--line);
+  }
+  #state.active { background: var(--ok-bg); border-color: var(--ok); }
+  #state.idle   { background: var(--panel); }
+  #state.stale  { background: var(--warn-bg); border-color: var(--warn); }
+  #stateLabel { font-size: 26px; font-weight: 800; letter-spacing: -0.3px; }
+  #state.active #stateLabel { color: var(--ok); }
+  #state.stale  #stateLabel { color: var(--warn); }
+  #updated { font-size: 15px; font-weight: 600; color: var(--fg-dim); }
+
+  h2.section {
+    font-size: 13px; font-weight: 800; letter-spacing: 1.2px;
+    text-transform: uppercase; color: var(--fg-dim);
+    margin: 22px 0 8px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 12px 14px;
+  }
+  /* current-ride.md, rendered */
+  .md h1, .md h2, .md h3 { margin: 14px 0 6px; line-height: 1.25; }
+  .md h1 { font-size: 19px; }
+  .md h2 { font-size: 18px; }
+  .md h3 { font-size: 15px; text-transform: uppercase; letter-spacing: 0.8px;
+           color: var(--fg-dim); }
+  .md h1:first-child, .md h2:first-child, .md h3:first-child { margin-top: 0; }
+  .md p { margin: 8px 0; }
+  .md ul { margin: 6px 0; padding-left: 20px; }
+  .md li { margin: 4px 0; }
+  .md em { color: var(--fg-dim); font-style: normal; font-size: 15px; }
+  .md code { font-family: ui-monospace, Menlo, monospace; font-size: 15px; }
+
+  ul.findings, ul.notes { list-style: none; margin: 0; padding: 0; }
+  ul.findings li, ul.notes li {
+    border-radius: 12px; padding: 11px 13px; margin-bottom: 8px;
+    border-left: 6px solid var(--line); background: var(--panel);
+  }
+  li.sev-page { background: var(--page-bg); border-left-color: var(--page); }
+  li.sev-warn { background: var(--warn-bg); border-left-color: var(--warn); }
+  li.sev-info { background: var(--info-bg); border-left-color: var(--info); }
+  li.sev-note { background: var(--note-bg); border-left-color: var(--note-fg); }
+  .meta {
+    display: block; font-size: 13px; font-weight: 800; letter-spacing: 0.6px;
+    text-transform: uppercase; margin-bottom: 3px; color: var(--fg-dim);
+  }
+  li.sev-page .meta { color: var(--page); }
+  li.sev-warn .meta { color: var(--warn); }
+  li.sev-info .meta { color: var(--info); }
+  li.sev-note .meta { color: var(--note-fg); }
+  .empty { color: var(--fg-dim); font-size: 15px; padding: 4px 2px; }
+  .pending-badge {
+    display: inline-block; margin-left: 6px; padding: 1px 7px;
+    border-radius: 99px; background: var(--warn); color: #000;
+    font-size: 12px; font-weight: 800; text-transform: uppercase;
+  }
+
+  /* --- composer (bottom, pinned) --------------------------------------- */
+  #composer {
+    flex: 0 0 auto;
+    border-top: 2px solid var(--line); background: var(--bg);
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+  }
+  #note {
+    display: block; width: 100%; min-height: 76px; resize: none;
+    font: 600 18px/1.35 var(--font);   /* >=16px: iOS zooms the page below that */
+    color: var(--fg); background: var(--panel);
+    border: 2px solid var(--line); border-radius: 12px; padding: 12px 14px;
+  }
+  #note:focus { outline: none; border-color: var(--accent); }
+  #note::placeholder { color: var(--fg-dim); font-weight: 500; }
+  #send {
+    display: block; width: 100%; min-height: 62px; margin-top: 10px;
+    font: 800 21px/1 var(--font); letter-spacing: 0.3px;
+    color: #fff; background: var(--accent);
+    border: none; border-radius: 14px; cursor: pointer;
+  }
+  #send:disabled { opacity: 0.45; }
+  #send:active:not(:disabled) { transform: scale(0.99); filter: brightness(0.9); }
+  #toast {
+    min-height: 22px; margin-top: 8px; text-align: center;
+    font-size: 15px; font-weight: 700; color: var(--fg-dim);
+  }
+  #toast.ok { color: var(--ok); }
+  #toast.bad { color: var(--warn); }
+</style>
+</head>
+<body>
+
+<div id="scroll">
+  <div id="state" class="idle">
+    <span id="stateLabel">Connecting…</span>
+    <span id="updated">&nbsp;</span>
+  </div>
+
+  <h2 class="section">Ride watch</h2>
+  <div class="card md" id="md"><p class="empty">Loading…</p></div>
+
+  <h2 class="section">Findings</h2>
+  <ul class="findings" id="findings"><li class="empty">None yet.</li></ul>
+
+  <h2 class="section">Your notes this ride</h2>
+  <ul class="notes" id="notes"><li class="empty">No notes yet.</li></ul>
+</div>
+
+<div id="composer">
+  <textarea id="note" rows="3" maxlength="500" autocapitalize="sentences"
+            autocorrect="on" spellcheck="true" enterkeyhint="send"
+            placeholder="What just happened?"></textarea>
+  <button id="send" type="button">Send note</button>
+  <div id="toast">&nbsp;</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var STATUS_URL = "/api/ride-status";
+  var NOTE_URL = "/api/ride-note";
+  var POLL_MS = 5000;
+  var QUEUE_KEY = "rideConsole.queue.v1";
+  var MAX_NOTE_CHARS = 500;
+
+  var el = {
+    state: document.getElementById("state"),
+    stateLabel: document.getElementById("stateLabel"),
+    updated: document.getElementById("updated"),
+    md: document.getElementById("md"),
+    findings: document.getElementById("findings"),
+    notes: document.getElementById("notes"),
+    note: document.getElementById("note"),
+    send: document.getElementById("send"),
+    toast: document.getElementById("toast")
+  };
+
+  var timer = null;
+  var lastUpdatedMs = null;
+  var lastPollOk = false;
+  var serverNotes = [];
+  var flushing = false;
+
+  // --- the offline queue -------------------------------------------------
+  // A rider in a tunnel must not lose the note they just typed. Everything is
+  // written to the queue first and only removed once the server has it, so a
+  // crash, a reload, or a dead cell mid-POST all end the same way: the note
+  // goes out on the next successful poll, still stamped with the time it was
+  // actually typed.
+
+  function loadQueue() {
+    try {
+      var q = JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+      return Array.isArray(q) ? q : [];
+    } catch (e) { return []; }
+  }
+
+  function saveQueue(q) {
+    try { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); } catch (e) {}
+  }
+
+  function enqueue(text) {
+    var q = loadQueue();
+    q.push({ tsMs: Date.now(), text: text });
+    saveQueue(q);
+    render();
+  }
+
+  function flushQueue() {
+    if (flushing) return Promise.resolve();
+    var q = loadQueue();
+    if (!q.length) return Promise.resolve();
+    flushing = true;
+
+    // Oldest first, one at a time: the daemon reads the stream in order and a
+    // note's position relative to the telemetry is half its value.
+    function step() {
+      var pending = loadQueue();
+      if (!pending.length) return Promise.resolve();
+      var note = pending[0];
+      return fetch(NOTE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: note.text, tsMs: note.tsMs })
+      }).then(function (res) {
+        if (!res.ok) throw new Error("http " + res.status);
+        var rest = loadQueue();
+        rest.shift();
+        saveQueue(rest);
+        return step();
+      });
+    }
+
+    return step().then(function () {
+      flushing = false;
+      render();
+      return poll();
+    }, function () {
+      flushing = false;
+      render();
+    });
+  }
+
+  // --- sending -----------------------------------------------------------
+
+  function toast(msg, cls) {
+    el.toast.textContent = msg || " ";
+    el.toast.className = cls || "";
+    if (msg) {
+      window.clearTimeout(toast._t);
+      toast._t = window.setTimeout(function () {
+        el.toast.textContent = " ";
+        el.toast.className = "";
+      }, 4000);
+    }
+  }
+
+  function send() {
+    var text = el.note.value.trim();
+    if (!text) { el.note.focus(); return; }
+    text = text.slice(0, MAX_NOTE_CHARS);
+
+    // Clear the box immediately. The note is safe in the queue, and a rider
+    // who has to watch a spinner before they can look up at the road has been
+    // handed the wrong trade.
+    el.note.value = "";
+    el.note.blur();
+    enqueue(text);
+    toast("Saved", "ok");
+
+    flushQueue().then(function () {
+      if (loadQueue().length) toast("Queued — will send when back online", "bad");
+      else toast("Sent", "ok");
+    });
+  }
+
+  el.send.addEventListener("click", send);
+
+  // --- polling -----------------------------------------------------------
+
+  function poll() {
+    return fetch(STATUS_URL, { cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) throw new Error("http " + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        lastPollOk = true;
+        lastUpdatedMs = data.updatedMs || null;
+        serverNotes = Array.isArray(data.notesToday) ? data.notesToday : [];
+        renderStatus(data);
+        render();
+        if (loadQueue().length) flushQueue();
+      })
+      .catch(function () {
+        lastPollOk = false;
+        renderConnectionLost();
+      });
+  }
+
+  function startPolling() {
+    if (timer) return;
+    poll();
+    timer = window.setInterval(poll, POLL_MS);
+  }
+
+  function stopPolling() {
+    if (!timer) return;
+    window.clearInterval(timer);
+    timer = null;
+  }
+
+  // Battery: a screen-off phone in a jersey pocket has no reason to keep a 5s
+  // poll running for a whole commute.
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) stopPolling();
+    else startPolling();
+  });
+
+  // --- rendering ---------------------------------------------------------
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function inline(s) {
+    return esc(s)
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      // Emphasis must open after whitespace and close before whitespace or
+      // punctuation, or the underscores inside a status value ("on_track",
+      // "stop-count-collapse") get eaten and the line renders in halves.
+      .replace(/(^|\s)_(\S(?:[\s\S]*?\S)?)_(?=$|\s|[.,;:!?)])/g,
+               "$1<em>$2</em>");
+  }
+
+  // current-ride.md is written by ride_watch.py and uses four constructs:
+  // headings, bullets, blank lines, and _emphasis_. Rendering exactly those is
+  // less code than pulling in a markdown library, and there is no third party
+  // to fetch on a cell connection.
+  function renderMarkdown(src) {
+    var out = [], inList = false;
+    var lines = String(src || "").split("\n");
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i];
+      var h = /^(#{1,6})\s+(.*)$/.exec(line);
+      var li = /^[-*]\s+(.*)$/.exec(line);
+      if (li) {
+        if (!inList) { out.push("<ul>"); inList = true; }
+        out.push("<li>" + inline(li[1]) + "</li>");
+        continue;
+      }
+      if (inList) { out.push("</ul>"); inList = false; }
+      if (h) {
+        var lvl = Math.min(h[1].length, 3);
+        out.push("<h" + lvl + ">" + inline(h[2]) + "</h" + lvl + ">");
+      } else if (line.trim()) {
+        out.push("<p>" + inline(line) + "</p>");
+      }
+    }
+    if (inList) out.push("</ul>");
+    return out.join("");
+  }
+
+  function ago(ms) {
+    if (!ms) return "";
+    var s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    if (s < 60) return s + "s ago";
+    var m = Math.round(s / 60);
+    if (m < 60) return m + "m ago";
+    return Math.round(m / 60) + "h ago";
+  }
+
+  function clock(ms) {
+    if (!ms) return "";
+    var d = new Date(ms);
+    return ("0" + d.getHours()).slice(-2) + ":" + ("0" + d.getMinutes()).slice(-2);
+  }
+
+  function renderStatus(data) {
+    el.state.className = data.active ? "active" : "idle";
+    el.stateLabel.textContent = data.active ? "Active trip" : "No active trip";
+    // current-ride.md ends with its own "### Rider notes" / "### Findings"
+    // sections. Both are rendered below with severity colours and correct
+    // ordering, so the card keeps only the trip summary above them — a rider
+    // holding a handlebar should not have to scroll past the same list twice.
+    var summary = String(data.markdown || "").split(/\n###\s/)[0];
+    el.md.innerHTML = renderMarkdown(summary) ||
+      '<p class="empty">Nothing reported.</p>';
+
+    var findings = Array.isArray(data.findings) ? data.findings : [];
+    if (!findings.length) {
+      el.findings.innerHTML = '<li class="empty">None yet.</li>';
+    } else {
+      el.findings.innerHTML = findings.map(function (f) {
+        var sev = f.rule === "rider-note" ? "note" :
+          (f.severity === "page" || f.severity === "warn" ? f.severity : "info");
+        var label = f.severity === "page" ? "PAGE" : String(f.severity || "").toUpperCase();
+        return '<li class="sev-' + sev + '"><span class="meta">' +
+          esc(clock(f.tsMs)) + " · " + esc(label) + " · " + esc(f.rule) +
+          "</span>" + esc(f.summary) + "</li>";
+      }).join("");
+    }
+  }
+
+  function renderConnectionLost() {
+    el.state.className = "stale";
+    el.stateLabel.textContent = "No connection";
+    el.updated.textContent = "notes are queued";
+  }
+
+  // Merge what the server has with what is still queued, so a note the rider
+  // just typed appears in their list whether or not it has landed yet.
+  function render() {
+    var queued = loadQueue().map(function (n) {
+      return { tsMs: n.tsMs, text: n.text, pending: true };
+    }).reverse();
+    var all = queued.concat(serverNotes);
+
+    if (!all.length) {
+      el.notes.innerHTML = '<li class="empty">No notes yet.</li>';
+    } else {
+      el.notes.innerHTML = all.map(function (n) {
+        return '<li class="sev-note"><span class="meta">' + esc(clock(n.tsMs)) +
+          (n.pending ? '<span class="pending-badge">queued</span>' : "") +
+          "</span>" + esc(n.text) + "</li>";
+      }).join("");
+    }
+
+    if (lastPollOk) {
+      var q = loadQueue().length;
+      el.updated.textContent = "updated " + ago(lastUpdatedMs) +
+        (q ? " · " + q + " queued" : "");
+    }
+  }
+
+  // Keep "updated Ns ago" honest between polls, and while the tab is hidden
+  // the poll is off but the clock is not.
+  window.setInterval(function () { if (!document.hidden) render(); }, 1000);
+
+  startPolling();
+  window.addEventListener("online", flushQueue);
+  render();
+})();
+</script>
+</body>
+</html>

@@ -66,6 +66,7 @@ MAX_PAGES_PER_TRIP = 2
 PUSH_MIN_INTERVAL_MS = 120 * 1000
 STATUS_DEBOUNCE_MS = 2000
 STOP_INCREASE_COOLDOWN_MS = 60 * 1000
+RIDER_NOTE_MAX_CHARS = 500                 # matches the sidecar's own cap
 
 # Page coalescing. A failure rarely produces one finding: on 2026-07-29 the
 # app flipped the riding tripId at 17:28:45 and only eight seconds later
@@ -279,6 +280,7 @@ class Trip:
         self.prev_dist = None
         self.last_rider_action_ms = 0
         self.console_seen = set()
+        self.notes = []                           # rider-typed notes, in order
         self.findings = []
         self.pages_sent = 0
         self.pending_pages = []                   # page candidates in the window
@@ -389,6 +391,11 @@ class RideWatch:
         elif typ == "STOP_GO_MODE":
             if trip:
                 self._end_trip(trip, t, "stop")
+        elif typ == "RIDER_NOTE" or kind == "rider-note":
+            # Typed by the rider on the /ride console mid-trip. Handled before
+            # the `trip is not None` branch because the note's session id is a
+            # best-effort guess by the sidecar and may not match a known trip.
+            self._on_rider_note(session, t, obj, trip)
         elif trip is not None:
             if kind == "console":
                 self._rule_console(trip, t, obj)
@@ -686,6 +693,66 @@ class RideWatch:
         self._finding(trip, t, "console-error", "info",
                       "console.error: %s" % msg[:120], {"message": msg})
 
+    # -- rider notes --------------------------------------------------------
+
+    def _trip_context(self, trip):
+        """What the trip looked like at this instant.
+
+        A note says "it just told me the wrong stop" — worthless a week later
+        unless we also recorded which leg, how far along, and whether the app
+        thought the rider was aboard. The post-ride report correlates the two.
+        """
+        p = trip.progress or {}
+        ctx = {
+            "legIndex": p.get("currentLegIndex"),
+            "legProgress": p.get("currentLegProgress"),
+            "status": p.get("status"),
+            "stopsRemaining": p.get("stopsRemaining"),
+            "nextStopName": p.get("nextStopName"),
+            "onTransitLeg": trip.current_leg_transit(),
+            "swapSeq": trip.swap_seq,
+            "secondsSinceFix": max(0, (self.now_ms() - trip.last_pos_ms) // 1000),
+        }
+        if trip.riding:
+            ctx["riding"] = {k: trip.riding.get(k) for k in
+                             ("tripId", "vehicleId", "routeId", "headsign",
+                              "legIndex")}
+        else:
+            ctx["riding"] = None
+        return ctx
+
+    def _on_rider_note(self, session, t, obj, trip):
+        """Ingest a note the rider typed on the /ride console.
+
+        Notes are the rider's own words about the ride, so they are the most
+        valuable input the post-ride report gets — but they are an observation,
+        never an alarm. They land at `info` severity and carry no push body, so
+        they can never consume one of the rider's two interrupts. Paging
+        someone about the note they just wrote would be absurd.
+        """
+        text = obj.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return
+        text = text.strip()[:RIDER_NOTE_MAX_CHARS]
+        if trip is None:
+            # The sidecar guesses the session from the log tail and can miss.
+            # If exactly one trip is running, the note is plainly about it —
+            # that is the timestamp correlation the note stream exists for.
+            active = list(self.trips.values())
+            if len(active) == 1:
+                trip = active[0]
+        if trip is None:
+            self.log.info("rider note outside any trip (session=%s): %s"
+                          % (session, text))
+            return
+        trip.last_event_ms = max(trip.last_event_ms, t)
+        context = self._trip_context(trip)
+        context["text"] = text
+        trip.notes.append({"tsMs": int(t), "time": fmt_hms(t), "text": text,
+                           "context": context})
+        self._finding(trip, t, "rider-note", "info",
+                      "rider note: %s" % text[:160], context)
+
     # -- findings, paging, surfaces ----------------------------------------
 
     def _finding(self, trip, ts_ms, rule, severity, summary, context, push_body=None):
@@ -838,6 +905,11 @@ class RideWatch:
             "findingsPath": self._findings_path(trip),
             "itinerarySummary": trip.itinerary or {"unavailable": True},
             "findingsCount": len(trip.findings),
+            # The rider's notes are in findingsPath too (rule "rider-note"),
+            # but the count is surfaced here so the report agent knows up front
+            # whether this ride has the rider's own account of it.
+            "notesCount": len(trip.notes),
+            "riderNotes": trip.notes,
             "pagesSent": trip.pages_sent,
             "endReason": trip.end_reason,
         }
@@ -961,6 +1033,23 @@ class RideWatch:
             lines.append("- Last fix: %ds ago" % max(0, (now - trip.last_pos_ms) // 1000))
             lines.append("- Pages sent: %d/%d" % (trip.pages_sent, MAX_PAGES_PER_TRIP))
             lines.append("")
+            # The rider's own words go above the machine findings: when both
+            # exist, the note is the one that says what actually went wrong.
+            if trip.notes:
+                lines.append("### Rider notes (%d, newest first)" % len(trip.notes))
+                lines.append("")
+                for note in reversed(trip.notes[-20:]):
+                    c = note["context"]
+                    where = "leg %s" % c.get("legIndex")
+                    if isinstance(c.get("legProgress"), (int, float)):
+                        where += " at %.0f%%" % c["legProgress"]
+                    if c.get("stopsRemaining") is not None:
+                        where += ", %s stops left" % c["stopsRemaining"]
+                    if c.get("status"):
+                        where += ", %s" % c["status"]
+                    lines.append("- %s — %s  _(%s)_" % (
+                        note["time"], note["text"], where))
+                lines.append("")
             if trip.findings:
                 lines.append("### Findings (%d, newest first)" % len(trip.findings))
                 lines.append("")
