@@ -1,0 +1,21 @@
+[Unit]
+Description=ride-watch — live Go Mode telemetry anomaly watcher
+Documentation=file:///home/rwt/projects/otp-minneapolis/ride-watch/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/rwt/projects/otp-minneapolis/ride-watch/ride_watch.py
+WorkingDirectory=/home/rwt/projects/otp-minneapolis
+Restart=on-failure
+RestartSec=10
+# The post-ride report agent is spawned as a child and outlives nothing;
+# give it room to finish rather than killing it with the daemon.
+KillMode=process
+TimeoutStopSec=30
+StandardOutput=null
+StandardError=journal
+SyslogIdentifier=ride-watch
+
+[Install]
+WantedBy=default.target

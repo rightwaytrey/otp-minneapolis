@@ -1,0 +1,149 @@
+# ride-watch
+
+A daemon that watches the transit-navigation app's live telemetry while the
+rider is actually on a trip, flags anomalies as they happen, and asks Claude
+for a written post-mortem once the ride ends.
+
+The problem it solves: the app streams a lot of telemetry, and the
+interesting failures (the stop counter collapsing, the itinerary being
+swapped out from under a rider who is already aboard) are buried in ~1 Hz
+noise and only noticed hours later, if at all. ride-watch reads the stream
+continuously so that a bad ride is understood the same evening.
+
+## How it works
+
+The app batches JSONL telemetry to the Flask sidecar
+(`/api/debug-log` in `transitnav/preferences_api.py`), which appends it to
+`~/otp-debug-logs/debug-<UTC-date>.jsonl`. ride-watch tails that file.
+
+Each line is a redux action (`{type, payload, t, session, recv}`), a console
+line (`{kind:"console", level, args}`), or a session marker.
+
+**State machine**, per session:
+
+- `idle` → `active` on `START_GO_MODE` (the itinerary is captured then)
+- `active` → `ended` on `STOP_GO_MODE`, or after 15 minutes of silence
+- A *second* `START_GO_MODE` during an active trip is an **itinerary swap**,
+  not a new trip. This distinction is what makes the `aboard-swap` rule
+  possible.
+- If the daemon starts mid-ride it scans the last 5 minutes of the file and
+  **adopts** an in-progress trip rather than missing it.
+
+**Rules.** Each produces a finding
+`{tsMs, session, rule, severity, summary, context}` at `info`, `warn`, or
+`page` severity:
+
+| rule | fires when | severity |
+| --- | --- | --- |
+| `stop-count-collapse` | `stopsRemaining` drops to 1 below 60% of a transit leg | page |
+| `stop-count-increase` | `stopsRemaining` rises with no itinerary swap | warn |
+| `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby | page |
+| `riding-flip` | `SET_RIDING` tripId changes on the same transit leg | page |
+| `missed-bus-while-riding` | `MISSED_BUS` notification while riding is held | page |
+| `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
+| `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip | warn |
+| `reroute-storm` | more than 3 `START_REROUTE` in 5 minutes | warn |
+| `console-error` | a `console.error` line (deduped by message) | info |
+| `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
+
+## The three surfaces
+
+**1. Pushover — the interrupt.** Only `page`-severity findings, at most
+**2 per ride**, with a **120s minimum gap**. Everything beyond the cap is
+logged, not sent. Message copy follows the rider's rule: only the numbers
+they can act on, under 120 characters, no coaching phrases, no exclamation
+marks. Credentials come from `~/.config/pushover/credentials`
+(`USER_KEY=` / `API_TOKEN=`, one per line).
+
+**2. `~/otp-debug-logs/ride-watch/current-ride.md` — the live view.**
+Rewritten on any state change (2s debounce) so *any* Claude session can just
+read it to see what is happening right now: trip summary, current leg,
+progress, status, whether the rider is aboard, how stale the last GPS fix
+is, and findings newest-first. When no trip is running it names the last one
+and whether it was a clean ride.
+
+**3. Vault reports — the post-mortem.** When a ride with at least one
+finding ends, the daemon writes
+`~/otp-debug-logs/ride-watch/report-request-<session>.json` and fires off
+`claude -p "$(cat report-prompt.md)"` with `RIDE_WATCH_REQUEST` pointing at
+it. That headless session triages every finding as **real-bug**,
+**app-behaved-correctly**, or **watcher-false-positive** with telemetry
+evidence, builds a replay fixture, and writes
+`~/obsidian-vault/Claude/ride-watch/<date>-<session-short>.md`, then sends
+one "Report ready" Pushover.
+
+If `claude` is missing or exits non-zero, the daemon sends a single fallback
+push — *"Ride ended — N findings. Report pending; open Claude and say 'ride
+report'."* — which is exempt from the 2-page cap but still shares the rate
+limit. A ride with zero findings requests no report at all; it just updates
+`current-ride.md`.
+
+Raw findings are also appended to
+`~/otp-debug-logs/ride-watch/<date>-<session>.findings.jsonl`.
+
+## Running it
+
+Installed as a **user** service:
+
+```
+systemctl --user status ride-watch
+systemctl --user restart ride-watch
+systemctl --user stop ride-watch          # stop watching
+systemctl --user disable --now ride-watch # stop and don't come back
+journalctl --user -u ride-watch -f        # live logs
+```
+
+The daemon's own log is `~/otp-debug-logs/ride-watch/daemon.log`
+(size-rotated at 5 MB to `.1`). `SIGTERM` shuts down cleanly and leaves any
+active trip un-ended, so a restart re-adopts it instead of firing a spurious
+"ride ended".
+
+The unit needs **linger** enabled so it runs when nobody is logged in. Check
+with `loginctl show-user rwt | grep Linger`. If it says `Linger=no`, run:
+
+```
+sudo loginctl enable-linger rwt
+```
+
+## Replaying a past ride
+
+Run any historical file through the exact same code path at full speed:
+
+```
+python3 ride-watch/ride_watch.py --replay ~/otp-debug-logs/debug-2026-07-29.jsonl
+```
+
+Replay is **always dry-run**: it never sends a Pushover and never spawns a
+report agent. It also writes to `~/otp-debug-logs/ride-watch/replay/` by
+default so it cannot clobber the live status file. Use `--watch-dir DIR` to
+send output somewhere else. It prints every finding with its local time and
+the pushes that *would* have gone out.
+
+## Tuning the rules
+
+Thresholds are module constants at the top of `ride_watch.py` —
+`STOP_COLLAPSE_MAX_PROGRESS`, `DEVIATED_STREAK_MS`, `GPS_GAP_MS`,
+`REROUTE_STORM_COUNT`, `DISTANCE_SPIKE_FAR_M`, `MAX_PAGES_PER_TRIP`,
+`PUSH_MIN_INTERVAL_MS`, and so on.
+
+The honest workflow for changing one: replay a real ride before and after,
+compare which findings appear, and add a test. A rule that pages on a
+correct app behaviour is worse than a rule that stays quiet — the rider gets
+two interrupts per ride and they should both be worth reading.
+
+Environment overrides: `RIDE_WATCH_DRY_RUN=1` (log pushes instead of sending
+them and skip the report agent), `RIDE_WATCH_LOG_DIR`, `RIDE_WATCH_DIR`,
+`RIDE_WATCH_PUSHOVER_CREDS`, `RIDE_WATCH_CLAUDE`, `RIDE_WATCH_REPO`.
+
+## Tests
+
+```
+python3 ride-watch/test_ride_watch.py
+```
+
+Stdlib `unittest`, no installs. Synthetic streams cover every rule (both the
+firing case and the case that must stay quiet) and the state machine. The
+last suite replays the real `debug-2026-07-29.jsonl` and asserts that the
+17:28 incident is caught — board-state anomaly plus stop-count collapse —
+and that the rider would not have been paged more than twice. Tests never
+touch the network; the Pushover path is verified by credential parsing only.
