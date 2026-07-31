@@ -67,6 +67,42 @@ PUSH_MIN_INTERVAL_MS = 120 * 1000
 STATUS_DEBOUNCE_MS = 2000
 STOP_INCREASE_COOLDOWN_MS = 60 * 1000
 
+# Page coalescing. A failure rarely produces one finding: on 2026-07-29 the
+# app flipped the riding tripId at 17:28:45 and only eight seconds later
+# reported one stop remaining at 0% of the leg. First-come-first-served paging
+# plus the 120s rate limit meant the rider was told about the tripId (a
+# diagnostic detail) and never about the stop count (the thing that would have
+# made them get off at the wrong stop). So a page is held briefly and the
+# highest-ranked page in the window is the one that goes out.
+#
+# The window is deliberately short: long enough to catch a cascade like
+# 17:28:45 -> 17:28:53, short enough that the rider hears about it while they
+# can still act on it. It is set by the *first* page in the window and later
+# pages do not extend it, so a continuing storm cannot defer paging forever.
+PAGE_COALESCE_MS = 15 * 1000
+
+# Actionability rank, highest first. The question each rank answers is "how
+# much does this change what the rider does in the next minute?", not "how
+# broken is the app" — the post-ride report covers the latter.
+#   stop-count-collapse     the banner is lying about when to get off; the
+#                           rider acts on it immediately
+#   missed-bus-while-riding a wrong alert telling a seated rider to move
+#   aboard-swap             the on-screen route no longer matches their bus
+#   riding-flip             board state is suspect, but the rider is still on
+#                           the right vehicle — diagnostic
+#   deviated-streak         position tracking looks off; nothing to do about it
+# Rules not listed rank mid-pack, so a newly added page rule is neither
+# silently starved nor able to outrank the stop counter before anyone has
+# thought about where it belongs. Add it here when you add the rule.
+PAGE_RANK = {
+    "stop-count-collapse": 50,
+    "missed-bus-while-riding": 40,
+    "aboard-swap": 30,
+    "riding-flip": 20,
+    "deviated-streak": 10,
+}
+PAGE_RANK_DEFAULT = 25
+
 TRANSIT_MODES = {
     "BUS", "TRAM", "RAIL", "SUBWAY", "FERRY", "GONDOLA", "CABLE_CAR",
     "FUNICULAR", "TROLLEYBUS", "MONORAIL", "TRANSIT", "COACH",
@@ -245,6 +281,8 @@ class Trip:
         self.console_seen = set()
         self.findings = []
         self.pages_sent = 0
+        self.pending_pages = []                   # page candidates in the window
+        self.pending_until_ms = None              # when the window closes
         self.end_ms = None
         self.end_reason = None
 
@@ -415,6 +453,9 @@ class RideWatch:
         self._mark_dirty()
 
     def _end_trip(self, trip, t, reason):
+        # Flush first: a page must not be lost because the trip ended three
+        # seconds into its coalescing window.
+        self._flush_pages(trip, t, force=True)
         trip.end_ms = t
         trip.end_reason = reason
         del self.trips[trip.session]
@@ -439,12 +480,18 @@ class RideWatch:
         self.write_status(force=True)
 
     def check_timers(self):
-        """Silence-based rules + trip timeout. Called per event and on ticks."""
+        """Silence-based rules + trip timeout. Called per event and on ticks.
+
+        This is also how a buffered page gets out when the log goes quiet: the
+        live loop ticks every 5s regardless of traffic, so a closed coalescing
+        window is never waiting on the next telemetry line.
+        """
         now = self.now_ms()
         for trip in list(self.trips.values()):
             if now - trip.last_event_ms > SESSION_TIMEOUT_MS:
                 self._end_trip(trip, trip.last_event_ms, "timeout")
                 continue
+            self._flush_pages(trip, now)
             # gps-gap: no position fix for >60s mid-trip
             if not trip.gps_gap_open and now - trip.last_pos_ms > GPS_GAP_MS:
                 trip.gps_gap_open = True
@@ -654,21 +701,75 @@ class RideWatch:
         trip.findings.append(finding)
         self.all_findings.append(finding)
         self.log.info("FINDING [%s/%s] %s %s" % (severity, rule, fmt_hms(ts_ms), summary))
-        # Page before persisting so the record says whether the rider was told.
-        if severity == "page":
-            finding["paged"] = (
-                self._page(trip, push_body) if push_body else False)
+        # Persist only once the paging decision is known, so the record always
+        # says whether the rider was told. For a page that means after the
+        # coalescing window closes (at most PAGE_COALESCE_MS later).
+        if severity == "page" and push_body:
+            finding["paged"] = "pending"
+            self._buffer_page(trip, ts_ms, rule, push_body, finding)
+        else:
+            if severity == "page":
+                finding["paged"] = False
+            self._persist_finding(trip, finding)
+        self._mark_dirty()
+
+    def _persist_finding(self, trip, finding):
         try:
             with open(self._findings_path(trip), "a") as f:
                 f.write(json.dumps(finding) + "\n")
         except OSError as exc:
             self.log.error("could not append finding: %r" % exc)
-        self._mark_dirty()
 
     def _findings_path(self, trip):
         return os.path.join(
             self.watch_dir,
             "%s-%s.findings.jsonl" % (fmt_date(trip.start_ms), trip.session))
+
+    def _buffer_page(self, trip, ts_ms, rule, body, finding):
+        """Hold a page for the coalescing window instead of sending it now."""
+        # Close an already-expired window first: the window belongs to the
+        # page that opened it, so a late arrival starts a fresh one rather
+        # than being judged against a decision that should already be out.
+        self._flush_pages(trip, self.now_ms())
+        if not trip.pending_pages:
+            trip.pending_until_ms = self.now_ms() + PAGE_COALESCE_MS
+        trip.pending_pages.append({
+            "tsMs": int(ts_ms), "rule": rule, "body": body,
+            "rank": PAGE_RANK.get(rule, PAGE_RANK_DEFAULT), "finding": finding,
+        })
+        self.log.info("page buffered (%s, rank %d, window closes %s): %s" % (
+            rule, PAGE_RANK.get(rule, PAGE_RANK_DEFAULT),
+            fmt_hms(trip.pending_until_ms), body))
+
+    def _flush_pages(self, trip, now, force=False):
+        """Send the most actionable buffered page; drop the rest.
+
+        Ties go to the earlier finding — if two pages are equally actionable,
+        the one that fired first described the problem first.
+        """
+        if not trip.pending_pages:
+            return
+        if not force and now < trip.pending_until_ms:
+            return
+        pending = trip.pending_pages
+        trip.pending_pages = []
+        trip.pending_until_ms = None
+        winner = min(pending, key=lambda e: (-e["rank"], e["tsMs"]))
+        for entry in pending:
+            if entry is winner:
+                continue
+            self.log.info("page dropped (superseded by %s): %s" % (
+                winner["rule"], entry["body"]))
+            entry["finding"]["paged"] = False
+            entry["finding"]["supersededBy"] = winner["rule"]
+            self.push_log.append({
+                "tsMs": int(now), "title": "Ride watch", "body": entry["body"],
+                "sent": False, "kind": "page",
+                "suppressed": "superseded-by-%s" % winner["rule"]})
+            self._persist_finding(trip, entry["finding"])
+        winner["finding"]["paged"] = self._page(trip, winner["body"])
+        self._persist_finding(trip, winner["finding"])
+        self._mark_dirty()
 
     def _page(self, trip, body):
         """Send a page if the trip's budget and the rate limit allow it."""
@@ -880,6 +981,16 @@ class RideWatch:
 
     # -- finalize (replay EOF / shutdown) -----------------------------------
 
+    def flush_pending_pages(self):
+        """Close every open coalescing window now (shutdown path).
+
+        A clean shutdown leaves active trips un-ended so a restart re-adopts
+        them, but a page still inside its window has nowhere to be re-adopted
+        from — send it before going away.
+        """
+        for trip in list(self.trips.values()):
+            self._flush_pages(trip, self.now_ms(), force=True)
+
     def finalize_replay(self):
         """End any still-active trips at replay EOF."""
         for trip in list(self.trips.values()):
@@ -1057,8 +1168,9 @@ def run_live(watch_dir=None):
         watch.maybe_write_status()
         time.sleep(0.5)
 
-    # Clean shutdown: keep active trips un-ended (a restart re-adopts them);
-    # just leave a fresh status file behind.
+    # Clean shutdown: keep active trips un-ended (a restart re-adopts them),
+    # but do not let the restart eat a page that was still inside its window.
+    watch.flush_pending_pages()
     watch.write_status(force=True)
     log.info("ride-watch stopped cleanly (active trips preserved: %d)"
              % len(watch.trips))

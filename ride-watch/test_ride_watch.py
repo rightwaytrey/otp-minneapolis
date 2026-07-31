@@ -407,7 +407,9 @@ class TestPaging(RuleTestCase):
         b = StreamBuilder().start().advance(1000).progress(stops=5)
         b.advance(1000).riding(trip_id="1:100")
         b.advance(5000).riding(trip_id="1:200")   # page
-        b.advance(5000).riding(trip_id="1:300")   # inside 120s -> suppressed
+        # Past the coalescing window (so this is a second page, not a rival
+        # candidate for the first one) but still inside the 120s rate limit.
+        b.advance(ride_watch.PAGE_COALESCE_MS + 20000).riding(trip_id="1:300")
         watch = self.run_stream(b)
         sent = [p for p in watch.push_log if p.get("sent")]
         self.assertEqual(len(sent), 1)
@@ -443,6 +445,144 @@ class TestPaging(RuleTestCase):
         for p in watch.push_log:
             self.assertLess(len(p["body"]), 120, p["body"])
             self.assertNotIn("!", p["body"])
+
+
+class TestPageRanking(RuleTestCase):
+    """The rider gets the most actionable page in the window, not the first.
+
+    Shaped after the real 17:28 cascade: riding-flip fires first, the stop
+    counter collapses eight seconds later, and only one of them can be sent.
+    """
+
+    def sent_bodies(self, watch):
+        return [p["body"] for p in watch.push_log if p.get("sent")]
+
+    def _flip_then_collapse(self, gap_ms):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=6, prog=20.0)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).riding(trip_id="1:222")            # riding-flip (rank 20)
+        b.advance(gap_ms).progress(leg=1, stops=1, prog=21.0)  # collapse (rank 50)
+        return b
+
+    def test_a_later_higher_ranked_page_supersedes_the_first(self):
+        watch = self.run_stream(self._flip_then_collapse(8000))
+        self.assertEqual(
+            {"riding-flip", "stop-count-collapse"},
+            set(self.rules(watch)) & {"riding-flip", "stop-count-collapse"})
+        sent = self.sent_bodies(watch)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Stop count wrong", sent[0])
+
+    def test_the_superseded_page_is_recorded_not_silently_dropped(self):
+        watch = self.run_stream(self._flip_then_collapse(8000))
+        dropped = [p for p in watch.push_log
+                   if p.get("suppressed", "").startswith("superseded-by")]
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0]["suppressed"],
+                         "superseded-by-stop-count-collapse")
+        self.assertIn("Trip id flipped", dropped[0]["body"])
+        flip = self.find(watch, "riding-flip")[0]
+        self.assertEqual(flip["paged"], False)
+        self.assertEqual(flip["supersededBy"], "stop-count-collapse")
+
+    def test_a_page_outside_the_window_is_not_superseded(self):
+        """Same cascade, but slow enough that both are separate decisions."""
+        watch = self.run_stream(
+            self._flip_then_collapse(ride_watch.PAGE_COALESCE_MS + 20000))
+        sent = self.sent_bodies(watch)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Trip id flipped", sent[0])   # the flip won its own window
+        rate_limited = [p for p in watch.push_log
+                        if p.get("suppressed") == "rate-limit"]
+        self.assertEqual(len(rate_limited), 1)
+
+    def test_a_lower_ranked_page_arriving_later_does_not_win(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=6, prog=20.0)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).progress(leg=1, stops=1, prog=21.0)   # collapse (50)
+        b.advance(5000).riding(trip_id="1:222")               # flip (20)
+        watch = self.run_stream(b)
+        sent = self.sent_bodies(watch)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Stop count wrong", sent[0])
+
+    def test_ties_go_to_the_earlier_page(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).riding(trip_id="1:222")   # riding-flip
+        b.advance(3000).riding(trip_id="1:333")   # riding-flip, same rank
+        watch = self.run_stream(b)
+        sent = self.sent_bodies(watch)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("1:222", sent[0])
+
+    def test_the_ranking_covers_every_page_rule(self):
+        """A page rule with no rank would silently fall back to mid-pack."""
+        page_rules = {"stop-count-collapse", "missed-bus-while-riding",
+                      "aboard-swap", "riding-flip", "deviated-streak"}
+        self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
+        self.assertEqual(
+            ["stop-count-collapse", "missed-bus-while-riding", "aboard-swap",
+             "riding-flip", "deviated-streak"],
+            sorted(ride_watch.PAGE_RANK, key=ride_watch.PAGE_RANK.get,
+                   reverse=True))
+
+    def test_a_buffered_page_is_held_until_the_window_closes(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).riding(trip_id="1:222")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.sent_bodies(watch), [])
+        trip = watch.trips[SESSION]
+        self.assertEqual(len(trip.pending_pages), 1)
+
+    def test_a_buffered_page_flushes_when_the_log_goes_quiet(self):
+        """No further telemetry — the idle tick must still send it."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).riding(trip_id="1:222")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.sent_bodies(watch), [])
+        # The live loop's 5s tick, with the clock past the window.
+        watch.clock_ms += ride_watch.PAGE_COALESCE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(len(self.sent_bodies(watch)), 1)
+        self.assertEqual(watch.trips[SESSION].pending_pages, [])
+
+    def test_a_buffered_page_flushes_when_the_trip_ends(self):
+        """Trip ends 3s into the window: the page must not be lost."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).riding(trip_id="1:222")
+        b.advance(3000).stop()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.sent_bodies(watch)), 1)
+        self.assertEqual(len(watch.ended_trips), 1)
+        self.assertEqual(watch.ended_trips[0].pages_sent, 1)
+
+    def test_a_buffered_page_flushes_on_clean_shutdown(self):
+        """A restart mid-window must not eat the page."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).riding(trip_id="1:222")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.sent_bodies(watch), [])
+        watch.flush_pending_pages()
+        self.assertEqual(len(self.sent_bodies(watch)), 1)
+        # ...and the trip is still active, so a restart re-adopts it.
+        self.assertIn(SESSION, watch.trips)
+
+    def test_a_page_is_persisted_with_its_final_paging_verdict(self):
+        watch = self.run_stream(self._flip_then_collapse(8000))
+        path = [f for f in os.listdir(self.tmp) if f.endswith(".findings.jsonl")]
+        rows = [json.loads(l) for l in
+                read_text(os.path.join(self.tmp, path[0])).splitlines()
+                if l.strip()]
+        by_rule = {r["rule"]: r for r in rows}
+        self.assertEqual(by_rule["stop-count-collapse"]["paged"], True)
+        self.assertEqual(by_rule["riding-flip"]["paged"], False)
+        for row in rows:
+            self.assertNotEqual(row.get("paged"), "pending")
 
 
 class TestSurfaces(RuleTestCase):
@@ -573,6 +713,35 @@ class TestRealIncidentReplay(unittest.TestCase):
         sent = [p for p in self.watch.push_log if p.get("sent")]
         self.assertLessEqual(len(sent), 2,
                              "sent %d pages: %s" % (len(sent), sent))
+
+    def test_the_stop_count_collapse_is_the_page_the_rider_gets(self):
+        """The whole point of the ranking.
+
+        Before coalescing, riding-flip (17:28:45) won the window and the stop
+        count collapse (17:28:53) died to the 120s rate limit — so the rider
+        was told about a trip id and not about the counter that would have put
+        them off at the wrong stop.
+        """
+        sent = [p for p in self.watch.push_log if p.get("sent")]
+        self.assertTrue(
+            any("Stop count wrong" in p["body"] for p in sent),
+            "stop-count-collapse must be one of the <=2 pages; got %s"
+            % [p["body"] for p in sent])
+        collapse = [f for f in self.watch.all_findings
+                    if f["rule"] == "stop-count-collapse"]
+        self.assertEqual(collapse[0]["paged"], True)
+
+    def test_the_17_28_cascade_costs_the_rider_one_interrupt(self):
+        """Four page-worthy findings in eight seconds, one page."""
+        cascade = [p for p in self.watch.push_log
+                   if INCIDENT_START_MS <= p["tsMs"] <= INCIDENT_END_MS]
+        sent = [p for p in cascade if p.get("sent")]
+        superseded = [p for p in cascade
+                      if p.get("suppressed", "").startswith("superseded-by")]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len(superseded), 3)
+        for p in superseded:
+            self.assertEqual(p["suppressed"], "superseded-by-stop-count-collapse")
 
     def test_replay_never_sends_a_real_push(self):
         for p in self.watch.push_log:

@@ -55,6 +55,54 @@ they can act on, under 120 characters, no coaching phrases, no exclamation
 marks. Credentials come from `~/.config/pushover/credentials`
 (`USER_KEY=` / `API_TOKEN=`, one per line).
 
+Pages are **coalesced and ranked** rather than sent first-come-first-served
+— see below.
+
+## Which page the rider actually gets
+
+Failures arrive in cascades. On 2026-07-29 the riding tripId flipped at
+17:28:45 and the stop counter collapsed to "1 left" at 17:28:53. Under
+first-wins paging the rider was told about the trip id — a diagnostic detail
+— and the 120s rate limit swallowed the stop count, which is the one that
+would have put them off at the wrong stop.
+
+So a page is not sent when it fires. It goes into a small per-trip buffer for
+`PAGE_COALESCE_MS` (**15s**); when that window closes, the **highest-ranked**
+page in it is sent and the rest are dropped and logged as
+`superseded by <rule>`. Ties go to the earlier finding. The window is opened
+by the first page and later pages do **not** extend it, so a continuing storm
+cannot defer paging indefinitely; subsequent pages simply open the next
+window. The 2-per-trip cap and the 120s global rate limit still apply on top.
+
+`PAGE_RANK`, highest first — the question is "how much does this change what
+the rider does in the next minute?", not "how broken is the app" (the
+post-ride report covers that):
+
+| rank | rule | why |
+| --- | --- | --- |
+| 50 | `stop-count-collapse` | the banner is lying about when to get off; acted on immediately |
+| 40 | `missed-bus-while-riding` | a wrong alert telling a seated rider to move |
+| 30 | `aboard-swap` | the on-screen route no longer matches their bus |
+| 20 | `riding-flip` | board state suspect, but they are on the right vehicle |
+| 10 | `deviated-streak` | tracking looks off; nothing to do about it |
+
+Rules absent from `PAGE_RANK` get `PAGE_RANK_DEFAULT` (25, mid-pack) so a new
+page rule is neither silently starved nor able to outrank the stop counter
+before anyone has decided where it belongs — **add your rule to `PAGE_RANK`
+when you add it.** Non-page severities never push at all.
+
+A buffered page is flushed by the main loop's 5s tick, so it goes out even if
+the log falls silent right after the finding, and immediately on trip end, so
+a ride that stops three seconds into a window still pages. Findings are
+persisted to the JSONL only once their paging verdict is known, so each
+record carries a final `paged` (and `supersededBy` when it lost).
+
+Tuning: raise `PAGE_COALESCE_MS` to catch slower cascades at the cost of
+telling the rider later; lower it toward 0 to restore first-wins behaviour.
+Reorder `PAGE_RANK` to change which finding wins a window. Replay a real ride
+before and after — the 7/29 log is the reference case, and it must page
+`stop-count-collapse`.
+
 **2. `~/otp-debug-logs/ride-watch/current-ride.md` — the live view.**
 Rewritten on any state change (2s debounce) so *any* Claude session can just
 read it to see what is happening right now: trip summary, current leg,
@@ -124,7 +172,7 @@ the pushes that *would* have gone out.
 Thresholds are module constants at the top of `ride_watch.py` —
 `STOP_COLLAPSE_MAX_PROGRESS`, `DEVIATED_STREAK_MS`, `GPS_GAP_MS`,
 `REROUTE_STORM_COUNT`, `DISTANCE_SPIKE_FAR_M`, `MAX_PAGES_PER_TRIP`,
-`PUSH_MIN_INTERVAL_MS`, and so on.
+`PUSH_MIN_INTERVAL_MS`, `PAGE_COALESCE_MS`, `PAGE_RANK`, and so on.
 
 The honest workflow for changing one: replay a real ride before and after,
 compare which findings appear, and add a test. A rule that pages on a
@@ -142,8 +190,12 @@ python3 ride-watch/test_ride_watch.py
 ```
 
 Stdlib `unittest`, no installs. Synthetic streams cover every rule (both the
-firing case and the case that must stay quiet) and the state machine. The
-last suite replays the real `debug-2026-07-29.jsonl` and asserts that the
-17:28 incident is caught — board-state anomaly plus stop-count collapse —
-and that the rider would not have been paged more than twice. Tests never
+firing case and the case that must stay quiet), the state machine, and page
+ranking (supersession inside the window, tie-breaking, flush on a quiet log,
+flush on trip end). The last suite replays the real `debug-2026-07-29.jsonl`
+and asserts that the 17:28 incident is caught — board-state anomaly plus
+stop-count collapse — that the four page-worthy findings in those eight
+seconds cost the rider exactly one interrupt, that the one they get is
+`stop-count-collapse`, and that they would not have been paged more than
+twice. Tests never
 touch the network; the Pushover path is verified by credential parsing only.
