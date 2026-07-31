@@ -4,9 +4,18 @@
 Follows the day's debug JSONL stream (written by the Flask sidecar's
 /api/debug-log endpoint), runs a per-trip rule engine over the redux action
 stream, pages the rider via Pushover for at most 2 high-value findings per
-ride, keeps a live status file any Claude session can read, answers the
-rider's mid-ride notes from a headless `claude -p` run, and requests a
-post-ride report from another one when a ride with findings ends.
+ride, keeps a live status file any Claude session can read, and — since
+2026-07-31 — runs **one Claude conversation per ride**: a remote-control
+session spawned in tmux at trip start, visible in the rider's phone app, fed a
+one-line digest ping at each milestone, which talks to the rider mid-ride and
+writes the wrap-up report itself.
+
+That thread replaced two headless agents: a `claude -p` per rider note (fresh
+context every message — it re-diagnosed the same bug twice in a row on the 7/31
+ride and the rider's reaction was "you're fresh context for *every*
+message???") and a `claude -p` post-ride report. Both are gone; the rule engine
+and Pushover paging below are untouched, because the safety layer must not
+depend on an LLM session being healthy.
 
 stdlib only. See README.md next to this file.
 
@@ -24,7 +33,10 @@ import argparse
 import collections
 import datetime
 import json
+import math
 import os
+import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -44,18 +56,9 @@ PUSHOVER_CREDS = os.environ.get(
     "RIDE_WATCH_PUSHOVER_CREDS", os.path.join(HOME, ".config", "pushover", "credentials")
 )
 DRY_RUN = os.environ.get("RIDE_WATCH_DRY_RUN") == "1"
-CLAUDE_BIN = os.environ.get("RIDE_WATCH_CLAUDE", "claude")
 REPO_DIR = os.environ.get(
     "RIDE_WATCH_REPO", os.path.join(HOME, "projects", "otp-minneapolis")
 )
-PROMPT_PATH = os.path.join(REPO_DIR, "ride-watch", "report-prompt.md")
-REPLY_PROMPT_PATH = os.path.join(REPO_DIR, "ride-watch", "reply-prompt.md")
-# Pointer handed to the reply agent so it can read the Go Mode source when a
-# note reports a bug. It never edits it — see reply-prompt.md.
-GO_MODE_SRC = os.environ.get(
-    "RIDE_WATCH_GO_MODE_SRC",
-    os.path.join(HOME, "projects", "otprr", "otp-react-redux"))
-GO_MODE_BRANCH = "feature/go-mode"
 
 # Rule thresholds (ms unless noted)
 STARTUP_LOOKBACK_MS = 5 * 60 * 1000        # scan back this far at startup
@@ -69,33 +72,61 @@ REROUTE_STORM_COUNT = 3                    # "> 3 in 5 min" pages on the 4th
 DISTANCE_SPIKE_FAR_M = 2000.0
 DISTANCE_SPIKE_NEAR_M = 200.0
 RIDER_ACTION_WINDOW_MS = 30 * 1000         # explicit action shields aboard-swap
+# notification-repeat. On 2026-07-31 the app pushed the identical turn alert
+# ("Turn right on Village Lane") to a stationary rider 14 times, 30.5s apart,
+# for seven minutes — the turn-cue dedup is a 30s rate limiter, not the
+# once-per-turn latch its comment claims. The rule engine had nothing to say
+# about it: _on_notification only ever looked at MISSED_BUS. Three of the same
+# alert inside five minutes is a phone misbehaving at the rider, which is
+# exactly the class of thing they should not have to notice and type by hand.
+NOTIFICATION_REPEAT_WINDOW_MS = 5 * 60 * 1000
+NOTIFICATION_REPEAT_COUNT = 3              # fires on the 3rd
+# progress-without-motion. Map-matching noise reported to the rider as travel.
+# On 7/31 the swing was a tenth of a point (0.31 -> 0.21 -> 0.31) inside a 7m
+# circle, which is below this threshold and should stay quiet; the same
+# signature at 30 points would mean the app is inventing a journey.
+MOTION_PROGRESS_PCT = 5.0                  # percentage points gained
+MOTION_DISPLACEMENT_M = 15.0               # ...while the fix stayed this close
+MOTION_COOLDOWN_MS = 5 * 60 * 1000
 MAX_PAGES_PER_TRIP = 2
 PUSH_MIN_INTERVAL_MS = 120 * 1000
 STATUS_DEBOUNCE_MS = 2000
 STOP_INCREASE_COOLDOWN_MS = 60 * 1000
 RIDER_NOTE_MAX_CHARS = 500                 # matches the sidecar's own cap
 
-# Mid-ride replies. A note used to go into the void: the rider typed it, the
-# daemon filed it, and nothing came back until the post-ride report hours
-# later. So a note now spawns a headless `claude -p` that answers it on the
-# /ride console.
+# The ride thread. One remote-control Claude conversation per ride, spawned in
+# tmux at trip start, visible in the rider's phone app, fed one line per
+# milestone. It is a *conversation*, not a job queue: the whole point is that it
+# still remembers the 11:04 stop-count collapse when the rider asks about it at
+# 11:31, which a fresh `claude -p` per note never could.
 #
-# Three limits, all about not letting a chat feature run away with a commute:
-#   * ONE agent in flight at a time. Notes that arrive while it is thinking are
-#     queued and handed to the *next* run together — three notes in a row cost
-#     one agent, and it sees all three, which is also the better answer.
-#   * REPLY_MAX_PER_TRIP runs per trip. Past that the console says the budget is
-#     spent rather than silently ignoring the rider.
-#   * REPLY_TIMEOUT_S wall clock per run, enforced by a watchdog thread that
-#     kills the process and frees the slot. An agent that wedges must not cost
-#     the rider every remaining answer of the ride.
-# None of this ever pages: the console is the surface for replies, and the two
-# Pushover interrupts per ride stay reserved for safety findings.
-REPLY_TIMEOUT_S = 180
-REPLY_MAX_PER_TRIP = 8
-REPLY_RECENT_FINDINGS = 12                 # findings handed to the reply agent
-REPLY_MAX_CHARS = 1200                     # hard cap on an answer we will show
-REPLY_STDOUT_FALLBACK_MAX = 2000
+# Two rules keep it from becoming noise:
+#   * MILESTONES ONLY. Trip start, leg transition, a rule finding, a rider note,
+#     trip end — plus a heartbeat if ten minutes pass silently while the rider
+#     is still moving. ~1 Hz telemetry never reaches the thread; the digest file
+#     does the detail and the ping is one line.
+#   * NEVER BLOCK THE TAILER. Bringing a Claude TUI up takes ~10s and every
+#     send-keys needs a beat before Enter, so the real tmux work happens on a
+#     worker thread. A dead pane, a missing tmux, a rider who typed /exit: all
+#     logged, none fatal. Telemetry keeps being read and pages keep going out.
+THREAD_ENABLED = os.environ.get("RIDE_THREAD_ENABLED", "1") not in (
+    "0", "false", "no", "off")
+THREAD_RUNNER = os.path.join(REPO_DIR, "ride-watch", "ride-thread-run.sh")
+# Namespace for both the tmux session (`ride-1432`) and the app display name
+# ("ride 07-31 14:32"). Overridable so an end-to-end test can spawn a real
+# thread without ever colliding with — or cleaning up — the rider's own.
+THREAD_NAME_PREFIX = os.environ.get("RIDE_THREAD_NAME_PREFIX", "ride")
+THREAD_TMUX_SIZE = (200, 50)               # wide enough that the TUI wraps sanely
+THREAD_READY_TIMEOUT_S = 30                # TUI is usually up in 10-12s
+THREAD_READY_POLL_S = 1.0
+THREAD_READY_MARKER = "❯"             # the ❯ prompt = accepting input
+# send-keys of the text and send-keys of Enter must be two calls with a beat
+# between them; combined into one call the line is typed but never submitted.
+THREAD_SUBMIT_DELAY_S = 1.0
+THREAD_HEARTBEAT_MS = 10 * 60 * 1000
+THREAD_MOVING_MS = 2 * 60 * 1000           # a fix this recent = still riding
+THREAD_LINE_MAX = 400                      # one line, no exceptions
+THREAD_MAX_EVENTS = 400                    # digest ledger cap
 
 # Page coalescing. A failure rarely produces one finding: on 2026-07-29 the
 # app flipped the riding tripId at 17:28:45 and only eight seconds later
@@ -124,9 +155,12 @@ PAGE_COALESCE_MS = 15 * 1000
 # Rules not listed rank mid-pack, so a newly added page rule is neither
 # silently starved nor able to outrank the stop counter before anyone has
 # thought about where it belongs. Add it here when you add the rule.
+#   notification-repeat     their phone is buzzing wrongly; "ignore it" is an
+#                           instruction they can act on this second
 PAGE_RANK = {
     "stop-count-collapse": 50,
     "missed-bus-while-riding": 40,
+    "notification-repeat": 35,
     "aboard-swap": 30,
     "riding-flip": 20,
     "deviated-streak": 10,
@@ -190,10 +224,47 @@ def fmt_date(ms):
     return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
 
 
+def fmt_pct(v):
+    """Leg progress as a percentage, with the small end kept honest.
+
+    UPDATE_PROGRESS.currentLegProgress is a percentage on 0-100. On 2026-07-31
+    a reply agent was handed the bare number 0.3077 under a unitless key, read
+    it as a fraction, and told a rider standing 4m into a 1326m leg that they
+    were "31% along". Rounding to whole percent has the opposite failure —
+    0.3077 prints as "0%", which reads as "no data" — so anything under 10
+    keeps a decimal. Every surface that shows progress goes through here.
+    """
+    if not isinstance(v, (int, float)):
+        return "?"
+    return ("%.1f%%" if abs(v) < 10 else "%.0f%%") % v
+
+
 def short_session(session):
     if not session:
         return "unknown"
     return session.rsplit("-", 1)[-1]
+
+
+def one_line(text, limit=THREAD_LINE_MAX):
+    """Collapse anything to a single bounded line.
+
+    Everything typed into the ride thread goes through here: a newline in a
+    rider's note would submit half a sentence and leave the rest in the box.
+    """
+    s = " ".join(str(text).split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def ride_thread_sessions(names, prefix=THREAD_NAME_PREFIX):
+    """Of these tmux session names, the ones this daemon owns.
+
+    Ours are exactly `<prefix>-HHMM`. The rider hand-spawns threads in the same
+    namespace (`ride-test-smoke` was live while this was written) and killing
+    one of those mid-sentence would be unforgivable, so the match is anchored
+    and the suffix must be four digits.
+    """
+    pat = re.compile(r"^%s-\d{4}$" % re.escape(prefix))
+    return [n for n in names if pat.match(n)]
 
 
 def read_pushover_creds(path):
@@ -220,6 +291,18 @@ def read_pushover_creds(path):
     if len(bare) >= 2:
         return bare[0], bare[1]
     raise ValueError("could not parse pushover credentials at %s" % path)
+
+
+def meters_between(a, b):
+    """Great-circle distance between two (lat, lon) fixes, in metres."""
+    lat1, lon1 = a
+    lat2, lon2 = b
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    h = (math.sin(dp / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
+    return 2 * 6371000.0 * math.asin(min(1.0, math.sqrt(h)))
 
 
 def leg_is_transit(leg):
@@ -297,7 +380,12 @@ class Trip:
         self.riding = None                        # SET_RIDING payload + swap_seq
         self.progress = None                      # last UPDATE_PROGRESS snapshot
         self.last_pos_ms = start_ms
+        self.last_fix = None                      # (lat, lon) of the last fix
         self.gps_gap_open = False
+        self.notification_times = collections.defaultdict(collections.deque)
+        self.notification_repeat_last = {}        # key -> ms of last finding
+        self.motion_anchor = None                 # where progress was last real
+        self.motion_fired_ms = 0
         self.prev_stops = None
         self.stops_swap_pending = False   # itinerary swapped since last count
         self.collapse_fired_seq = set()
@@ -312,7 +400,12 @@ class Trip:
         self.last_rider_action_ms = 0
         self.console_seen = set()
         self.notes = []                           # rider-typed notes, in order
-        self.replies_spawned = 0                  # reply agents run for this trip
+        # -- the ride thread ---------------------------------------------
+        self.thread = None            # {"tmux","display","spawnedMs","ok"}
+        self.thread_events = []       # milestone ledger, oldest first
+        self.thread_cursor = 0        # events already handed to the thread
+        self.thread_pushes = 0
+        self.last_thread_push_ms = 0
         self.findings = []
         self.pages_sent = 0
         self.pending_pages = []                   # page candidates in the window
@@ -342,7 +435,8 @@ class Trip:
 
 class RideWatch:
     def __init__(self, dry_run=DRY_RUN, replay=False, watch_dir=WATCH_DIR,
-                 log=None, spawn_reply=None):
+                 log=None, spawn_thread=None, push_line=None,
+                 thread_enabled=None):
         self.dry_run = dry_run
         self.replay = replay
         self.watch_dir = watch_dir
@@ -358,18 +452,20 @@ class RideWatch:
         self.push_log = []            # [{tsMs, title, body, sent, kind}]
         self._status_dirty = True
         self._status_last_write = 0
-        self._report_threads = []
-        # -- mid-ride reply agent ------------------------------------------
-        # spawn_reply is the injection seam: tests hand in a stub so the suite
-        # never spends money on (or waits for) a real `claude` run.
-        self.spawn_reply = spawn_reply
-        self._reply_lock = threading.RLock()
-        self.reply_queue = []          # notes waiting for the next agent
-        self.reply_inflight = None     # {"id", "startedMs"} while one runs
-        self.reply_threads = []        # watchdog threads (tests join them)
-        self.replies = []              # every reply record, newest last
-        self.orphan_replies = 0        # budget for notes outside any trip
-        self._reply_seq = 0
+        # -- the ride thread ------------------------------------------------
+        # spawn_thread/push_line are the injection seam, exactly like the old
+        # spawn_reply one: tests hand in stubs so the suite exercises the real
+        # lifecycle and push cadence without tmux, without `claude`, and
+        # without the ~10s of real waiting each spawn costs.
+        self.spawn_thread = spawn_thread
+        self.push_line = push_line
+        self.thread_enabled = (THREAD_ENABLED if thread_enabled is None
+                               else thread_enabled)
+        self._thread_lock = threading.RLock()
+        self._thread_jobs = []         # queued tmux work (worker thread)
+        self._thread_wake = threading.Event()
+        self._thread_worker = None
+        self._thread_status = {}       # tmux name -> True/False once known
 
     # -- clock ------------------------------------------------------------
 
@@ -446,6 +542,7 @@ class RideWatch:
             elif typ == "UPDATE_POSITION":
                 trip.last_pos_ms = max(trip.last_pos_ms, t)
                 trip.gps_gap_open = False
+                self._on_position(trip, obj.get("payload") or {})
             elif typ == "UPDATE_PROGRESS":
                 self._on_progress(trip, t, obj.get("payload") or {})
             elif typ == "UPDATE_ROUTE_MATCH":
@@ -472,6 +569,10 @@ class RideWatch:
                 trip = Trip(session, t, None, adopted=True)
                 self.trips[session] = trip
                 self.log.info("adopted mid-stream trip for session %s" % session)
+                # An adopted trip is a ride in progress — usually the daemon was
+                # just restarted under a rider who is still on the bus — so it
+                # gets a thread too, marked as adopted in the digest.
+                self._begin_ride_thread(trip, t)
                 self._on_progress(trip, t, obj.get("payload") or {})
                 self._mark_dirty()
 
@@ -489,6 +590,7 @@ class RideWatch:
             self.trips[session] = trip
             self.log.info("trip started: session=%s itinerary=%s" % (
                 session, itinerary_one_liner(summary)))
+            self._begin_ride_thread(trip, t)
         else:
             # Itinerary replacement mid-trip.
             trip.swap_seq += 1
@@ -502,6 +604,11 @@ class RideWatch:
             trip.prev_dist = None
             self.log.info("itinerary swap #%d: session=%s -> %s" % (
                 trip.swap_seq, session, itinerary_one_liner(summary)))
+            # Not a push on its own — the swap either fires aboard-swap (which
+            # is) or is the routine re-plan the rider asked for. It still goes
+            # in the ledger so the next digest explains the new itinerary.
+            self._thread_event(trip, t, "itinerary swap #%d -> %s" % (
+                trip.swap_seq, itinerary_one_liner(summary)))
             self._rule_aboard_swap(trip, t)
         self._mark_dirty()
 
@@ -526,9 +633,22 @@ class RideWatch:
             "itinerary": itinerary_one_liner(trip.itinerary),
         }
         self._save_state()
-        if n > 0:
-            req_path = self._write_report_request(trip)
-            self._request_report(trip, req_path)
+        req_path = self._write_report_request(trip) if n > 0 else None
+        # The wrap-up is the thread's job now (no headless report agent): tell
+        # it the ride is over and where the request file is, and it writes the
+        # vault report from the context it has been holding all ride.
+        line = "trip ended (%s) after %dm — %d finding(s), %d note(s)" % (
+            reason, max(0, (t - trip.start_ms) // 60000), n, len(trip.notes))
+        if req_path:
+            line += " — wrap-up now; request: %s" % req_path
+        self._thread_event(trip, t, line)
+        self._thread_push(trip, line)
+        # Fallback: findings with nobody to write them up. Same push the report
+        # agent's failure used to send — it is still exactly the right sentence.
+        if n > 0 and self._thread_missing(trip):
+            self.log.warn("no ride thread for %s; falling back to a page"
+                          % trip.session)
+            self._report_fallback_push(trip)
         self._mark_dirty()
         self.write_status(force=True)
 
@@ -554,10 +674,7 @@ class RideWatch:
                               {"lastFixMs": trip.last_pos_ms})
             # deviated-streak may mature between UPDATE_PROGRESS ticks
             self._check_deviated_streak(trip, now)
-        # Belt and braces: the watchdog thread normally drains the queue as
-        # soon as an answer lands, but the tick guarantees a queued note is
-        # never stranded by a thread that died on its way there.
-        self._maybe_spawn_reply()
+            self._maybe_heartbeat(trip, now)
 
     # -- rules --------------------------------------------------------------
 
@@ -573,6 +690,16 @@ class RideWatch:
             "tMs": t,
         }
         self._mark_dirty()
+
+        # Leg transition: the one routine milestone worth a ping. It is where
+        # the rider's next decision lives (get off, walk, board) and it is the
+        # moment the thread's picture of the ride would otherwise go stale.
+        leg = p.get("currentLegIndex")
+        if prev is not None and leg is not None and prev.get("currentLegIndex") != leg:
+            line = "leg %s -> %s (%s)" % (
+                prev.get("currentLegIndex"), leg, self._leg_label(trip, leg))
+            self._thread_event(trip, t, line)
+            self._thread_push(trip, line)
 
         # deviated-streak bookkeeping
         if p.get("status") == "deviated":
@@ -606,7 +733,7 @@ class RideWatch:
                         "stopsRemaining %d -> 1 at %.0f%% of transit leg %s"
                         % (prev_stops, progress, p.get("currentLegIndex")),
                         {"prevStops": prev_stops, "stops": stops,
-                         "legProgress": progress,
+                         "legProgressPct": progress,
                          "nextStop": p.get("nextStopName")},
                         push_body="Stop count wrong — app says 1 left at %.0f%% of the leg. Ignore the banner."
                                   % progress)
@@ -628,6 +755,70 @@ class RideWatch:
             trip.prev_stops = None
             trip.stops_swap_pending = False
 
+        self._check_progress_without_motion(trip, t, p)
+
+    def _on_position(self, trip, p):
+        """Remember where the rider actually is.
+
+        The real payload is `{coords: {latitude, longitude, accuracy, …},
+        timestamp}`. Older synthetic streams wrap it as `{position: {coords}}`,
+        so both are accepted rather than making a fixture lie about the shape.
+        """
+        coords = p.get("coords")
+        if not isinstance(coords, dict):
+            nested = p.get("position")
+            coords = nested.get("coords") if isinstance(nested, dict) else None
+        if not isinstance(coords, dict):
+            return
+        lat, lon = coords.get("latitude"), coords.get("longitude")
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            trip.last_fix = (lat, lon)
+
+    def _check_progress_without_motion(self, trip, t, p):
+        """Leg progress advancing faster than the rider physically moved.
+
+        The anchor is the last place progress was believed. It is reset when
+        the rider genuinely travels (past MOTION_DISPLACEMENT_M — a real move,
+        not GPS jitter) or when the leg changes, so the question the rule
+        actually asks is *physical*: did the progress bar gain more than
+        MOTION_PROGRESS_PCT points in the time it took the rider to cover 15m?
+
+        That window is adaptive, and both of its ends are real defects:
+        - Stationary: the window is minutes wide. This is the 7/31 shape —
+          map-matching noise reported to a standing rider as travel.
+        - Moving: the window is a couple of seconds. This is the 7/29 shape —
+          on the Orange Line the bar went 35% -> 71% in ONE second while the
+          bus covered 6.7m, i.e. the app teleported the rider a kilometre up
+          the leg. Nothing else in the engine noticed.
+        """
+        prog = p.get("currentLegProgress")
+        leg = p.get("currentLegIndex")
+        if not isinstance(prog, (int, float)) or trip.last_fix is None:
+            return
+        anchor = trip.motion_anchor
+        fresh = {"fix": trip.last_fix, "progress": prog, "leg": leg, "tMs": t}
+        if anchor is None or anchor["leg"] != leg:
+            trip.motion_anchor = fresh
+            return
+        moved = meters_between(anchor["fix"], trip.last_fix)
+        if moved > MOTION_DISPLACEMENT_M:
+            trip.motion_anchor = fresh          # they really went somewhere
+            return
+        if prog - anchor["progress"] <= MOTION_PROGRESS_PCT:
+            return
+        if trip.motion_fired_ms and t - trip.motion_fired_ms <= MOTION_COOLDOWN_MS:
+            return
+        trip.motion_fired_ms = t
+        self._finding(
+            trip, t, "progress-without-motion", "warn",
+            "leg progress %s -> %s while the fix moved %.0fm" % (
+                fmt_pct(anchor["progress"]), fmt_pct(prog), moved),
+            {"fromPct": anchor["progress"], "toPct": prog,
+             "movedMeters": round(moved, 1), "legIndex": leg,
+             "sinceMs": anchor["tMs"]})
+        # Re-anchor: a drift that keeps drifting is one finding, not a stream.
+        trip.motion_anchor = fresh
+
     def _check_deviated_streak(self, trip, now):
         if trip.deviated_since_ms is None or trip.deviated_fired:
             return
@@ -648,8 +839,8 @@ class RideWatch:
     def _on_route_match(self, trip, t, p):
         """Remember where the app thinks the rider is, then run the spike rule.
 
-        The snapshot is not used by any rule — it is context for the reply
-        agent, which gets asked things like "is it actually following me?" and
+        The snapshot is not used by any rule — it is context for the ride
+        thread, which gets asked things like "is it actually following me?" and
         needs the last number the app computed, not a rule's verdict on it.
         """
         trip.last_route_match = {
@@ -739,6 +930,47 @@ class RideWatch:
                 {"notificationId": nid, "message": p.get("message"),
                  "riding": trip.riding.get("tripId")},
                 push_body="Missed-bus alert while aboard %s. Ignore it." % route)
+        self._rule_notification_repeat(trip, t, p)
+
+    def _rule_notification_repeat(self, trip, t, p):
+        """The same alert, over and over, at a rider who cannot make it stop.
+
+        Keyed on (title, message) rather than the notification id, because the
+        id carries a fresh `Date.now()` on every fire — the very defect that
+        let the 7/31 storm through. The id minus that suffix
+        (`UPCOMING_TURN_<legStart>_<cue>_<stage>`) would also work and survives
+        the message drifting "173 ft" -> "175 ft" on GPS jitter; the stricter
+        key is the conservative choice, since a page costs the rider one of
+        their two interrupts. On the 7/31 log this fires at 11:53:38 — the 3rd
+        of 14 buzzes, six minutes before the rider gave up and typed it out.
+        """
+        title = (p.get("title") or p.get("type") or "").strip()
+        message = (p.get("message") or "").strip()
+        if not title and not message:
+            return
+        key = (title, message)
+        window = trip.notification_times[key]
+        window.append(t)
+        while window and t - window[0] > NOTIFICATION_REPEAT_WINDOW_MS:
+            window.popleft()
+        if len(window) < NOTIFICATION_REPEAT_COUNT:
+            return
+        # Once per alert per ride. The finding says "ignore the buzzing"; a
+        # second one five minutes later says nothing new and would spend the
+        # rider's other interrupt on a thing they have already been told to
+        # ignore. A different turn is a different key and can still fire.
+        if key in trip.notification_repeat_last:
+            return
+        trip.notification_repeat_last[key] = t
+        mins = max(1, int(round((t - window[0]) / 60000.0)))
+        self._finding(
+            trip, t, "notification-repeat", "page",
+            "same notification %dx in %d min: %s" % (len(window), mins, title),
+            {"title": title, "message": message, "count": len(window),
+             "windowMs": t - window[0], "notificationId": p.get("id"),
+             "type": p.get("type")},
+            push_body="Same alert %d times in %d min: %s. Ignore the buzzing."
+                      % (len(window), mins, title[:50]))
 
     def _on_start_reroute(self, trip, t, p):
         if p.get("autoApply") is False:
@@ -784,7 +1016,10 @@ class RideWatch:
         p = trip.progress or {}
         ctx = {
             "legIndex": p.get("currentLegIndex"),
-            "legProgress": p.get("currentLegProgress"),
+            # Named for its unit on purpose: this is a percentage on 0-100, and
+            # the unitless key it replaced is what made a reply agent tell the
+            # rider "31% along" when 0.3077 meant 0.31% (see fmt_pct).
+            "legProgressPct": p.get("currentLegProgress"),
             "status": p.get("status"),
             "stopsRemaining": p.get("stopsRemaining"),
             "nextStopName": p.get("nextStopName"),
@@ -821,13 +1056,11 @@ class RideWatch:
             if len(active) == 1:
                 trip = active[0]
         if trip is None:
-            # No trip to attach it to, so it produces no finding — but it is
-            # still the rider asking a question, and a question outside a trip
-            # deserves an answer too (with less context to answer it from).
+            # No trip, no thread to hand it to. It is still logged: the rider
+            # can open any Claude session and it is in the daemon log, and if a
+            # ride starts in the next few seconds the next note lands properly.
             self.log.info("rider note outside any trip (session=%s): %s"
                           % (session, text))
-            self._enqueue_reply(None, {"tsMs": int(t), "time": fmt_hms(t),
-                                       "text": text, "context": None})
             return
         trip.last_event_ms = max(trip.last_event_ms, t)
         context = self._trip_context(trip)
@@ -835,9 +1068,10 @@ class RideWatch:
         note = {"tsMs": int(t), "time": fmt_hms(t), "text": text,
                 "context": context}
         trip.notes.append(note)
+        # The finding is what reaches the ride thread (see _finding), so the
+        # note is answered in the conversation the rider is already reading.
         self._finding(trip, t, "rider-note", "info",
                       "rider note: %s" % text[:160], context)
-        self._enqueue_reply(trip, note)
 
     # -- findings, paging, surfaces ----------------------------------------
 
@@ -864,6 +1098,13 @@ class RideWatch:
             if severity == "page":
                 finding["paged"] = False
             self._persist_finding(trip, finding)
+        # Every finding is a milestone, including a rider note (which arrives
+        # as rule "rider-note"): the note IS the ping that gets it answered,
+        # which is why there is no separate note trigger.
+        line = (summary if rule == "rider-note"
+                else "finding [%s] %s: %s" % (severity, rule, summary))
+        self._thread_event(trip, ts_ms, line)
+        self._thread_push(trip, line)
         self._mark_dirty()
 
     def _persist_finding(self, trip, finding):
@@ -981,6 +1222,12 @@ class RideWatch:
             return False
 
     # -- post-ride report ---------------------------------------------------
+    #
+    # The daemon no longer runs the report itself. It writes the request file
+    # and pings the ride thread, which has watched the whole ride and writes
+    # the vault report from held context (see ride-thread-sysprompt.md). The
+    # request file is unchanged — it is now an input to a conversation instead
+    # of to a headless `claude -p`.
 
     def _write_report_request(self, trip):
         req = {
@@ -1012,333 +1259,375 @@ class RideWatch:
             % len(trip.findings),
             kind="fallback")
 
-    def _request_report(self, trip, req_path):
-        if self.dry_run:
-            self.log.info("DRY-RUN: skipping claude report invocation for %s"
-                          % trip.session)
+    # -- the ride thread ----------------------------------------------------
+    #
+    # Lifecycle: spawn one tmux session per ride running ride-thread-run.sh
+    # (which execs `claude --remote-control`), wait for the TUI, then type one
+    # line per milestone into it. The thread reads the digest file for detail
+    # and answers the rider in the same conversation.
+    #
+    # Everything here is best-effort by design. tmux missing, pane dead, rider
+    # typed /exit, `claude` broken: each is logged and the ride carries on. The
+    # rule engine and its pages do not depend on any of it.
+
+    def _thread_name(self, trip):
+        return "%s-%s" % (THREAD_NAME_PREFIX, datetime.datetime.fromtimestamp(
+            trip.start_ms / 1000).strftime("%H%M"))
+
+    def _thread_display(self, trip):
+        """What the rider sees in their Claude app list."""
+        return "%s %s" % (THREAD_NAME_PREFIX, datetime.datetime.fromtimestamp(
+            trip.start_ms / 1000).strftime("%m-%d %H:%M"))
+
+    def _begin_ride_thread(self, trip, t):
+        """Spawn the ride's thread and send the kickoff line."""
+        self._thread_event(trip, t, "trip started%s — %s" % (
+            " (adopted mid-stream)" if trip.adopted else "",
+            itinerary_one_liner(trip.itinerary)))
+        if not self.thread_enabled:
+            self.log.info("ride thread disabled (RIDE_THREAD_ENABLED=0)")
             return
+        name, display = self._thread_name(trip), self._thread_display(trip)
+        spawn = self.spawn_thread
+        if spawn is None:
+            if self.replay:
+                self.log.info("replay: not spawning a ride thread")
+                return
+            spawn = self._tmux_spawn
+        trip.thread = {"tmux": name, "display": display,
+                       "spawnedMs": self.now_ms(), "ok": None}
         try:
-            with open(PROMPT_PATH) as f:
-                prompt = f.read()
-        except OSError as exc:
-            self.log.error("report prompt unreadable: %r" % exc)
-            self._report_fallback_push(trip)
+            # None = pending: the real spawner hands the ~10s of TUI startup to
+            # the worker thread and answers later.
+            trip.thread["ok"] = spawn(name, display)
+        except Exception as exc:
+            self.log.error("ride thread spawn failed: %r" % exc)
+            trip.thread["ok"] = False
             return
-        env = dict(os.environ)
-        env["RIDE_WATCH_REQUEST"] = req_path
-        out_path = os.path.join(self.watch_dir,
-                                "report-claude-%s.log" % trip.session)
-        try:
-            out = open(out_path, "a")
-            proc = subprocess.Popen(
-                [CLAUDE_BIN, "-p", prompt],
-                cwd=REPO_DIR, env=env,
-                stdout=out, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-            )
-        except FileNotFoundError:
-            self.log.error("claude binary not found (%s)" % CLAUDE_BIN)
-            self._report_fallback_push(trip)
-            return
-        except OSError as exc:
-            self.log.error("claude spawn failed: %r" % exc)
-            self._report_fallback_push(trip)
-            return
-        self.log.info("post-ride report agent started (pid %d, log %s)"
-                      % (proc.pid, out_path))
+        self.log.info("ride thread %s (%s) spawned for session %s"
+                      % (name, display, trip.session))
+        self._thread_push(trip, "trip started %s%s — %s" % (
+            fmt_hms(trip.start_ms), " (adopted)" if trip.adopted else "",
+            itinerary_one_liner(trip.itinerary)))
 
-        def waiter():
-            rc = proc.wait()
-            out.close()
-            if rc != 0:
-                self.log.error("report agent exited %d" % rc)
-                self._report_fallback_push(trip)
-            else:
-                self.log.info("report agent finished ok for %s" % trip.session)
+    def _thread_ok(self, trip):
+        """Usable? Pending counts as usable — pushes queue behind the spawn."""
+        th = trip.thread
+        if th is None:
+            return False
+        status = self._thread_status.get(th["tmux"])
+        if status is not None:
+            th["ok"] = status
+        return th.get("ok") is not False
 
-        th = threading.Thread(target=waiter, daemon=True)
-        th.start()
-        self._report_threads.append(th)
+    def _thread_missing(self, trip):
+        """True when this ride has no working thread to hold its wrap-up.
 
-    # -- mid-ride replies ---------------------------------------------------
-    #
-    # The rider types a note; a headless `claude -p` reads a context file the
-    # daemon writes and answers on the console.
-    #
-    # How the answer comes back: the agent writes plain text to the path in
-    # RIDE_WATCH_REPLY_OUT and exits. No HTTP endpoint, no new nginx route, no
-    # auth to get wrong, and nothing to be up — a file the daemon already knows
-    # the name of is the smallest thing that works. If the agent exits without
-    # writing it, its captured stdout is used as a fallback, because an answer
-    # that got printed instead of written is still an answer.
-    #
-    # Replies are stored append-only in <date>-<session>.replies.jsonl next to
-    # the findings, one row per state change, collapsed by `id` on read: the
-    # "thinking" placeholder is written the instant the agent is spawned (so
-    # the console can show it immediately) and the final row supersedes it.
-    # Append-only means a crash mid-answer leaves a truthful "thinking" record
-    # rather than a half-written file.
-
-    def _replies_path(self, trip):
-        if trip is not None:
-            return os.path.join(
-                self.watch_dir,
-                "%s-%s.replies.jsonl" % (fmt_date(trip.start_ms), trip.session))
-        return os.path.join(
-            self.watch_dir, "%s-no-trip.replies.jsonl" % fmt_date(self.now_ms()))
-
-    def _enqueue_reply(self, trip, note):
-        with self._reply_lock:
-            self.reply_queue.append({"trip": trip, "note": note})
-        self._maybe_spawn_reply()
-
-    def _reply_budget(self, trip):
-        """(used, cap) for whichever budget this reply spends."""
-        if trip is not None:
-            return trip.replies_spawned, REPLY_MAX_PER_TRIP
-        return self.orphan_replies, REPLY_MAX_PER_TRIP
-
-    def _maybe_spawn_reply(self):
-        """Start an agent if one is not already running and notes are waiting.
-
-        Everything queued is handed to the same run: three notes typed while an
-        agent thinks cost one agent, and it answers them knowing about all
-        three. The trip used for context is the newest one any of them
-        mentioned, so a note typed just before the trip started does not force
-        the whole batch to be answered blind.
+        A replay never promises one, so it never falls back to a page; a real
+        ride whose spawn failed does.
         """
-        with self._reply_lock:
-            if self.reply_inflight is not None or not self.reply_queue:
-                return
-            batch = self.reply_queue
-            self.reply_queue = []
-            trip = None
-            for item in batch:
-                if item["trip"] is not None:
-                    trip = item["trip"]
-            notes = [item["note"] for item in batch]
+        if trip.thread is None:
+            return not self.replay
+        self._thread_ok(trip)
+        return trip.thread.get("ok") is not True
 
-            used, cap = self._reply_budget(trip)
-            if used >= cap:
-                self.log.info("reply budget spent (%d/%d); %d note(s) unanswered"
-                              % (used, cap, len(notes)))
-                self._record_reply(
-                    trip, self._new_reply_record(notes), "error",
-                    "Reply budget spent for this ride (%d answers). Notes are "
-                    "still logged for the post-ride report." % cap)
-                return
+    def _thread_event(self, trip, ts_ms, text):
+        """Record a milestone for the digest's "new since last push" section."""
+        trip.thread_events.append("%s %s" % (fmt_hms(ts_ms), one_line(text)))
+        if len(trip.thread_events) > THREAD_MAX_EVENTS:
+            drop = len(trip.thread_events) - THREAD_MAX_EVENTS
+            del trip.thread_events[:drop]
+            trip.thread_cursor = max(0, trip.thread_cursor - drop)
 
-            record = self._new_reply_record(notes)
-            if trip is not None:
-                trip.replies_spawned += 1
-            else:
-                self.orphan_replies += 1
-            self.reply_inflight = {"id": record["id"], "startedMs": self.now_ms()}
-            self._record_reply(trip, record, "thinking", "")
-            self._start_reply_agent(trip, notes, record)
-
-    def _new_reply_record(self, notes):
-        self._reply_seq += 1
-        return {
-            "id": "%d-%d" % (self.now_ms(), self._reply_seq),
-            "tsMs": self.now_ms(),
-            "noteTsMs": [n["tsMs"] for n in notes],
-            "noteText": [n["text"] for n in notes],
-            "text": "",
-            "status": "thinking",
-        }
-
-    def _record_reply(self, trip, record, status, text):
-        """Append the record at its current status and mirror it in memory."""
-        record["status"] = status
-        record["text"] = text
-        record["updatedMs"] = self.now_ms()
-        row = dict(record)
-        with self._reply_lock:
-            existing = next((r for r in self.replies
-                             if r["id"] == record["id"]), None)
-            if existing is None:
-                self.replies.append(row)
-            else:
-                existing.update(row)
+    def _thread_push(self, trip, line):
+        """Rewrite the digest, then type one line into the thread."""
+        if not self._thread_ok(trip):
+            return False
         try:
-            with open(self._replies_path(trip), "a") as f:
-                f.write(json.dumps(row) + "\n")
+            digest = self._write_digest(trip)
         except OSError as exc:
-            self.log.error("could not append reply: %r" % exc)
+            self.log.error("digest write failed: %r" % exc)
+            digest = self._digest_path(trip)
+        # Detail lives in the file; the line says only what changed.
+        text = one_line("[ride-watch] %s — digest: %s" % (line, digest))
+        trip.thread_cursor = len(trip.thread_events)
+        trip.last_thread_push_ms = self.now_ms()
+        trip.thread_pushes += 1
+        push = self.push_line
+        if push is None:
+            if self.replay:
+                return False
+            push = self._tmux_push
+        try:
+            push(trip.thread["tmux"], text)
+        except Exception as exc:
+            self.log.error("ride thread push failed: %r" % exc)
+            return False
+        self.log.info("ride thread push: %s" % text)
         self._mark_dirty()
+        return True
 
-    def _finish_reply(self, trip, record, status, text):
-        self._record_reply(trip, record, status, text)
-        self.log.info("reply %s [%s]: %s" % (record["id"], status, text[:160]))
-        with self._reply_lock:
-            if self.reply_inflight and self.reply_inflight["id"] == record["id"]:
-                self.reply_inflight = None
-        self.write_status(force=True)
-        # Anything typed while this one was thinking goes out now rather than
-        # waiting for the next telemetry line or the 5s tick.
-        self._maybe_spawn_reply()
+    def _maybe_heartbeat(self, trip, now):
+        """One line every 10 minutes of silence, but only while still moving.
 
-    def _write_reply_request(self, trip, notes, record, out_path):
-        """Everything the agent needs, in one file, with no lookups required."""
-        active = trip is not None and trip.session in self.trips
-        req = {
-            "replyId": record["id"],
-            "requestedAtMs": record["tsMs"],
-            "requestedAt": fmt_hms(record["tsMs"]),
-            "answerPath": out_path,
-            "notes": notes,
-            "tripActive": active,
-            "trip": None,
-            "lastTrip": None if trip is not None else self.last_trip_summary,
-            "recentFindings": [],
-            "debugLogPath": current_log_path(),
-            "statusPath": os.path.join(self.watch_dir, "current-ride.md"),
-            "goModeSource": {"path": GO_MODE_SRC, "branch": GO_MODE_BRANCH},
-        }
-        if trip is not None:
-            req["trip"] = {
-                "session": trip.session,
-                "date": fmt_date(trip.start_ms),
-                "startedAt": fmt_hms(trip.start_ms),
-                "startMs": trip.start_ms,
-                "itinerary": itinerary_one_liner(trip.itinerary),
-                "itinerarySummary": trip.itinerary,
-                "itinerarySwaps": trip.swap_seq,
-                "state": self._trip_context(trip),
-                "riding": trip.riding,
-                "routeMatch": trip.last_route_match,
-                "vehicleMatch": trip.last_vehicle_match,
-                "pagesSent": trip.pages_sent,
-                "findingsPath": self._findings_path(trip),
-                "repliesPath": self._replies_path(trip),
-                "notesThisTrip": trip.notes,
-            }
-            req["recentFindings"] = trip.findings[-REPLY_RECENT_FINDINGS:]
-        else:
-            req["recentFindings"] = self.all_findings[-REPLY_RECENT_FINDINGS:]
-        path = os.path.join(self.watch_dir, "reply-request-%s.json" % record["id"])
-        with open(path, "w") as f:
-            json.dump(req, f, indent=2)
+        A rider stuck at a stop for 20 minutes does not need to be told that
+        nothing is happening; a 40-minute Orange Line leg with no findings
+        should still show the thread is alive and following.
+        """
+        if trip.thread is None or not trip.last_thread_push_ms:
+            return
+        if now - trip.last_thread_push_ms < THREAD_HEARTBEAT_MS:
+            return
+        if now - trip.last_pos_ms > THREAD_MOVING_MS:
+            return
+        self._thread_push(trip, "still riding — %s" % self._short_state(trip))
+
+    def _leg_label(self, trip, idx):
+        legs = (trip.itinerary or {}).get("legs") or []
+        if not isinstance(idx, int) or not (0 <= idx < len(legs)):
+            return "leg %s" % idx
+        leg = legs[idx]
+        if leg.get("transit"):
+            return " ".join(str(x) for x in
+                            (leg.get("mode"), leg.get("route"),
+                             leg.get("headsign")) if x)
+        return leg.get("mode") or "leg %s" % idx
+
+    def _short_state(self, trip):
+        p = trip.progress
+        if not p:
+            return "no progress yet"
+        out = "leg %s at %s, %s" % (
+            p.get("currentLegIndex"), fmt_pct(p.get("currentLegProgress")),
+            p.get("status"))
+        if p.get("stopsRemaining") is not None:
+            out += ", %s stops left" % p["stopsRemaining"]
+        return out
+
+    # -- the digest ---------------------------------------------------------
+
+    def _digest_path(self, trip):
+        return os.path.join(self.watch_dir, "%s.digest.md" % trip.session)
+
+    def _write_digest(self, trip):
+        """The whole ride so far, rewritten before every push.
+
+        The ping is one line because the digest is the message: state now,
+        what changed since the thread last looked, every finding, every note.
+        A thread that reads this file is never behind, even if a push was lost.
+        """
+        now = self.now_ms()
+        L = ["# Ride digest — session %s" % trip.session, "",
+             "Written: %s" % datetime.datetime.now().strftime(
+                 "%Y-%m-%d %H:%M:%S"),
+             "Pushes so far: %d" % trip.thread_pushes, ""]
+        L.append("## Trip")
+        L.append("")
+        L.extend(self._trip_state_lines(trip, now))
+        L.append("- Progress units: currentLegProgress is a percentage on"
+                 " 0-100; UPDATE_ROUTE_MATCH.progressAlongLeg is the same"
+                 " value as a 0-1 fraction. Do not confuse them.")
+        if trip.end_ms:
+            L.append("- **Ended: %s (%s)**" % (fmt_hms(trip.end_ms),
+                                               trip.end_reason))
+        L.append("")
+        L.append("## Where the evidence is")
+        L.append("")
+        L.append("- Raw telemetry: %s (filter on session `%s`)"
+                 % (current_log_path(), trip.session))
+        L.append("- Findings: %s" % self._findings_path(trip))
+        L.append("- Live status: %s"
+                 % os.path.join(self.watch_dir, "current-ride.md"))
+        req = os.path.join(self.watch_dir,
+                           "report-request-%s.json" % trip.session)
+        if os.path.exists(req):
+            L.append("- Report request (wrap-up): %s" % req)
+        L.append("")
+        new = trip.thread_events[trip.thread_cursor:]
+        L.append("## New since the last push (%d)" % len(new))
+        L.append("")
+        L.extend(["- %s" % e for e in new] or ["- (nothing)"])
+        L.append("")
+        L.append("## Findings (%d)" % len(trip.findings))
+        L.append("")
+        L.extend(["- %s [%s] %s: %s" % (f["time"], f["severity"], f["rule"],
+                                        one_line(f["summary"]))
+                  for f in trip.findings[-THREAD_MAX_EVENTS:]]
+                 or ["- (none)"])
+        L.append("")
+        L.append("## Rider notes (%d)" % len(trip.notes))
+        L.append("")
+        for note in trip.notes[-THREAD_MAX_EVENTS:]:
+            c = note["context"] or {}
+            L.append("- %s — %s  _(at %s of leg %s, %s, %s stops left)_" % (
+                note["time"], one_line(note["text"]),
+                fmt_pct(c.get("legProgressPct")), c.get("legIndex"),
+                c.get("status"), c.get("stopsRemaining")))
+        if not trip.notes:
+            L.append("- (none)")
+        L.append("")
+        path = self._digest_path(trip)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(L) + "\n")
+        os.replace(tmp, path)
         return path
 
-    def _popen_reply(self, argv, env, log_path):
-        """Default spawner. The parent's copy of the log fd is closed right
-        away — the child has its own dup, and the watchdog must not have to
-        own a file handle to do its job."""
-        out = open(log_path, "a")
-        try:
-            return subprocess.Popen(
-                argv, cwd=REPO_DIR, env=env, stdout=out,
-                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
-        finally:
-            out.close()
+    # -- tmux (the real spawner and pusher) ---------------------------------
 
-    def _start_reply_agent(self, trip, notes, record):
-        out_path = os.path.join(self.watch_dir,
-                                "reply-out-%s.txt" % record["id"])
-        log_path = os.path.join(self.watch_dir,
-                                "reply-claude-%s.log" % record["id"])
-        spawn = self.spawn_reply
-        if spawn is None:
-            if self.dry_run:
-                # --replay and RIDE_WATCH_DRY_RUN=1 must never spend money or
-                # touch a real agent, but the rider should still see why.
-                self._finish_reply(trip, record, "error",
-                                   "Reply agent disabled (dry run).")
-                return
-            spawn = self._popen_reply
-        try:
-            with open(REPLY_PROMPT_PATH) as f:
-                prompt = f.read()
-        except OSError as exc:
-            self.log.error("reply prompt unreadable: %r" % exc)
-            self._finish_reply(trip, record, "error",
-                               "No answer — the reply prompt is missing.")
-            return
-        try:
-            req_path = self._write_reply_request(trip, notes, record, out_path)
-        except OSError as exc:
-            self.log.error("reply request unwritable: %r" % exc)
-            self._finish_reply(trip, record, "error",
-                               "No answer — could not write the request file.")
-            return
-        env = dict(os.environ)
-        env["RIDE_WATCH_REPLY_REQUEST"] = req_path
-        env["RIDE_WATCH_REPLY_OUT"] = out_path
-        try:
-            proc = spawn([CLAUDE_BIN, "-p", prompt], env, log_path)
-        except FileNotFoundError:
-            self.log.error("claude binary not found (%s)" % CLAUDE_BIN)
-            self._finish_reply(trip, record, "error",
-                               "No answer — the agent could not be started.")
-            return
-        except OSError as exc:
-            self.log.error("reply agent spawn failed: %r" % exc)
-            self._finish_reply(trip, record, "error",
-                               "No answer — the agent could not be started.")
-            return
-        self.log.info("reply agent started (id %s, pid %s, %d note(s))"
-                      % (record["id"], getattr(proc, "pid", "?"), len(notes)))
+    def _tmux(self, args, timeout=20):
+        return subprocess.run(
+            ["tmux"] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, timeout=timeout,
+            universal_newlines=True)
 
-        th = threading.Thread(
-            target=self._reply_watchdog,
-            args=(proc, trip, record, out_path, log_path), daemon=True)
-        th.start()
-        self.reply_threads.append(th)
+    def _tmux_spawn(self, name, display):
+        """Queue the real spawn. Returns None — "ask again later".
 
-    def _reply_watchdog(self, proc, trip, record, out_path, log_path):
-        """Wait for the agent, bounded. A wedged agent frees its slot."""
-        try:
-            rc = proc.wait(timeout=REPLY_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            self.log.error("reply agent %s timed out after %ds; killing"
-                           % (record["id"], REPLY_TIMEOUT_S))
-            for step in (proc.kill, proc.wait):
+        The TUI takes ~10s to come up and the tailer must not stop reading
+        telemetry for it, so the waiting happens on the worker thread.
+        """
+        self._thread_enqueue(("spawn", name, display))
+        return None
+
+    def _tmux_push(self, name, line):
+        self._thread_enqueue(("push", name, line))
+        return True
+
+    def _thread_enqueue(self, job):
+        with self._thread_lock:
+            self._thread_jobs.append(job)
+            if self._thread_worker is None or not self._thread_worker.is_alive():
+                self._thread_worker = threading.Thread(
+                    target=self._thread_worker_loop, daemon=True)
+                self._thread_worker.start()
+            self._thread_wake.set()
+
+    def _thread_worker_loop(self):
+        """Serialize tmux work. Order matters: pushes must not overtake the
+        spawn they belong to, and two send-keys must not interleave."""
+        while True:
+            self._thread_wake.wait(1.0)
+            while True:
+                with self._thread_lock:
+                    job = self._thread_jobs.pop(0) if self._thread_jobs else None
+                    if job is None:
+                        self._thread_wake.clear()
+                        break
                 try:
-                    step()
-                except Exception:
-                    pass
-            self._finish_reply(
-                trip, record, "error",
-                "No answer — the agent timed out after %ds." % REPLY_TIMEOUT_S)
-            return
-        except Exception as exc:
-            self.log.error("reply agent %s wait failed: %r" % (record["id"], exc))
-            self._finish_reply(trip, record, "error",
-                               "No answer — the agent failed.")
-            return
-        text = self._read_reply_text(out_path, log_path)
-        if text:
-            # A non-zero exit that still produced an answer is worth showing;
-            # the rider cares about the sentence, not the exit code.
-            if rc:
-                self.log.warn("reply agent %s exited %s but wrote an answer"
-                              % (record["id"], rc))
-            self._finish_reply(trip, record, "done", text)
-        else:
-            self._finish_reply(
-                trip, record, "error",
-                "No answer — the agent exited %s without writing one." % rc)
+                    if job[0] == "spawn":
+                        self._tmux_spawn_blocking(job[1], job[2])
+                    else:
+                        self._tmux_push_blocking(job[1], job[2])
+                except Exception as exc:
+                    self.log.error("ride thread worker job %s failed: %r"
+                                   % (job[0], exc))
 
-    def _read_reply_text(self, out_path, log_path):
-        """The answer file, else the agent's stdout, else nothing."""
-        for path, limit in ((out_path, None),
-                            (log_path, REPLY_STDOUT_FALLBACK_MAX)):
-            try:
-                with open(path) as f:
-                    raw = f.read().strip()
-            except OSError:
+    def _tmux_spawn_blocking(self, name, display):
+        self._kill_previous_threads(keep=name)
+        cmd = "%s %s" % (shlex.quote(THREAD_RUNNER), shlex.quote(display))
+        res = self._tmux(["new-session", "-d", "-s", name,
+                          "-x", str(THREAD_TMUX_SIZE[0]),
+                          "-y", str(THREAD_TMUX_SIZE[1]),
+                          "-c", REPO_DIR, cmd])
+        if res.returncode != 0:
+            self.log.error("tmux new-session failed (%d): %s"
+                           % (res.returncode, one_line(res.stdout)))
+            self._thread_status[name] = False
+            return
+        deadline = time.time() + THREAD_READY_TIMEOUT_S
+        while time.time() < deadline:
+            time.sleep(THREAD_READY_POLL_S)
+            pane = self._tmux(["capture-pane", "-p", "-t", name])
+            if pane.returncode != 0:
                 continue
-            if not raw or (limit is not None and len(raw) > limit):
+            if THREAD_READY_MARKER in (pane.stdout or ""):
+                self._thread_status[name] = True
+                self.log.info("ride thread %s ready in %.0fs" % (
+                    name, THREAD_READY_TIMEOUT_S - (deadline - time.time())))
+                return
+        # No prompt yet. If the pane is still alive the keystrokes will buffer
+        # in the tty and be read when it comes up, so this is a warning rather
+        # than a dead thread; only a vanished session is a failure.
+        alive = self._tmux(["has-session", "-t", name]).returncode == 0
+        self._thread_status[name] = alive
+        self.log.warn("ride thread %s not ready after %ds (session alive=%s)"
+                      % (name, THREAD_READY_TIMEOUT_S, alive))
+
+    def _tmux_push_blocking(self, name, line):
+        # -l types the line literally: a note containing `;` or `C-c` must
+        # never be interpreted as a tmux key name.
+        res = self._tmux(["send-keys", "-t", name, "-l", line])
+        if res.returncode != 0:
+            self.log.error("send-keys failed for %s (%s); thread considered gone"
+                           % (name, one_line(res.stdout)))
+            self._thread_status[name] = False
+            return
+        time.sleep(THREAD_SUBMIT_DELAY_S)
+        res = self._tmux(["send-keys", "-t", name, "Enter"])
+        if res.returncode != 0:
+            self.log.error("submit failed for %s (%s)"
+                           % (name, one_line(res.stdout)))
+            self._thread_status[name] = False
+
+    def _kill_previous_threads(self, keep=None):
+        """The new ride's thread is the rider's thread; retire the old ones."""
+        res = self._tmux(["list-sessions", "-F", "#{session_name}"])
+        if res.returncode != 0:
+            return []          # no tmux server yet: nothing to clean up
+        killed = []
+        for name in ride_thread_sessions((res.stdout or "").split()):
+            if name == keep:
                 continue
-            return " ".join(raw.split())[:REPLY_MAX_CHARS]
-        return ""
+            if self._tmux(["kill-session", "-t", name]).returncode == 0:
+                killed.append(name)
+        if killed:
+            self.log.info("previous ride thread(s) killed: %s"
+                          % ", ".join(killed))
+        return killed
 
     # -- live status file ---------------------------------------------------
 
     def _mark_dirty(self):
         self._status_dirty = True
+
+    def _trip_state_lines(self, trip, now):
+        """The trip's current state as bullets.
+
+        Shared verbatim by current-ride.md and the thread digest: two surfaces
+        describing the same second must not describe it differently.
+        """
+        lines = [
+            "- Started: %s %s" % (fmt_date(trip.start_ms), fmt_hms(trip.start_ms)),
+            "- Itinerary: %s" % itinerary_one_liner(trip.itinerary),
+        ]
+        if trip.swap_seq:
+            lines.append("- Itinerary swaps: %d (last %s)" % (
+                trip.swap_seq, fmt_hms(trip.swap_times[-1])))
+        p = trip.progress
+        if p:
+            stops = ""
+            if p.get("stopsRemaining") is not None:
+                stops = ", %s stops left (next: %s)" % (
+                    p["stopsRemaining"], p.get("nextStopName"))
+            lines.append("- Leg %s at %s, status %s%s" % (
+                p.get("currentLegIndex"),
+                fmt_pct(p.get("currentLegProgress")), p.get("status"), stops))
+        if trip.riding:
+            lines.append("- Riding: trip %s vehicle %s (%s) since %s" % (
+                trip.riding.get("tripId"), trip.riding.get("vehicleId"),
+                trip.riding.get("headsign"), fmt_hms(trip.riding.get("boardedAt"))))
+        else:
+            lines.append("- Riding: not aboard")
+        lines.append("- Last fix: %ds ago" % max(0, (now - trip.last_pos_ms) // 1000))
+        lines.append("- Pages sent: %d/%d" % (trip.pages_sent, MAX_PAGES_PER_TRIP))
+        if trip.thread:
+            lines.append("- Ride thread: tmux %s (%s), %d push(es)" % (
+                trip.thread["tmux"],
+                {True: "up", False: "gone", None: "starting"}.get(
+                    trip.thread.get("ok"), "?"),
+                trip.thread_pushes))
+        return lines
 
     def maybe_write_status(self):
         if not self._status_dirty:
@@ -1365,36 +1654,13 @@ class RideWatch:
                         s.get("reason")))
             else:
                 lines.append("No active trip. Last: none recorded yet.")
-        # list(): the reply watchdog thread also writes the status file when an
-        # answer lands, and the tailer may be starting or ending a trip.
+        # list(): the tailer may be starting or ending a trip while this runs.
         for trip in list(self.trips.values()):
             now = self.now_ms()
             lines.append("## Active trip — session %s%s" % (
                 trip.session, " (adopted mid-stream)" if trip.adopted else ""))
             lines.append("")
-            lines.append("- Started: %s %s" % (fmt_date(trip.start_ms), fmt_hms(trip.start_ms)))
-            lines.append("- Itinerary: %s" % itinerary_one_liner(trip.itinerary))
-            if trip.swap_seq:
-                lines.append("- Itinerary swaps: %d (last %s)" % (
-                    trip.swap_seq, fmt_hms(trip.swap_times[-1])))
-            p = trip.progress
-            if p:
-                stops = ""
-                if p.get("stopsRemaining") is not None:
-                    stops = ", %s stops left (next: %s)" % (
-                        p["stopsRemaining"], p.get("nextStopName"))
-                prog = p.get("currentLegProgress")
-                prog_s = "%.0f%%" % prog if isinstance(prog, (int, float)) else "?"
-                lines.append("- Leg %s at %s, status %s%s" % (
-                    p.get("currentLegIndex"), prog_s, p.get("status"), stops))
-            if trip.riding:
-                lines.append("- Riding: trip %s vehicle %s (%s) since %s" % (
-                    trip.riding.get("tripId"), trip.riding.get("vehicleId"),
-                    trip.riding.get("headsign"), fmt_hms(trip.riding.get("boardedAt"))))
-            else:
-                lines.append("- Riding: not aboard")
-            lines.append("- Last fix: %ds ago" % max(0, (now - trip.last_pos_ms) // 1000))
-            lines.append("- Pages sent: %d/%d" % (trip.pages_sent, MAX_PAGES_PER_TRIP))
+            lines.extend(self._trip_state_lines(trip, now))
             lines.append("")
             # The rider's own words go above the machine findings: when both
             # exist, the note is the one that says what actually went wrong.
@@ -1404,8 +1670,8 @@ class RideWatch:
                 for note in reversed(trip.notes[-20:]):
                     c = note["context"]
                     where = "leg %s" % c.get("legIndex")
-                    if isinstance(c.get("legProgress"), (int, float)):
-                        where += " at %.0f%%" % c["legProgress"]
+                    if isinstance(c.get("legProgressPct"), (int, float)):
+                        where += " at %s" % fmt_pct(c["legProgressPct"])
                     if c.get("stopsRemaining") is not None:
                         where += ", %s stops left" % c["stopsRemaining"]
                     if c.get("status"):
@@ -1421,18 +1687,6 @@ class RideWatch:
                         fnd["time"], fnd["severity"], fnd["rule"], fnd["summary"]))
             else:
                 lines.append("### Findings: none")
-            lines.append("")
-        # Outside the per-trip loop: a note typed between rides is answered
-        # too, and that answer still belongs in the live view.
-        if self.replies:
-            pending = sum(1 for r in self.replies if r["status"] == "thinking")
-            lines.append("### Agent replies (%d%s, newest first)" % (
-                len(self.replies), ", %d thinking" % pending if pending else ""))
-            lines.append("")
-            for rep in reversed(self.replies[-10:]):
-                body = rep["text"] if rep["status"] != "thinking" else "…"
-                lines.append("- %s [%s] %s" % (
-                    fmt_hms(rep["tsMs"]), rep["status"], body))
             lines.append("")
         path = os.path.join(self.watch_dir, "current-ride.md")
         try:

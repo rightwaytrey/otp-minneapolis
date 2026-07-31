@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
 """Tests for ride-watch. Stdlib only:  python3 ride-watch/test_ride_watch.py
 
-Two layers:
+Three layers:
   * synthetic streams that exercise each rule and the state machine in
-    isolation, and
+    isolation,
   * a replay of the real 2026-07-29 telemetry, which asserts that the
     afternoon's incident is actually caught and that the rider would not
-    have been paged more than twice.
+    have been paged more than twice, and
+  * the ride thread: lifecycle and push cadence, replayed against both real
+    logs, with tmux and `claude` behind stubs.
+
+Nothing here spawns a process, touches tmux, or reaches the network.
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ride_watch  # noqa: E402
 from ride_watch import (  # noqa: E402
-    Log, RideWatch, read_pushover_creds, run_replay)
+    Log, RideWatch, read_pushover_creds, ride_thread_sessions, run_replay)
 
 
-def quiet_watch(watch_dir, replay=True, spawn_reply=None):
+def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
+                thread_enabled=None):
     """A watcher whose daemon log does not spam the test runner."""
     log = Log(os.path.join(watch_dir, "daemon.log"), echo=False)
     return RideWatch(dry_run=True, replay=replay, watch_dir=watch_dir, log=log,
-                     spawn_reply=spawn_reply)
+                     spawn_thread=spawn_thread, push_line=push_line,
+                     thread_enabled=thread_enabled)
 
 
 def read_text(path):
@@ -114,8 +119,34 @@ class StreamBuilder:
             p["stopsRemaining"] = stops
         return self.action("UPDATE_PROGRESS", p)
 
-    def position(self):
-        return self.action("UPDATE_POSITION", {"position": {"coords": {}}})
+    # Downtown Minneapolis, and a metre is ~9e-6 degrees of latitude — enough
+    # to express "jittered in place" and "actually went somewhere" without a
+    # geo library. The shape matches the real payload (coords at the top of
+    # the payload, not nested under `position`).
+    LAT, LON = 44.97780, -93.26500
+
+    def position(self, lat=None, lon=None, accuracy=5.0):
+        return self.action("UPDATE_POSITION", {
+            "coords": {"latitude": self.LAT if lat is None else lat,
+                       "longitude": self.LON if lon is None else lon,
+                       "accuracy": accuracy},
+            "timestamp": self.t})
+
+    def position_metres_north(self, metres, **kw):
+        return self.position(lat=self.LAT + metres * 9.0e-6, **kw)
+
+    def notification(self, title="Turn right on Village Lane",
+                     message="In 173 ft, then bear right on Village Terrace",
+                     ntype="TURN_ALERT", nid=None):
+        """An ADD_NOTIFICATION shaped like the real ones, id and all.
+
+        The id carries a fresh Date.now() on every fire — that is the app bug
+        that produced the 7/31 storm, so the fixture reproduces it.
+        """
+        return self.action("ADD_NOTIFICATION", {
+            "id": nid or "UPCOMING_TURN_1785518021000_0_prepare_%d" % self.t,
+            "title": title, "message": message, "type": ntype,
+            "priority": "medium"})
 
     def riding(self, trip_id="1:100", vehicle="1:900", leg=1):
         return self.action("SET_RIDING", {
@@ -137,87 +168,85 @@ class StreamBuilder:
         return self
 
 
-# --- the reply agent stub ---------------------------------------------------
-# The suite must never invoke the real `claude`: it costs money, it takes
-# minutes, and its answer is different every time. RideWatch takes a
-# `spawn_reply` callable for exactly this, so the tests exercise the real
-# queueing, budget, watchdog and persistence code against a process that is
-# only pretending.
+# --- the ride thread stub ----------------------------------------------------
+# The suite must never start a tmux session or a real `claude`: it costs money,
+# it takes ten seconds per spawn, and the rider's own threads live in the same
+# namespace. RideWatch takes `spawn_thread`/`push_line` for exactly this, so the
+# tests exercise the real lifecycle, cadence and digest code against a thread
+# that is only pretending.
+
+PUSH_KINDS = (
+    ("trip started", "start"),
+    ("leg ", "leg"),
+    ("finding [", "finding"),
+    ("rider note:", "note"),
+    ("trip ended", "end"),
+    ("still riding", "heartbeat"),
+)
 
 
-class FakeProc:
-    """Just enough of subprocess.Popen for the watchdog."""
+class StubThread:
+    """Records what would have been typed, and the digest as it was then.
 
-    def __init__(self, rc=0, hang=False, block=None):
-        self.pid = 4242
-        self.rc = rc
-        self.hang = hang          # wait() always times out
-        self.block = block        # Event that must be set before wait() returns
-        self.killed = False
-
-    def wait(self, timeout=None):
-        if self.hang:
-            raise subprocess.TimeoutExpired("claude", timeout)
-        if self.block is not None and not self.block.wait(timeout or 5):
-            raise subprocess.TimeoutExpired("claude", timeout)
-        return self.rc
-
-    def kill(self):
-        self.killed = True
-
-
-class StubAgent:
-    """Records every spawn and writes a canned answer where the daemon looks."""
-
-    def __init__(self, answer="Confirmed. Logged for after the ride.", rc=0,
-                 hang=False, to_stdout=False, block=False):
-        self.answer = answer
-        self.rc = rc
-        self.hang = hang
-        self.to_stdout = to_stdout     # print instead of writing answerPath
-        self.block = threading.Event() if block else None
-        self.calls = []                # [{argv, env, request, log}]
-        self.procs = []
-
-    def __call__(self, argv, env, log_path):
-        with open(env["RIDE_WATCH_REPLY_REQUEST"]) as f:
-            request = json.load(f)
-        self.calls.append({"argv": argv, "env": env, "request": request,
-                           "log": log_path})
-        if self.answer is not None and not self.hang:
-            target = log_path if self.to_stdout else env["RIDE_WATCH_REPLY_OUT"]
-            with open(target, "w") as f:
-                f.write(self.answer)
-        proc = FakeProc(rc=self.rc, hang=self.hang, block=self.block)
-        self.procs.append(proc)
-        return proc
-
-    def release(self):
-        if self.block is not None:
-            self.block.set()
-
-    def notes_seen(self):
-        """The note texts each spawned agent was handed."""
-        return [[n["text"] for n in c["request"]["notes"]] for c in self.calls]
-
-
-def settle(watch, timeout=5.0):
-    """Wait for every reply watchdog to finish, including ones they spawn.
-
-    A watchdog that finishes an answer immediately starts the next queued
-    agent, so joining the list once is not enough — join until the list stops
-    growing and nothing is in flight.
+    Reading the digest at push time is the point: asserting on the file after
+    the ride would only prove the last write, and the promise is that the
+    thread is never handed a stale picture.
     """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        threads = list(watch.reply_threads)
-        for th in threads:
-            th.join(timeout=max(0.05, deadline - time.time()))
-        if (len(watch.reply_threads) == len(threads)
-                and watch.reply_inflight is None
-                and not watch.reply_queue):
-            return
-    raise AssertionError("reply agents did not settle within %ss" % timeout)
+
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.spawns = []               # [(tmux_name, display_name)]
+        self.pushes = []               # [{name, line, digest}]
+
+    def spawn(self, name, display):
+        self.spawns.append((name, display))
+        return self.ok
+
+    def push(self, name, line):
+        path = line.rsplit(" — digest: ", 1)[-1]
+        with open(path) as f:
+            digest = f.read()
+        self.pushes.append({"name": name, "line": line, "digest": digest})
+        return True
+
+    def lines(self):
+        return [p["line"] for p in self.pushes]
+
+    def kinds(self):
+        """Each push classified by its milestone, or 'other' if it is not one."""
+        out = []
+        for line in self.lines():
+            body = line.split("[ride-watch] ", 1)[-1]
+            out.append(next((kind for prefix, kind in PUSH_KINDS
+                             if body.startswith(prefix)), "other"))
+        return out
+
+    def of_kind(self, kind):
+        return [p for p, k in zip(self.pushes, self.kinds()) if k == kind]
+
+
+class NoProcesses:
+    """Fails the test if anything tries to start a process.
+
+    The retired reply path spawned `claude -p` from the note handler; this is
+    how the suite proves a note is now just a digest push.
+    """
+
+    def __enter__(self):
+        self._popen = ride_watch.subprocess.Popen
+        self._run = ride_watch.subprocess.run
+
+        def forbidden(*a, **kw):
+            raise AssertionError("a process was spawned: %r" % (a,))
+
+        ride_watch.subprocess.Popen = forbidden
+        ride_watch.subprocess.run = forbidden
+        return self
+
+    def __exit__(self, *exc):
+        ride_watch.subprocess.Popen = self._popen
+        ride_watch.subprocess.run = self._run
+        return False
 
 
 class RuleTestCase(unittest.TestCase):
@@ -227,8 +256,11 @@ class RuleTestCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="ride-watch-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def run_stream(self, builder, finalize=True, spawn_reply=None):
-        watch = quiet_watch(self.tmp, spawn_reply=spawn_reply)
+    def run_stream(self, builder, finalize=True, thread=None):
+        watch = quiet_watch(
+            self.tmp,
+            spawn_thread=thread.spawn if thread else None,
+            push_line=thread.push if thread else None)
         for ev in builder.events:
             watch.process(ev)
         if finalize:
@@ -469,6 +501,112 @@ class TestRules(RuleTestCase):
         self.assertEqual(len(hits), 2)
         self.assertEqual(hits[0]["severity"], "info")
 
+    def test_k_notification_repeat_pages(self):
+        """The 7/31 storm, in miniature: three identical buzzes in five minutes."""
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        for _ in range(3):
+            b.advance(30 * 1000).notification()
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "notification-repeat")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "page")
+        self.assertEqual(hits[0]["context"]["count"], 3)
+        self.assertIn("Turn right on Village Lane", hits[0]["summary"])
+
+    def test_k_two_of_the_same_alert_is_not_a_storm(self):
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        b.advance(30 * 1000).notification()
+        b.advance(30 * 1000).notification()
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("notification-repeat", self.rules(watch))
+
+    def test_k_three_different_alerts_are_not_a_storm(self):
+        # Three turns in a row on a fast route is the app working.
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        for turn in ("Turn right on Village Lane", "Turn left on 5th",
+                     "Bear right on Hiawatha"):
+            b.advance(30 * 1000).notification(title=turn, message=turn)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("notification-repeat", self.rules(watch))
+
+    def test_k_the_same_alert_spread_over_an_hour_is_not_a_storm(self):
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        for _ in range(3):
+            b.advance(20 * 60 * 1000).notification()
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("notification-repeat", self.rules(watch))
+
+    def test_k_a_continuing_storm_is_one_finding_not_fourteen(self):
+        # The real ride buzzed 14 times; the rider gets told once.
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        for _ in range(14):
+            b.advance(30 * 1000).notification()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "notification-repeat")), 1)
+
+    def test_l_progress_without_motion_warns(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=1, prog=10.0, stops=5)
+        for _ in range(6):                       # jitter inside a few metres
+            b.advance(10 * 1000).position_metres_north(1.0)
+        b.advance(1000).progress(leg=1, prog=25.0, stops=5)
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "progress-without-motion")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "warn")
+        self.assertEqual(hits[0]["context"]["fromPct"], 10.0)
+        self.assertEqual(hits[0]["context"]["toPct"], 25.0)
+        self.assertLess(hits[0]["context"]["movedMeters"], 15.0)
+
+    def test_l_progress_with_real_motion_is_just_travel(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=1, prog=10.0, stops=5)
+        for i in range(6):                       # 60m per tick: a moving bus
+            b.advance(10 * 1000).position_metres_north(60.0 * (i + 1))
+        b.advance(1000).progress(leg=1, prog=25.0, stops=5)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("progress-without-motion", self.rules(watch))
+
+    def test_l_standing_still_with_steady_progress_is_quiet(self):
+        b = StreamBuilder().start().advance(1000).position()
+        for _ in range(8):
+            b.advance(10 * 1000).position_metres_north(1.0)
+            b.progress(leg=1, prog=10.0, stops=5)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("progress-without-motion", self.rules(watch))
+
+    def test_l_a_progress_teleport_on_a_moving_bus_still_warns(self):
+        """The 7/29 shape: 35% -> 71% in one second, 6.7m of actual travel.
+
+        A moving rider re-anchors every couple of seconds, so this can only
+        fire when the bar outruns the bus inside that window — which is
+        exactly what a map-matching relocation looks like.
+        """
+        b = StreamBuilder().start()
+        # 6.5m per second — an Orange Line bus. The anchor resets every third
+        # tick (past 15m), so the teleport has to land inside one of those
+        # windows to be caught, which is precisely what happened at 17:20:11.
+        b.advance(1000).position_metres_north(0.0).progress(
+            leg=0, prog=35.0, stops=None)
+        b.advance(1000).position_metres_north(6.5).progress(
+            leg=0, prog=35.1, stops=None)
+        b.advance(1000).position_metres_north(13.0).progress(
+            leg=0, prog=70.6, stops=None)
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "progress-without-motion")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("71%", hits[0]["summary"])
+        self.assertLess(hits[0]["context"]["movedMeters"], 15.0)
+
+    def test_l_a_tenth_of_a_point_of_jitter_is_not_a_finding(self):
+        """The actual 7/31 numbers: 0.31 -> 0.21 -> 0.31 inside a 7m circle."""
+        b = StreamBuilder().start().advance(1000).position()
+        for prog in (0.3077, 0.2100, 0.3077):
+            b.advance(60 * 1000).position_metres_north(3.0)
+            b.progress(leg=0, prog=prog, stops=None)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("progress-without-motion", self.rules(watch))
+
     def test_j_distance_spike_warns(self):
         b = StreamBuilder().start().advance(1000).progress()
         b.advance(1000).route_match(50.0)
@@ -615,11 +753,13 @@ class TestPageRanking(RuleTestCase):
     def test_the_ranking_covers_every_page_rule(self):
         """A page rule with no rank would silently fall back to mid-pack."""
         page_rules = {"stop-count-collapse", "missed-bus-while-riding",
-                      "aboard-swap", "riding-flip", "deviated-streak"}
+                      "notification-repeat", "aboard-swap", "riding-flip",
+                      "deviated-streak"}
         self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
         self.assertEqual(
-            ["stop-count-collapse", "missed-bus-while-riding", "aboard-swap",
-             "riding-flip", "deviated-streak"],
+            ["stop-count-collapse", "missed-bus-while-riding",
+             "notification-repeat", "aboard-swap", "riding-flip",
+             "deviated-streak"],
             sorted(ride_watch.PAGE_RANK, key=ride_watch.PAGE_RANK.get,
                    reverse=True))
 
@@ -767,7 +907,7 @@ class TestRiderNotes(RuleTestCase):
         watch = self.run_stream(b, finalize=False)
         ctx = watch.trips[SESSION].notes[0]["context"]
         self.assertEqual(ctx["legIndex"], 1)
-        self.assertEqual(ctx["legProgress"], 45.0)
+        self.assertEqual(ctx["legProgressPct"], 45.0)
         self.assertEqual(ctx["stopsRemaining"], 3)
         self.assertEqual(ctx["status"], "on_track")
         self.assertTrue(ctx["onTransitLeg"])
@@ -843,280 +983,386 @@ class TestRiderNotes(RuleTestCase):
                          "app said 1 stop left, it was 6")
 
 
-class TestMidRideReplies(RuleTestCase):
-    """A note now gets an answer while the rider is still on the bus.
 
-    The three things that have to hold under load: one agent at a time, every
-    queued note reaches the agent that eventually runs, and a wedged agent
-    cannot eat the rest of the ride's answers.
+class TestRideThread(RuleTestCase):
+    """One conversation per ride, pinged only at milestones.
+
+    What has to hold: the thread exists from the first second of the ride, it
+    hears about everything that matters and nothing that does not, the digest
+    it is pointed at is current at the moment of every ping, and none of it can
+    take the daemon down or interfere with paging.
     """
 
-    def reply_rows(self, watch=None):
-        """Reply records as persisted, collapsed by id like the API does."""
-        files = [f for f in os.listdir(self.tmp) if f.endswith(".replies.jsonl")]
-        rows = []
-        for name in files:
-            for line in read_text(os.path.join(self.tmp, name)).splitlines():
-                if line.strip():
-                    rows.append(json.loads(line))
-        return rows
+    def ride(self, builder, ok=True, finalize=False):
+        thread = StubThread(ok=ok)
+        watch = self.run_stream(builder, finalize=finalize, thread=thread)
+        return watch, thread
 
-    def collapsed(self):
-        by_id = {}
-        for row in self.reply_rows():
-            by_id[row["id"]] = row
-        return list(by_id.values())
+    # -- lifecycle ---------------------------------------------------------
 
-    def test_a_note_spawns_a_reply_agent(self):
-        stub = StubAgent(answer="4 stops left, next Lake St.")
-        b = StreamBuilder().start().advance(1000).progress(stops=4, prog=30.0)
-        b.advance(1000).note("how many stops")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        self.assertEqual(len(stub.calls), 1)
-        self.assertEqual(stub.notes_seen(), [["how many stops"]])
-        self.assertEqual(len(watch.replies), 1)
-        self.assertEqual(watch.replies[0]["status"], "done")
-        self.assertEqual(watch.replies[0]["text"], "4 stops left, next Lake St.")
+    def test_a_trip_start_spawns_exactly_one_thread(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        watch, thread = self.ride(b)
+        self.assertEqual(len(thread.spawns), 1)
+        name, display = thread.spawns[0]
+        # tmux name is machine-facing; the display name is what the rider
+        # picks out of a list of conversations on their phone.
+        self.assertRegex(name, r"^ride-\d{4}$")
+        self.assertRegex(display, r"^ride \d\d-\d\d \d\d:\d\d$")
+        self.assertEqual(watch.trips[SESSION].thread["tmux"], name)
 
-    def test_the_agent_is_invoked_as_claude_dash_p_with_the_prompt(self):
-        stub = StubAgent()
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("check")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        argv = stub.calls[0]["argv"]
-        self.assertEqual(argv[0], ride_watch.CLAUDE_BIN)
-        self.assertEqual(argv[1], "-p")
-        self.assertIn("RIDE_WATCH_REPLY_REQUEST", argv[2])
-        env = stub.calls[0]["env"]
-        self.assertTrue(os.path.exists(env["RIDE_WATCH_REPLY_REQUEST"]))
-        self.assertIn("reply-out-", env["RIDE_WATCH_REPLY_OUT"])
+    def test_an_itinerary_swap_is_not_a_second_thread(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).start()          # auto-reroute swap, same ride
+        watch, thread = self.ride(b)
+        self.assertEqual(len(thread.spawns), 1)
 
-    def test_a_thinking_placeholder_is_recorded_before_the_answer(self):
-        """The console must be able to say "working on it" immediately."""
-        stub = StubAgent(block=True)
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("is this thing on")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        self.assertEqual(watch.replies[0]["status"], "thinking")
-        self.assertEqual([r["status"] for r in self.reply_rows()], ["thinking"])
-        stub.release()
-        settle(watch)
-        # Append-only: the placeholder row stays, the final row supersedes it.
-        self.assertEqual([r["status"] for r in self.reply_rows()],
-                         ["thinking", "done"])
-        self.assertEqual(len(self.collapsed()), 1)
-        self.assertEqual(self.collapsed()[0]["status"], "done")
+    def test_a_trip_adopted_mid_stream_still_gets_a_thread(self):
+        # Daemon restarted under a rider who is already on the bus.
+        b = StreamBuilder().advance(1000).progress(stops=5)
+        watch, thread = self.ride(b)
+        self.assertEqual(len(thread.spawns), 1)
+        self.assertIn("adopted", thread.lines()[0])
 
-    def test_the_request_carries_the_trip_context_at_note_time(self):
-        stub = StubAgent()
+    def test_the_kill_switch_leaves_the_ride_untouched(self):
+        thread = StubThread()
+        watch = quiet_watch(self.tmp, spawn_thread=thread.spawn,
+                            push_line=thread.push, thread_enabled=False)
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        for ev in b.events:
+            watch.process(ev)
+        self.assertEqual(thread.spawns, [])
+        self.assertEqual(thread.pushes, [])
+        # The rule engine and the page are exactly as they were.
+        self.assertIn("stop-count-collapse", self.rules(watch))
+
+    def test_a_failed_spawn_never_stops_the_ride(self):
+        def explode(name, display):
+            raise OSError("tmux: command not found")
+
+        watch = quiet_watch(self.tmp, spawn_thread=explode,
+                            push_line=lambda n, l: True)
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0).advance(1000).stop()
+        for ev in b.events:
+            watch.process(ev)
+        self.assertEqual(len(watch.ended_trips), 1)
+        self.assertIn("stop-count-collapse", self.rules(watch))
+
+    def test_a_push_failure_never_stops_the_ride(self):
+        def explode(name, line):
+            raise OSError("no such pane")
+
+        watch = quiet_watch(self.tmp, spawn_thread=lambda n, d: True,
+                            push_line=explode)
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0).advance(1000).stop()
+        for ev in b.events:
+            watch.process(ev)
+        self.assertEqual(len(watch.ended_trips), 1)
+        self.assertEqual(len(watch.ended_trips[0].findings), 1)
+
+    # -- which tmux sessions are ours to kill -------------------------------
+
+    def test_only_our_own_ride_sessions_are_cleaned_up(self):
+        names = ["0", "rc-1785516790", "ride-1432", "ride-0907",
+                 "ride-test-smoke", "ride-impl-test-1432", "rider-1432",
+                 "ride-143", "ride-14322"]
+        self.assertEqual(ride_thread_sessions(names), ["ride-1432", "ride-0907"])
+
+    def test_the_riders_own_test_thread_is_never_killed(self):
+        # `ride-test-smoke` was live in the rider's app while this was written.
+        self.assertEqual(ride_thread_sessions(["ride-test-smoke"]), [])
+
+    def test_a_test_run_under_its_own_prefix_ignores_real_rides(self):
+        names = ["ride-1432", "ride-impl-test-1432", "ride-test-smoke"]
+        self.assertEqual(
+            ride_thread_sessions(names, prefix="ride-impl-test"),
+            ["ride-impl-test-1432"])
+
+    # -- cadence -------------------------------------------------------------
+
+    def test_the_kickoff_names_the_itinerary(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        watch, thread = self.ride(b)
+        first = thread.lines()[0]
+        self.assertIn("[ride-watch] trip started", first)
+        self.assertIn("BUS 5", first)
+        self.assertIn(".digest.md", first)
+
+    def test_every_push_is_one_line(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5, prog=10.0)
+        b.advance(1000).note("driver\nblew\npast my stop")
+        b.advance(1000).progress(leg=2, stops=None, prog=5.0)
+        b.advance(1000).stop()
+        watch, thread = self.ride(b)
+        for line in thread.lines():
+            self.assertNotIn("\n", line)
+            self.assertLessEqual(len(line), ride_watch.THREAD_LINE_MAX)
+
+    def test_routine_telemetry_never_reaches_the_thread(self):
+        b = StreamBuilder().start()
+        for _ in range(60):                 # a minute of ~1 Hz noise
+            b.advance(1000).position().progress(stops=5, prog=30.0)
+        watch, thread = self.ride(b)
+        self.assertEqual(thread.kinds(), ["start"])
+
+    def test_a_leg_transition_is_a_milestone(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).progress(leg=2, prog=5.0)
+        watch, thread = self.ride(b)
+        self.assertEqual(thread.kinds(), ["start", "leg"])
+        self.assertIn("leg 1 -> 2", thread.of_kind("leg")[0]["line"])
+
+    def test_a_finding_is_a_milestone(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        watch, thread = self.ride(b)
+        self.assertEqual(thread.kinds(), ["start", "finding"])
+        self.assertIn("stop-count-collapse", thread.of_kind("finding")[0]["line"])
+
+    def test_a_rider_note_is_a_milestone_and_costs_one_push(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5, prog=30.0)
+        b.advance(1000).note("driver blew past my stop")
+        watch, thread = self.ride(b)
+        self.assertEqual(thread.kinds(), ["start", "note"])
+        self.assertIn("driver blew past my stop", thread.of_kind("note")[0]["line"])
+
+    def test_a_note_no_longer_spawns_a_process(self):
+        """The whole reason this feature exists — no more `claude -p` per note."""
+        thread = StubThread()
+        watch = quiet_watch(self.tmp, spawn_thread=thread.spawn,
+                            push_line=thread.push)
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for text in ("how many stops", "is it following me", "still wrong"):
+            b.advance(1000).note(text)
+        with NoProcesses():
+            for ev in b.events:
+                watch.process(ev)
+        self.assertEqual(len(watch.trips[SESSION].notes), 3)
+        self.assertEqual(thread.kinds(), ["start", "note", "note", "note"])
+        self.assertFalse(hasattr(watch, "replies"))
+        self.assertFalse(hasattr(watch, "reply_queue"))
+
+    def test_trip_end_hands_over_the_wrap_up(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch, thread = self.ride(b)
+        end = thread.of_kind("end")
+        self.assertEqual(len(end), 1)
+        self.assertIn("1 finding(s)", end[0]["line"])
+        self.assertIn("report-request-%s.json" % SESSION, end[0]["line"])
+
+    def test_a_clean_ride_ends_without_a_request_file(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).stop()
+        watch, thread = self.ride(b)
+        end = thread.of_kind("end")
+        self.assertEqual(len(end), 1)
+        self.assertNotIn("report-request", end[0]["line"])
+
+    def test_a_heartbeat_only_fires_while_still_moving(self):
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        # 11 minutes of position fixes with nothing else happening.
+        for _ in range(11):
+            b.advance(60 * 1000).position().progress(stops=5, prog=30.0)
+        watch, thread = self.ride(b)
+        self.assertEqual(len(thread.of_kind("heartbeat")), 1)
+        self.assertIn("leg 1 at 30%", thread.of_kind("heartbeat")[0]["line"])
+
+    def test_no_heartbeat_when_the_fixes_stopped(self):
+        # gps-gap still fires (that is a finding); the heartbeat does not,
+        # because "still riding" would be a lie.
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        b.advance(20 * 60 * 1000).progress(stops=5, prog=30.0)
+        watch, thread = self.ride(b)
+        self.assertEqual(thread.of_kind("heartbeat"), [])
+
+    # -- the digest ----------------------------------------------------------
+
+    def test_the_digest_is_current_at_every_push(self):
         b = StreamBuilder().start().advance(1000).position()
         b.advance(1000).riding(trip_id="1:100")
-        b.advance(1000).route_match(12.0)
-        b.advance(1000).action("UPDATE_VEHICLE_MATCH", {
-            "consecutiveMatches": 3, "emptyPolls": 0,
-            "match": {"confidence": "high", "vehicleId": "1:900",
-                      "label": "5", "distanceMeters": 18.0}})
-        b.advance(1000).progress(stops=3, prog=45.0, status="on_track")
-        b.advance(1000).note("driver blew past my stop")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        req = stub.calls[0]["request"]
-        self.assertTrue(req["tripActive"])
-        self.assertEqual(req["notes"][0]["text"], "driver blew past my stop")
-        self.assertEqual(req["notes"][0]["context"]["stopsRemaining"], 3)
-        trip = req["trip"]
-        self.assertEqual(trip["session"], SESSION)
-        self.assertIn("BUS 5", trip["itinerary"])
-        self.assertEqual(len(trip["itinerarySummary"]["legs"]), 3)
-        self.assertEqual(trip["state"]["legIndex"], 1)
-        self.assertEqual(trip["state"]["legProgress"], 45.0)
-        self.assertEqual(trip["state"]["status"], "on_track")
-        self.assertEqual(trip["state"]["stopsRemaining"], 3)
-        self.assertEqual(trip["riding"]["tripId"], "1:100")
-        self.assertEqual(trip["routeMatch"]["distanceFromRoute"], 12.0)
-        self.assertEqual(trip["vehicleMatch"]["confidence"], "high")
-        self.assertEqual(trip["vehicleMatch"]["vehicleId"], "1:900")
-        # Pointers, so the agent can go and read the raw evidence itself.
-        self.assertTrue(req["debugLogPath"].endswith(".jsonl"))
-        self.assertEqual(req["goModeSource"]["branch"], "feature/go-mode")
-        self.assertIn("otp-react-redux", req["goModeSource"]["path"])
+        b.advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)     # collapse
+        b.advance(1000).note("it says one stop and we just left")
+        b.advance(1000).stop()
+        watch, thread = self.ride(b)
+        seen = 0
+        for push in thread.pushes:
+            digest = push["digest"]
+            # Trip state, every time.
+            self.assertIn("- Started:", digest)
+            self.assertIn("- Itinerary: WALK > BUS 5", digest)
+            self.assertIn("- Last fix:", digest)
+            # The findings section never goes backwards.
+            count = int(re.search(r"## Findings \((\d+)\)", digest).group(1))
+            self.assertGreaterEqual(count, seen)
+            seen = count
+        self.assertEqual(seen, len(watch.ended_trips[0].findings))
 
-    def test_the_request_carries_the_recent_findings(self):
-        stub = StubAgent()
+    def test_a_finding_push_carries_that_finding_in_the_digest(self):
         b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
-        b.advance(1000).progress(stops=1, prog=21.0)   # stop-count-collapse
-        b.advance(1000).note("it says one stop left, that is wrong")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        rules = [f["rule"] for f in stub.calls[0]["request"]["recentFindings"]]
-        self.assertIn("stop-count-collapse", rules)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        watch, thread = self.ride(b)
+        push = thread.of_kind("finding")[0]
+        summary = push["line"].split(": ", 1)[1].rsplit(" — digest: ", 1)[0]
+        self.assertIn(summary, push["digest"])
+        self.assertIn("## New since the last push (1)", push["digest"])
 
-    def test_only_one_agent_runs_at_a_time(self):
-        stub = StubAgent(block=True)
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("first")
-        b.advance(1000).note("second")
-        b.advance(1000).note("third")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        self.assertEqual(len(stub.calls), 1)
-        self.assertEqual(len(watch.reply_queue), 2)
-        stub.release()
-        settle(watch)
+    def test_the_digest_carries_the_riders_own_words(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=3, prog=45.0)
+        b.advance(1000).note("wrong stop announced")
+        watch, thread = self.ride(b)
+        digest = thread.pushes[-1]["digest"]
+        self.assertIn("## Rider notes (1)", digest)
+        self.assertIn("wrong stop announced", digest)
+        self.assertIn("leg 1", digest)
 
-    def test_notes_that_arrive_mid_answer_are_coalesced_into_the_next_run(self):
-        """Three notes, two agents, and the second one sees notes 2 and 3."""
-        stub = StubAgent(block=True)
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("first")
-        b.advance(1000).note("second")
-        b.advance(1000).note("third")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        stub.release()
-        settle(watch)
-        self.assertEqual(stub.notes_seen(),
-                         [["first"], ["second", "third"]])
-        self.assertEqual(len(watch.replies), 2)
-        self.assertEqual(watch.replies[1]["noteTsMs"],
-                         [n["tsMs"] for n in watch.trips[SESSION].notes[1:]])
+    def test_a_fraction_of_a_percent_is_never_shown_as_a_third_of_the_leg(self):
+        """The 7/31 bug, in one test.
 
-    def test_the_per_trip_reply_budget_is_capped(self):
-        stub = StubAgent()
-        watch = quiet_watch(self.tmp, spawn_reply=stub)
-        b = StreamBuilder().start()
-        watch.process(b.events[0])
-        b.advance(1000).progress(stops=4)
-        watch.process(b.events[-1])
-        # One at a time, settling in between, so each note gets its own agent
-        # rather than being coalesced into a batch.
-        for i in range(ride_watch.REPLY_MAX_PER_TRIP + 2):
-            b.advance(1000).note("note %d" % i)
-            watch.process(b.events[-1])
-            settle(watch)
-        self.assertEqual(len(stub.calls), ride_watch.REPLY_MAX_PER_TRIP)
-        self.assertEqual(len(watch.replies), ride_watch.REPLY_MAX_PER_TRIP + 2)
-        over = watch.replies[ride_watch.REPLY_MAX_PER_TRIP:]
-        for rep in over:
-            self.assertEqual(rep["status"], "error")
-            self.assertIn("budget spent", rep["text"])
-        # The notes themselves are still filed for the post-ride report.
-        self.assertEqual(len(watch.trips[SESSION].notes),
-                         ride_watch.REPLY_MAX_PER_TRIP + 2)
+        currentLegProgress 0.3077 means 0.31% of the leg — a rider 4m into a
+        1326m bike leg. A reply agent read the unitless number as a fraction
+        and told them "31% along"; rounding it to "0%" would be the opposite
+        lie. It must render 0.3%, and the digest must say what the unit is.
+        """
+        b = StreamBuilder().start().advance(1000).progress(leg=0, prog=0.3077,
+                                                           stops=None)
+        b.advance(1000).note("am I moving")
+        watch, thread = self.ride(b)
+        digest = thread.pushes[-1]["digest"]
+        self.assertIn("0.3%", digest)
+        self.assertNotIn("31%", digest)
+        self.assertNotIn("at 0% of leg", digest)
+        self.assertIn("currentLegProgress is a percentage on 0-100", digest)
+        self.assertIn("progressAlongLeg", digest)
+        ctx = watch.trips[SESSION].notes[0]["context"]
+        self.assertEqual(ctx["legProgressPct"], 0.3077)
+        self.assertNotIn("legProgress", ctx)
 
-    def test_a_wedged_agent_is_killed_and_frees_the_slot(self):
-        hung = StubAgent(hang=True)
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("hello")
-        watch = self.run_stream(b, finalize=False, spawn_reply=hung)
-        settle(watch)
-        self.assertTrue(hung.procs[0].killed)
-        self.assertEqual(watch.replies[0]["status"], "error")
-        self.assertIn("timed out", watch.replies[0]["text"])
-        self.assertIsNone(watch.reply_inflight)
-        # ...and the next note is answered normally.
-        good = StubAgent(answer="Still here.")
-        watch.spawn_reply = good
-        b.advance(1000).note("again")
-        watch.process(b.events[-1])
-        settle(watch)
-        self.assertEqual(len(good.calls), 1)
-        self.assertEqual(watch.replies[1]["text"], "Still here.")
+    def test_a_whole_percentage_still_reads_as_a_whole_number(self):
+        self.assertEqual(ride_watch.fmt_pct(42.0), "42%")
+        self.assertEqual(ride_watch.fmt_pct(0.3077), "0.3%")
+        self.assertEqual(ride_watch.fmt_pct(9.94), "9.9%")
+        self.assertEqual(ride_watch.fmt_pct(None), "?")
 
-    def test_an_agent_that_exits_without_writing_records_an_error(self):
-        stub = StubAgent(answer=None, rc=1)
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("hello")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        self.assertEqual(watch.replies[0]["status"], "error")
-        self.assertIn("without writing", watch.replies[0]["text"])
+    def test_the_digest_points_at_the_evidence(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        watch, thread = self.ride(b)
+        digest = thread.pushes[0]["digest"]
+        self.assertIn("debug-", digest)               # raw telemetry
+        self.assertIn(".findings.jsonl", digest)
+        self.assertIn("current-ride.md", digest)
 
-    def test_an_answer_printed_to_stdout_is_still_used(self):
-        stub = StubAgent(answer="Nothing in the telemetry covers that.",
-                         to_stdout=True)
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("did it reroute me")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        self.assertEqual(watch.replies[0]["status"], "done")
-        self.assertEqual(watch.replies[0]["text"],
-                         "Nothing in the telemetry covers that.")
+    # -- the fallback page ---------------------------------------------------
 
-    def test_a_note_outside_any_trip_is_still_answered(self):
-        stub = StubAgent(answer="No trip running.")
-        b = StreamBuilder().at(0).note("thinking out loud")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        self.assertEqual(watch.trips, {})
-        self.assertEqual(watch.all_findings, [])     # still no finding
-        self.assertEqual(len(stub.calls), 1)
-        req = stub.calls[0]["request"]
-        self.assertFalse(req["tripActive"])
-        self.assertIsNone(req["trip"])
-        self.assertEqual(req["notes"][0]["text"], "thinking out loud")
-        self.assertEqual(watch.replies[0]["text"], "No trip running.")
-        self.assertTrue(any(f.endswith("-no-trip.replies.jsonl")
-                            for f in os.listdir(self.tmp)))
+    def test_a_ride_with_no_thread_and_findings_still_reaches_the_rider(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch, thread = self.ride(b, ok=False)
+        fallback = [p for p in watch.push_log if p["kind"] == "fallback"]
+        self.assertEqual(len(fallback), 1)
+        self.assertIn("Report pending", fallback[0]["body"])
 
-    def test_a_reply_never_pages_the_rider(self):
-        stub = StubAgent(answer="Confirmed. Logged for after the ride.")
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        for text in ("this is broken", "PAGE ME", "urgent"):
-            b.advance(1000).note(text)
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        self.assertTrue(watch.replies)
+    def test_a_working_thread_means_no_fallback_page(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch, thread = self.ride(b, ok=True)
+        self.assertEqual([p for p in watch.push_log if p["kind"] == "fallback"], [])
+
+    def test_a_clean_ride_never_falls_back(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).stop()
+        watch, thread = self.ride(b, ok=False)
         self.assertEqual(watch.push_log, [])
-        self.assertEqual(watch.trips[SESSION].pages_sent, 0)
 
-    def test_replies_are_persisted_with_the_api_payload_shape(self):
-        stub = StubAgent(answer="4 stops left.")
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("stops?")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        rows = self.collapsed()
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        for key in ("id", "tsMs", "noteTsMs", "text", "status"):
-            self.assertIn(key, row)
-        self.assertEqual(row["status"], "done")
-        self.assertEqual(row["text"], "4 stops left.")
-        self.assertEqual(row["noteTsMs"],
-                         [watch.trips[SESSION].notes[0]["tsMs"]])
-        # ...and the file is named for the trip, beside its findings.
-        self.assertTrue(any(f.endswith("-%s.replies.jsonl" % SESSION)
-                            for f in os.listdir(self.tmp)))
 
-    def test_replies_render_in_the_status_file(self):
-        stub = StubAgent(answer="Confirmed at 18% of the leg.")
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("wrong stop count")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        watch.write_status(force=True)
-        text = read_text(os.path.join(self.tmp, "current-ride.md"))
-        self.assertIn("Agent replies (1", text)
-        self.assertIn("Confirmed at 18% of the leg.", text)
+class TestThreadCadenceOnRealRides(unittest.TestCase):
+    """Replay both real logs and count what the rider's thread would have heard.
 
-    def test_a_long_answer_is_truncated_before_the_rider_sees_it(self):
-        stub = StubAgent(answer="x" * (ride_watch.REPLY_MAX_CHARS + 500))
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("go on")
-        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
-        settle(watch)
-        self.assertEqual(len(watch.replies[0]["text"]),
-                         ride_watch.REPLY_MAX_CHARS)
+    The 7/29 file is the incident ride; the 7/31 file is the one whose reply
+    agents re-diagnosed the same bug twice and prompted this whole design. If
+    milestone-only pushing is right, these two rides are the proof: a full
+    ride of ~1 Hz telemetry must come out as a handful of lines.
+    """
 
-    def test_dry_run_without_a_stub_never_starts_a_real_agent(self):
-        """--replay and RIDE_WATCH_DRY_RUN must not spend money."""
-        b = StreamBuilder().start().advance(1000).progress(stops=4)
-        b.advance(1000).note("replaying an old ride")
-        watch = self.run_stream(b, finalize=False)   # no stub, dry_run=True
-        settle(watch)
-        self.assertEqual(watch.replies[0]["status"], "error")
-        self.assertIn("dry run", watch.replies[0]["text"])
+    LOGS = [os.path.join(os.path.expanduser("~"), "otp-debug-logs", name)
+            for name in ("debug-2026-07-29.jsonl", "debug-2026-07-31.jsonl")]
+
+    def replay(self, path):
+        tmp = tempfile.mkdtemp(prefix="ride-watch-thread-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        thread = StubThread()
+        watch = quiet_watch(tmp, spawn_thread=thread.spawn,
+                            push_line=thread.push)
+        run_replay(path, watch=watch)
+        return watch, thread
+
+    def test_every_push_is_a_milestone(self):
+        for path in self.LOGS:
+            if not os.path.exists(path):
+                continue
+            watch, thread = self.replay(path)
+            self.assertNotIn("other", thread.kinds(),
+                             "%s pushed a non-milestone: %s"
+                             % (path, thread.lines()))
+
+    def test_one_thread_and_one_kickoff_per_ride(self):
+        for path in self.LOGS:
+            if not os.path.exists(path):
+                continue
+            watch, thread = self.replay(path)
+            rides = len(watch.ended_trips)
+            self.assertEqual(len(thread.spawns), rides, path)
+            self.assertEqual(len(thread.of_kind("start")), rides, path)
+            self.assertEqual(len(thread.of_kind("end")), rides, path)
+
+    def test_a_push_per_finding_and_nothing_extra(self):
+        for path in self.LOGS:
+            if not os.path.exists(path):
+                continue
+            watch, thread = self.replay(path)
+            findings = [f for f in watch.all_findings
+                        if f["rule"] != "rider-note"]
+            notes = sum(len(t.notes) for t in watch.ended_trips)
+            self.assertEqual(len(thread.of_kind("finding")), len(findings), path)
+            self.assertEqual(len(thread.of_kind("note")), notes, path)
+
+    def test_heartbeats_are_bounded_by_the_length_of_the_ride(self):
+        for path in self.LOGS:
+            if not os.path.exists(path):
+                continue
+            watch, thread = self.replay(path)
+            minutes = sum((t.end_ms - t.start_ms) / 60000.0
+                          for t in watch.ended_trips)
+            self.assertLessEqual(
+                len(thread.of_kind("heartbeat")),
+                int(minutes / 10) + len(watch.ended_trips), path)
+
+    def test_the_whole_ride_fits_in_a_conversation(self):
+        """A ride is a handful of lines, not a feed."""
+        for path in self.LOGS:
+            if not os.path.exists(path):
+                continue
+            watch, thread = self.replay(path)
+            with open(path) as f:
+                events = sum(1 for _ in f)
+            self.assertLess(len(thread.pushes), max(40, events // 100), path)
+
+    def test_the_incident_ride_tells_the_thread_about_the_stop_count(self):
+        path = self.LOGS[0]
+        if not os.path.exists(path):
+            self.skipTest("%s not present" % path)
+        watch, thread = self.replay(path)
+        self.assertTrue(
+            any("stop-count-collapse" in p["line"]
+                for p in thread.of_kind("finding")),
+            "the thread must hear about the 17:28 collapse: %s" % thread.lines())
 
 
 class TestPushoverCreds(unittest.TestCase):
@@ -1226,6 +1472,77 @@ class TestRealIncidentReplay(unittest.TestCase):
         for p in self.watch.push_log:
             self.assertLess(len(p["body"]), 120, p["body"])
             self.assertNotIn("!", p["body"])
+
+    def test_the_progress_teleports_are_caught(self):
+        """Twice on this ride the bar outran the bus; nothing used to notice.
+
+        17:05:12 (0% -> 13%) and 17:20:11 (35% -> 71%), each in one second
+        while the Orange Line covered about 6.5m.
+        """
+        hits = [f for f in self.watch.all_findings
+                if f["rule"] == "progress-without-motion"]
+        self.assertEqual(len(hits), 2, [f["summary"] for f in hits])
+        for f in hits:
+            self.assertEqual(f["severity"], "warn")   # diagnostic, not a page
+            self.assertLess(f["context"]["movedMeters"], 15.0)
+        self.assertEqual(hits[0]["time"][:5], "17:05")
+        self.assertEqual(hits[1]["time"][:5], "17:20")
+
+
+class TestNotificationStormReplay(unittest.TestCase):
+    """Replay the 7/31 ride whose 14-buzz storm nothing caught at the time.
+
+    Every finding that ride produced was a rider note: the rider typed the
+    complaint out by hand on a bike because the engine had no rule for a phone
+    misbehaving at them. This is that rule, against that ride.
+    """
+
+    LOG = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                       "debug-2026-07-31.jsonl")
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(cls.LOG):
+            raise unittest.SkipTest("%s not present" % cls.LOG)
+        cls.tmp = tempfile.mkdtemp(prefix="ride-watch-storm-")
+        cls.watch = run_replay(cls.LOG, watch=quiet_watch(cls.tmp))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def hits(self):
+        return [f for f in self.watch.all_findings
+                if f["rule"] == "notification-repeat"]
+
+    def test_the_turn_alert_storm_is_caught_at_the_third_buzz(self):
+        first = self.hits()[0]
+        self.assertEqual(first["time"], "11:53:38")
+        self.assertEqual(first["severity"], "page")
+        self.assertEqual(first["context"]["count"], 3)
+        self.assertEqual(first["context"]["title"],
+                         "Turn right on Village Lane")
+
+    def test_it_fires_six_minutes_before_the_rider_had_to_type_it(self):
+        note = next(f for f in self.watch.all_findings
+                    if f["rule"] == "rider-note"
+                    and "notifications" in f["summary"])
+        self.assertLess(self.hits()[0]["tsMs"], note["tsMs"])
+        gap = (note["tsMs"] - self.hits()[0]["tsMs"]) / 60000.0
+        self.assertGreater(gap, 1.0)
+
+    def test_fourteen_buzzes_cost_the_rider_one_finding(self):
+        storm = [f for f in self.hits()
+                 if f["context"]["title"] == "Turn right on Village Lane"
+                 and f["time"].startswith("11:")]
+        self.assertEqual(len(storm), 1)
+
+    def test_the_page_copy_follows_the_rider_rules(self):
+        for p in self.watch.push_log:
+            self.assertLess(len(p["body"]), 120, p["body"])
+            self.assertNotIn("!", p["body"])
+        sent = [p for p in self.watch.push_log if p.get("sent")]
+        self.assertTrue(any("Ignore the buzzing" in p["body"] for p in sent))
 
 
 if __name__ == "__main__":

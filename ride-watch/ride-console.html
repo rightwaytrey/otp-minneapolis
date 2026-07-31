@@ -5,9 +5,8 @@
 
   Three jobs, nothing else:
     TOP     what ride-watch currently sees (GET /api/ride-status, 5s poll)
-    MIDDLE  the conversation: each note the rider typed with the agent's answer
-            beneath it, oldest first so the newest exchange sits against the
-            composer where they are already looking
+    MIDDLE  the notes the rider typed, oldest first, so the newest sits against
+            the composer where they are already looking
     BOTTOM  a plain text box that drops a note into the live telemetry stream
             (POST /api/ride-note)
 
@@ -16,9 +15,18 @@
   bike at a stoplight types one short sentence; anything that needs reading or
   choosing costs them the moment.
 
-  Replies arrive on the SAME poll as the status — /api/ride-status carries
-  `replies` and `replyPending`. A second polling loop for a chat channel would
-  double the radio wakeups on a phone that has to survive the commute.
+  PASSIVE SINCE 2026-07-31. This page used to be the conversation: a note
+  spawned a headless `claude -p` and its answer appeared underneath. That
+  channel is retired — a fresh agent per message re-diagnosed the same bug
+  twice on the 7/31 ride — and the conversation moved to the ride thread in the
+  Claude app, which holds the whole ride. So this page is now status plus a
+  quick way to get a note into the telemetry: the note is still filed, still
+  becomes a finding, and now pings the thread that answers it.
+
+  Replies already on disk still render (the API still carries `replies`), the
+  list simply stops growing. Nothing here promises an answer any more — no
+  "thinking…" placeholder, because nothing is thinking. /api/ride-status and
+  /api/ride-note are unchanged.
 
   Constraints this file is built around:
   - Self-contained. No external requests of any kind — the phone may be on
@@ -189,17 +197,10 @@
   li.msg-reply .meta { color: var(--reply-fg); }
   li.msg-reply.err { background: var(--warn-bg); border-left-color: var(--warn); }
   li.msg-reply.err .meta { color: var(--warn); }
-  /* "thinking" is the whole point of showing a placeholder: the rider must be
-     able to tell "the agent is working" from "nothing happened". */
-  li.msg-reply.thinking { color: var(--fg-dim); font-style: italic; }
-  .dots::after {
-    content: "…"; display: inline-block;
-    animation: blink 1.2s steps(1, end) infinite;
-  }
-  @keyframes blink { 0%, 60% { opacity: 1; } 61%, 100% { opacity: 0.25; } }
-  @media (prefers-reduced-motion: reduce) {
-    .dots::after { animation: none; }
-  }
+  /* The "thinking…" placeholder and its animated dots are gone with the reply
+     agents (2026-07-31). Old replies still render; new notes are answered in
+     the ride thread in the Claude app, so a placeholder here would be a
+     promise this page can no longer keep. */
 
   /* --- composer (bottom, pinned) --------------------------------------- */
   #composer {
@@ -228,11 +229,14 @@
   }
   #send:disabled { opacity: 0.45; }
   #send:active:not(:disabled) { transform: scale(0.99); filter: brightness(0.9); }
+  /* No reserved strip. An empty toast used to hold 30px open under the
+     composer for a message that is usually not there, and on a phone that is
+     the difference between seeing the last note and not. */
   #toast {
-    min-height: 22px; margin-top: 8px; text-align: center;
+    margin-top: 8px; text-align: center;
     font-size: 15px; font-weight: 700; color: var(--fg-dim);
   }
-  #toast.ok { color: var(--ok); }
+  #toast:empty { display: none; margin-top: 0; }
   #toast.bad { color: var(--warn); }
 </style>
 </head>
@@ -250,7 +254,7 @@
   <h2 class="section">Findings</h2>
   <ul class="findings" id="findings"><li class="empty">None yet.</li></ul>
 
-  <h2 class="section">You and the agent</h2>
+  <h2 class="section">Your notes</h2>
   <ul class="convo" id="convo"><li class="empty">No notes yet.</li></ul>
 </div>
 
@@ -261,7 +265,7 @@
             placeholder="What just happened?"></textarea>
   <button id="send" type="button">Send</button>
   </div>
-  <div id="toast">&nbsp;</div>
+  <div id="toast"></div>
 </div>
 
 <script>
@@ -357,13 +361,18 @@
 
   // --- sending -----------------------------------------------------------
 
+  // Only two things are worth saying here: the note is queued because the
+  // phone is offline, and something failed. Success is not one of them — the
+  // note appearing in the list above IS the confirmation, and "Saved" followed
+  // by "Sent" was two more announcements of a thing the rider could already
+  // see. Empty string, not a space: #toast:empty is what collapses the strip.
   function toast(msg, cls) {
-    el.toast.textContent = msg || " ";
+    el.toast.textContent = msg || "";
     el.toast.className = cls || "";
     if (msg) {
       window.clearTimeout(toast._t);
       toast._t = window.setTimeout(function () {
-        el.toast.textContent = " ";
+        el.toast.textContent = "";
         el.toast.className = "";
       }, 4000);
     }
@@ -388,13 +397,12 @@
     autoGrow();
     el.note.blur();
     enqueue(text);
-    // They just sent it; put it where they can see it without scrolling.
+    // They just sent it; put it where they can see it without scrolling. That
+    // is the whole confirmation — no toast on the happy path.
     el.scroll.scrollTop = el.scroll.scrollHeight;
-    toast("Saved", "ok");
 
     flushQueue().then(function () {
       if (loadQueue().length) toast("Queued — will send when back online", "bad");
-      else toast("Sent", "ok");
     });
   }
 
@@ -591,10 +599,9 @@
           (m.pending ? '<span class="pending-badge">queued</span>' : "") +
           "</span>" + esc(m.text) + "</li>";
       }
-      if (m.status === "thinking") {
-        return '<li class="msg-reply thinking"><span class="meta">agent</span>' +
-          'thinking<span class="dots"></span></li>';
-      }
+      // A "thinking" row can only be a leftover from the retired reply agents
+      // — nothing will ever resolve it — so it renders as the plain (empty)
+      // reply it is rather than as an animated promise.
       var cls = m.status === "error" ? "msg-reply err" : "msg-reply";
       return '<li class="' + cls + '"><span class="meta">' +
         esc(clock(m.tsMs)) + " · agent</span>" +

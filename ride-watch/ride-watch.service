@@ -9,14 +9,18 @@ ExecStart=/usr/bin/python3 /home/rwt/projects/otp-minneapolis/ride-watch/ride_wa
 WorkingDirectory=/home/rwt/projects/otp-minneapolis
 Restart=on-failure
 RestartSec=10
-# `claude` lives in ~/.local/bin, which is NOT on a systemd user service's
-# default PATH — without this both agents (the post-ride report and the
-# mid-ride reply) die at spawn with "claude binary not found". The stable
-# symlink is on the path rather than the versioned binary, so a CLI upgrade
-# does not silently disarm them.
+# The daemon shells out to `tmux` to run the ride thread, and the pane it
+# starts re-exports its own PATH (a tmux server started by another client does
+# not inherit this one). `claude` itself lives in ~/.local/bin, which is NOT on
+# a systemd user service's default PATH; the stable symlink is on the path
+# rather than the versioned binary, so a CLI upgrade cannot silently disarm it.
 Environment=PATH=/home/rwt/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# The report and reply agents are spawned as children and outlive nothing;
-# give them room to finish rather than killing them with the daemon.
+# The kill switch. Set to 0 and the daemon behaves exactly as it did before
+# ride threads existed: rules, pages and current-ride.md, no conversation.
+Environment=RIDE_THREAD_ENABLED=1
+# The ride thread is a tmux session, not a child of this unit — but the worker
+# thread that types into it is, and a restart mid-ride must not take the
+# rider's live conversation down with it or leave a send-keys half-done.
 KillMode=process
 TimeoutStopSec=30
 StandardOutput=null

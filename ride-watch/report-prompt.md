@@ -1,3 +1,11 @@
+<!-- RETIRED as an agent invocation, 2026-07-31 — but still worth reading.
+
+     Nothing spawns `claude -p` with this any more. The wrap-up is written by
+     the ride thread (ride-thread-sysprompt.md), which is pointed here for the
+     long-form triage brief when a ride was complicated. The daemon still
+     writes report-request-<session>.json exactly as described below; the
+     reader changed, the contract did not. -->
+
 You are writing a post-ride diagnostic report for a transit-navigation app
 (Go Mode) after the ride-watch daemon flagged anomalies during a real trip
 taken by the app's single rider. Work autonomously and finish the whole job —
