@@ -3,14 +3,22 @@
   ride-console.html — the page the rider opens from their phone home screen
   while actually riding.
 
-  Two jobs, nothing else:
+  Three jobs, nothing else:
     TOP     what ride-watch currently sees (GET /api/ride-status, 5s poll)
+    MIDDLE  the conversation: each note the rider typed with the agent's answer
+            beneath it, oldest first so the newest exchange sits against the
+            composer where they are already looking
     BOTTOM  a plain text box that drops a note into the live telemetry stream
             (POST /api/ride-note)
 
-  Deliberately absent: no agent chat, no reply channel, no quick-tag buttons.
-  The rider chose a plain text box. A rider on a bike at a stoplight types one
-  short sentence; anything that needs reading or choosing costs them the moment.
+  Still deliberately absent: quick-tag buttons, threads, any control that has to
+  be read before it can be used. The rider chose a plain text box. A rider on a
+  bike at a stoplight types one short sentence; anything that needs reading or
+  choosing costs them the moment.
+
+  Replies arrive on the SAME poll as the status — /api/ride-status carries
+  `replies` and `replyPending`. A second polling loop for a chat channel would
+  double the radio wakeups on a phone that has to survive the commute.
 
   Constraints this file is built around:
   - Self-contained. No external requests of any kind — the phone may be on
@@ -62,6 +70,8 @@
     --info-bg: #dbe8ff;
     --note-bg: #e6dcff;
     --note-fg: #4423a0;
+    --reply-bg: #e8eef7;
+    --reply-fg: #10437f;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -82,6 +92,8 @@
       --info-bg: #10203a;
       --note-bg: #241a45;
       --note-fg: #c4b0ff;
+      --reply-bg: #101a26;
+      --reply-fg: #9ec5ff;
     }
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -134,8 +146,8 @@
   .md em { color: var(--fg-dim); font-style: normal; font-size: 15px; }
   .md code { font-family: ui-monospace, Menlo, monospace; font-size: 15px; }
 
-  ul.findings, ul.notes { list-style: none; margin: 0; padding: 0; }
-  ul.findings li, ul.notes li {
+  ul.findings { list-style: none; margin: 0; padding: 0; }
+  ul.findings li {
     border-radius: 12px; padding: 11px 13px; margin-bottom: 8px;
     border-left: 6px solid var(--line); background: var(--panel);
   }
@@ -156,6 +168,35 @@
     display: inline-block; margin-left: 6px; padding: 1px 7px;
     border-radius: 99px; background: var(--warn); color: #000;
     font-size: 12px; font-weight: 800; text-transform: uppercase;
+  }
+
+  /* --- the conversation ------------------------------------------------- */
+  /* The rider's note and the answer to it are one exchange, so the answer is
+     indented under its note rather than being a second equal-weight list. */
+  ul.convo { list-style: none; margin: 0; padding: 0; }
+  ul.convo li {
+    border-radius: 12px; padding: 11px 13px; margin-bottom: 8px;
+    border-left: 6px solid var(--line); background: var(--panel);
+  }
+  li.msg-note { background: var(--note-bg); border-left-color: var(--note-fg); }
+  li.msg-note .meta { color: var(--note-fg); }
+  li.msg-reply {
+    background: var(--reply-bg); border-left-color: var(--reply-fg);
+    margin-left: 18px;
+  }
+  li.msg-reply .meta { color: var(--reply-fg); }
+  li.msg-reply.err { background: var(--warn-bg); border-left-color: var(--warn); }
+  li.msg-reply.err .meta { color: var(--warn); }
+  /* "thinking" is the whole point of showing a placeholder: the rider must be
+     able to tell "the agent is working" from "nothing happened". */
+  li.msg-reply.thinking { color: var(--fg-dim); font-style: italic; }
+  .dots::after {
+    content: "…"; display: inline-block;
+    animation: blink 1.2s steps(1, end) infinite;
+  }
+  @keyframes blink { 0%, 60% { opacity: 1; } 61%, 100% { opacity: 0.25; } }
+  @media (prefers-reduced-motion: reduce) {
+    .dots::after { animation: none; }
   }
 
   /* --- composer (bottom, pinned) --------------------------------------- */
@@ -202,8 +243,8 @@
   <h2 class="section">Findings</h2>
   <ul class="findings" id="findings"><li class="empty">None yet.</li></ul>
 
-  <h2 class="section">Your notes this ride</h2>
-  <ul class="notes" id="notes"><li class="empty">No notes yet.</li></ul>
+  <h2 class="section">You and the agent</h2>
+  <ul class="convo" id="convo"><li class="empty">No notes yet.</li></ul>
 </div>
 
 <div id="composer">
@@ -225,12 +266,13 @@
   var MAX_NOTE_CHARS = 500;
 
   var el = {
+    scroll: document.getElementById("scroll"),
     state: document.getElementById("state"),
     stateLabel: document.getElementById("stateLabel"),
     updated: document.getElementById("updated"),
     md: document.getElementById("md"),
     findings: document.getElementById("findings"),
-    notes: document.getElementById("notes"),
+    convo: document.getElementById("convo"),
     note: document.getElementById("note"),
     send: document.getElementById("send"),
     toast: document.getElementById("toast")
@@ -240,7 +282,9 @@
   var lastUpdatedMs = null;
   var lastPollOk = false;
   var serverNotes = [];
+  var serverReplies = [];
   var flushing = false;
+  var lastConvoHtml = "";
 
   // --- the offline queue -------------------------------------------------
   // A rider in a tunnel must not lose the note they just typed. Everything is
@@ -327,6 +371,8 @@
     el.note.value = "";
     el.note.blur();
     enqueue(text);
+    // They just sent it; put it where they can see it without scrolling.
+    el.scroll.scrollTop = el.scroll.scrollHeight;
     toast("Saved", "ok");
 
     flushQueue().then(function () {
@@ -349,6 +395,7 @@
         lastPollOk = true;
         lastUpdatedMs = data.updatedMs || null;
         serverNotes = Array.isArray(data.notesToday) ? data.notesToday : [];
+        serverReplies = Array.isArray(data.replies) ? data.replies : [];
         renderStatus(data);
         render();
         if (loadQueue().length) flushQueue();
@@ -471,22 +518,82 @@
     el.updated.textContent = "notes are queued";
   }
 
-  // Merge what the server has with what is still queued, so a note the rider
-  // just typed appears in their list whether or not it has landed yet.
-  function render() {
-    var queued = loadQueue().map(function (n) {
-      return { tsMs: n.tsMs, text: n.text, pending: true };
-    }).reverse();
-    var all = queued.concat(serverNotes);
+  // --- the conversation --------------------------------------------------
+  // One list, oldest first, so the newest exchange ends up against the
+  // composer. A reply is filed under the LAST note it answers: the daemon
+  // batches notes typed while an agent was already thinking, and one answer
+  // covering three notes belongs after all three, not above the last two.
+  //
+  // Merges three sources — the server's notes, the server's replies, and
+  // whatever is still sitting in the offline queue — so a note the rider just
+  // typed appears immediately whether or not it has landed yet.
 
-    if (!all.length) {
-      el.notes.innerHTML = '<li class="empty">No notes yet.</li>';
-    } else {
-      el.notes.innerHTML = all.map(function (n) {
-        return '<li class="sev-note"><span class="meta">' + esc(clock(n.tsMs)) +
-          (n.pending ? '<span class="pending-badge">queued</span>' : "") +
-          "</span>" + esc(n.text) + "</li>";
-      }).join("");
+  function conversationItems() {
+    var items = [];
+    var noteTimes = {};
+
+    loadQueue().forEach(function (n) {
+      items.push({ kind: "note", sortMs: n.tsMs, tsMs: n.tsMs, text: n.text,
+                   pending: true });
+      noteTimes[n.tsMs] = true;
+    });
+    serverNotes.forEach(function (n) {
+      items.push({ kind: "note", sortMs: n.tsMs, tsMs: n.tsMs, text: n.text });
+      noteTimes[n.tsMs] = true;
+    });
+
+    serverReplies.forEach(function (r) {
+      // Anchor to the newest note this reply answers, when that note is still
+      // in view; otherwise the reply stands on its own at its own time.
+      var anchor = 0;
+      (r.noteTsMs || []).forEach(function (t) {
+        if (noteTimes[t] && t > anchor) anchor = t;
+      });
+      items.push({
+        kind: "reply", sortMs: anchor || r.tsMs, tsMs: r.tsMs,
+        text: r.text, status: r.status
+      });
+    });
+
+    items.sort(function (a, b) {
+      if (a.sortMs !== b.sortMs) return a.sortMs - b.sortMs;
+      if (a.kind !== b.kind) return a.kind === "note" ? -1 : 1;
+      return a.tsMs - b.tsMs;
+    });
+    return items;
+  }
+
+  function convoHtml(items) {
+    if (!items.length) return '<li class="empty">No notes yet.</li>';
+    return items.map(function (m) {
+      if (m.kind === "note") {
+        return '<li class="msg-note"><span class="meta">' + esc(clock(m.tsMs)) +
+          " · you" +
+          (m.pending ? '<span class="pending-badge">queued</span>' : "") +
+          "</span>" + esc(m.text) + "</li>";
+      }
+      if (m.status === "thinking") {
+        return '<li class="msg-reply thinking"><span class="meta">agent</span>' +
+          'thinking<span class="dots"></span></li>';
+      }
+      var cls = m.status === "error" ? "msg-reply err" : "msg-reply";
+      return '<li class="' + cls + '"><span class="meta">' +
+        esc(clock(m.tsMs)) + " · agent</span>" +
+        esc(m.text || "No answer.") + "</li>";
+    }).join("");
+  }
+
+  function render() {
+    var html = convoHtml(conversationItems());
+    if (html !== lastConvoHtml) {
+      // Only touch the DOM when something changed: this runs every second to
+      // keep "updated Ns ago" honest, and rewriting the list under a rider's
+      // thumb would fight their scroll.
+      var atBottom = el.scroll.scrollHeight - el.scroll.scrollTop -
+        el.scroll.clientHeight < 140;
+      lastConvoHtml = html;
+      el.convo.innerHTML = html;
+      if (atBottom) el.scroll.scrollTop = el.scroll.scrollHeight;
     }
 
     if (lastPollOk) {

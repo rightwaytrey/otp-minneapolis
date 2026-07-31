@@ -1,8 +1,9 @@
 # ride-watch
 
 A daemon that watches the transit-navigation app's live telemetry while the
-rider is actually on a trip, flags anomalies as they happen, and asks Claude
-for a written post-mortem once the ride ends.
+rider is actually on a trip, flags anomalies as they happen, answers the
+rider's questions mid-ride, and asks Claude for a written post-mortem once the
+ride ends.
 
 The problem it solves: the app streams a lot of telemetry, and the
 interesting failures (the stop counter collapsing, the itinerary being
@@ -46,7 +47,7 @@ line (`{kind:"console", level, args}`), or a session marker.
 | `console-error` | a `console.error` line (deduped by message) | info |
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
 
-## The three surfaces
+## The four surfaces
 
 **1. Pushover — the interrupt.** Only `page`-severity findings, at most
 **2 per ride**, with a **120s minimum gap**. Everything beyond the cap is
@@ -110,7 +111,11 @@ progress, status, whether the rider is aboard, how stale the last GPS fix
 is, and findings newest-first. When no trip is running it names the last one
 and whether it was a clean ride.
 
-**3. Vault reports — the post-mortem.** When a ride with at least one
+**3. The ride console — the conversation.** `https://tre.hopto.org:9966/ride`,
+where the rider types notes and reads the agent's answers to them. See *Rider
+notes* and *Mid-ride replies* below.
+
+**4. Vault reports — the post-mortem.** When a ride with at least one
 finding ends, the daemon writes
 `~/otp-debug-logs/ride-watch/report-request-<session>.json` and fires off
 `claude -p "$(cat report-prompt.md)"` with `RIDE_WATCH_REQUEST` pointing at
@@ -156,10 +161,97 @@ highest-value input to the post-ride report, which triages each one against
 what the telemetry says was happening at that second (`report-prompt.md`).
 
 The page also polls `/api/ride-status` (5s, paused when hidden) for the current
-`current-ride.md`, the newest findings, and today's notes. It is a single
-self-contained file, deployed by `ride-watch/deploy-ride-console.sh`; the
-frontend's `deploy-prod.sh` re-runs it, because that script's
-`rsync --delete` would otherwise sweep the page out of the web root.
+`current-ride.md`, the newest findings, today's notes, and the agent's replies.
+It is a single self-contained file, deployed by
+`ride-watch/deploy-ride-console.sh`; the frontend's `deploy-prod.sh` re-runs it,
+because that script's `rsync --delete` would otherwise sweep the page out of the
+web root.
+
+## Mid-ride replies — talking back
+
+A note used to go into the void: the rider typed it, the daemon filed it, and
+nothing came back until the post-ride report hours later. Now a note spawns a
+headless `claude -p` that answers it on the console, usually within about
+twenty seconds.
+
+**Trigger.** Any `RIDER_NOTE`, whether or not a trip is running — a question
+asked between rides still deserves an answer, just with less to answer it from.
+The note keeps behaving exactly as before (attached to the trip, filed as an
+`info` finding, fed to the post-ride report); the reply is additional.
+
+**Concurrency.** One agent in flight, ever. Notes typed while it is thinking are
+queued and handed to the **next** run *together* — three notes in a row cost one
+extra agent, and that agent answers all three knowing about all three, which is
+also the better answer. The spawn never blocks the tailer: the process is fired
+and a watchdog thread waits on it.
+
+**Bounds.** `REPLY_MAX_PER_TRIP` (8) runs per trip; past that the console says
+the budget is spent rather than silently ignoring the rider, and the notes are
+still filed for the report. `REPLY_TIMEOUT_S` (180) wall clock per run, after
+which the watchdog kills the process, records an error reply, and frees the
+slot — a wedged agent must not cost the rider every remaining answer of the
+ride. Notes typed outside any trip share a separate budget of the same size.
+
+**Never a page.** Replies do not touch Pushover. The console is the surface for
+a conversation; the rider's two interrupts per ride stay reserved for the safety
+findings.
+
+### How the answer gets back
+
+The daemon writes `reply-request-<id>.json` into the watch dir and runs
+`claude -p "$(cat reply-prompt.md)"` with two environment variables:
+
+| var | meaning |
+| --- | --- |
+| `RIDE_WATCH_REPLY_REQUEST` | the context file: the note(s) with timestamps and the trip state at the moment each was typed, the itinerary, the live leg/progress/status/stops/riding/route-match/vehicle-match, the last 12 findings, and pointers to the raw debug log and the Go Mode source tree |
+| `RIDE_WATCH_REPLY_OUT` | where the agent writes its answer, as plain text |
+
+The agent writes a file and exits. **No HTTP endpoint, no new nginx route, no
+auth to get wrong, and nothing that has to be up** — a file whose name the
+daemon already knows is the smallest thing that works. If the agent exits
+without writing it, its captured stdout is used instead, because an answer that
+got printed rather than written is still an answer; if there is neither, the
+console shows "no answer".
+
+`reply-prompt.md` is the whole brief and is self-contained like
+`report-prompt.md`. It enforces the rider's copy rules — terse, factual, only
+what they can act on, 1–3 sentences, no coaching phrases, no exclamation marks
+— and three hard prohibitions: **do not edit code** (a hot reload lands on the
+phone the rider is navigating by), **do not send any notification**, and do not
+modify the daemon's files. A note that reports a bug gets a verdict from the
+telemetry — confirmed with the numbers, contradicted with the number that
+contradicts it, or "the telemetry is silent" — plus "logged for after the ride".
+
+### Storage and the API
+
+Replies live beside the findings, in
+`~/otp-debug-logs/ride-watch/<date>-<session>.replies.jsonl` (or
+`<date>-no-trip.replies.jsonl` when no trip is running):
+
+```json
+{"id","tsMs","noteTsMs":[...],"noteText":[...],"text","status","updatedMs"}
+```
+
+`status` is `thinking` | `done` | `error`. The file is **append-only, one row
+per state change**: a `thinking` placeholder is written the instant the agent is
+spawned, so the console can show "thinking…" immediately, and the finished
+answer is appended under the same `id`. Readers collapse by `id` and keep the
+last row. That way a crash mid-answer leaves a truthful "thinking" record rather
+than a half-written file.
+
+`GET /api/ride-status` carries `replies` (collapsed, newest first, cap 20) and
+`replyPending`, so the console needs **one** polling loop for the whole
+conversation — a chat channel with its own poll would double the radio wakeups
+on a phone that has to survive the commute. Replies also appear in
+`current-ride.md` under **Agent replies**.
+
+### Testing it without spending money
+
+`RideWatch(spawn_reply=...)` is the injection seam: the test suite hands in a
+stub process, so it exercises the real queueing, budget, watchdog and
+persistence code without ever invoking `claude`. In dry-run mode with no stub
+(`--replay`, `RIDE_WATCH_DRY_RUN=1`) no agent is started at all and the reply is
+recorded as `Reply agent disabled (dry run)`.
 
 ## Running it
 
@@ -211,9 +303,13 @@ compare which findings appear, and add a test. A rule that pages on a
 correct app behaviour is worse than a rule that stays quiet — the rider gets
 two interrupts per ride and they should both be worth reading.
 
+Reply thresholds live next to them: `REPLY_MAX_PER_TRIP`, `REPLY_TIMEOUT_S`,
+`REPLY_RECENT_FINDINGS`, `REPLY_MAX_CHARS`.
+
 Environment overrides: `RIDE_WATCH_DRY_RUN=1` (log pushes instead of sending
-them and skip the report agent), `RIDE_WATCH_LOG_DIR`, `RIDE_WATCH_DIR`,
-`RIDE_WATCH_PUSHOVER_CREDS`, `RIDE_WATCH_CLAUDE`, `RIDE_WATCH_REPO`.
+them and skip both the report and reply agents), `RIDE_WATCH_LOG_DIR`,
+`RIDE_WATCH_DIR`, `RIDE_WATCH_PUSHOVER_CREDS`, `RIDE_WATCH_CLAUDE`,
+`RIDE_WATCH_REPO`, `RIDE_WATCH_GO_MODE_SRC`.
 
 ## Tests
 
@@ -229,5 +325,19 @@ and asserts that the 17:28 incident is caught — board-state anomaly plus
 stop-count collapse — that the four page-worthy findings in those eight
 seconds cost the rider exactly one interrupt, that the one they get is
 `stop-count-collapse`, and that they would not have been paged more than
-twice. Tests never
-touch the network; the Pushover path is verified by credential parsing only.
+twice.
+
+The reply suite (`TestMidRideReplies`) covers the same ground for the
+conversation: a note spawns an agent, only one runs at a time, notes that arrive
+mid-answer are coalesced into the next run, the per-trip budget is enforced and
+reported, a wedged agent is killed and its slot freed, an answer printed to
+stdout is still used, a note outside any trip is still answered, and no reply
+ever pages.
+
+Tests never touch the network and never invoke the real `claude`; the Pushover
+path is verified by credential parsing only.
+
+The Flask side of the contract is `transitnav/test_ride_api.py`
+(`venv-prefs/bin/python test_ride_api.py`), which asserts the `/api/ride-status`
+payload shape the console reads — including that append-only reply rows collapse
+by `id`.

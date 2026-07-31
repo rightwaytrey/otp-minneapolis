@@ -12,8 +12,11 @@ Two layers:
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,10 +26,11 @@ from ride_watch import (  # noqa: E402
     Log, RideWatch, read_pushover_creds, run_replay)
 
 
-def quiet_watch(watch_dir, replay=True):
+def quiet_watch(watch_dir, replay=True, spawn_reply=None):
     """A watcher whose daemon log does not spam the test runner."""
     log = Log(os.path.join(watch_dir, "daemon.log"), echo=False)
-    return RideWatch(dry_run=True, replay=replay, watch_dir=watch_dir, log=log)
+    return RideWatch(dry_run=True, replay=replay, watch_dir=watch_dir, log=log,
+                     spawn_reply=spawn_reply)
 
 
 def read_text(path):
@@ -133,6 +137,89 @@ class StreamBuilder:
         return self
 
 
+# --- the reply agent stub ---------------------------------------------------
+# The suite must never invoke the real `claude`: it costs money, it takes
+# minutes, and its answer is different every time. RideWatch takes a
+# `spawn_reply` callable for exactly this, so the tests exercise the real
+# queueing, budget, watchdog and persistence code against a process that is
+# only pretending.
+
+
+class FakeProc:
+    """Just enough of subprocess.Popen for the watchdog."""
+
+    def __init__(self, rc=0, hang=False, block=None):
+        self.pid = 4242
+        self.rc = rc
+        self.hang = hang          # wait() always times out
+        self.block = block        # Event that must be set before wait() returns
+        self.killed = False
+
+    def wait(self, timeout=None):
+        if self.hang:
+            raise subprocess.TimeoutExpired("claude", timeout)
+        if self.block is not None and not self.block.wait(timeout or 5):
+            raise subprocess.TimeoutExpired("claude", timeout)
+        return self.rc
+
+    def kill(self):
+        self.killed = True
+
+
+class StubAgent:
+    """Records every spawn and writes a canned answer where the daemon looks."""
+
+    def __init__(self, answer="Confirmed. Logged for after the ride.", rc=0,
+                 hang=False, to_stdout=False, block=False):
+        self.answer = answer
+        self.rc = rc
+        self.hang = hang
+        self.to_stdout = to_stdout     # print instead of writing answerPath
+        self.block = threading.Event() if block else None
+        self.calls = []                # [{argv, env, request, log}]
+        self.procs = []
+
+    def __call__(self, argv, env, log_path):
+        with open(env["RIDE_WATCH_REPLY_REQUEST"]) as f:
+            request = json.load(f)
+        self.calls.append({"argv": argv, "env": env, "request": request,
+                           "log": log_path})
+        if self.answer is not None and not self.hang:
+            target = log_path if self.to_stdout else env["RIDE_WATCH_REPLY_OUT"]
+            with open(target, "w") as f:
+                f.write(self.answer)
+        proc = FakeProc(rc=self.rc, hang=self.hang, block=self.block)
+        self.procs.append(proc)
+        return proc
+
+    def release(self):
+        if self.block is not None:
+            self.block.set()
+
+    def notes_seen(self):
+        """The note texts each spawned agent was handed."""
+        return [[n["text"] for n in c["request"]["notes"]] for c in self.calls]
+
+
+def settle(watch, timeout=5.0):
+    """Wait for every reply watchdog to finish, including ones they spawn.
+
+    A watchdog that finishes an answer immediately starts the next queued
+    agent, so joining the list once is not enough — join until the list stops
+    growing and nothing is in flight.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        threads = list(watch.reply_threads)
+        for th in threads:
+            th.join(timeout=max(0.05, deadline - time.time()))
+        if (len(watch.reply_threads) == len(threads)
+                and watch.reply_inflight is None
+                and not watch.reply_queue):
+            return
+    raise AssertionError("reply agents did not settle within %ss" % timeout)
+
+
 class RuleTestCase(unittest.TestCase):
     """Base: runs a synthetic stream through the real RideWatch code path."""
 
@@ -140,8 +227,8 @@ class RuleTestCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="ride-watch-test-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def run_stream(self, builder, finalize=True):
-        watch = quiet_watch(self.tmp)
+    def run_stream(self, builder, finalize=True, spawn_reply=None):
+        watch = quiet_watch(self.tmp, spawn_reply=spawn_reply)
         for ev in builder.events:
             watch.process(ev)
         if finalize:
@@ -754,6 +841,282 @@ class TestRiderNotes(RuleTestCase):
         self.assertEqual(req["notesCount"], 1)
         self.assertEqual(req["riderNotes"][0]["text"],
                          "app said 1 stop left, it was 6")
+
+
+class TestMidRideReplies(RuleTestCase):
+    """A note now gets an answer while the rider is still on the bus.
+
+    The three things that have to hold under load: one agent at a time, every
+    queued note reaches the agent that eventually runs, and a wedged agent
+    cannot eat the rest of the ride's answers.
+    """
+
+    def reply_rows(self, watch=None):
+        """Reply records as persisted, collapsed by id like the API does."""
+        files = [f for f in os.listdir(self.tmp) if f.endswith(".replies.jsonl")]
+        rows = []
+        for name in files:
+            for line in read_text(os.path.join(self.tmp, name)).splitlines():
+                if line.strip():
+                    rows.append(json.loads(line))
+        return rows
+
+    def collapsed(self):
+        by_id = {}
+        for row in self.reply_rows():
+            by_id[row["id"]] = row
+        return list(by_id.values())
+
+    def test_a_note_spawns_a_reply_agent(self):
+        stub = StubAgent(answer="4 stops left, next Lake St.")
+        b = StreamBuilder().start().advance(1000).progress(stops=4, prog=30.0)
+        b.advance(1000).note("how many stops")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(stub.notes_seen(), [["how many stops"]])
+        self.assertEqual(len(watch.replies), 1)
+        self.assertEqual(watch.replies[0]["status"], "done")
+        self.assertEqual(watch.replies[0]["text"], "4 stops left, next Lake St.")
+
+    def test_the_agent_is_invoked_as_claude_dash_p_with_the_prompt(self):
+        stub = StubAgent()
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("check")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        argv = stub.calls[0]["argv"]
+        self.assertEqual(argv[0], ride_watch.CLAUDE_BIN)
+        self.assertEqual(argv[1], "-p")
+        self.assertIn("RIDE_WATCH_REPLY_REQUEST", argv[2])
+        env = stub.calls[0]["env"]
+        self.assertTrue(os.path.exists(env["RIDE_WATCH_REPLY_REQUEST"]))
+        self.assertIn("reply-out-", env["RIDE_WATCH_REPLY_OUT"])
+
+    def test_a_thinking_placeholder_is_recorded_before_the_answer(self):
+        """The console must be able to say "working on it" immediately."""
+        stub = StubAgent(block=True)
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("is this thing on")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        self.assertEqual(watch.replies[0]["status"], "thinking")
+        self.assertEqual([r["status"] for r in self.reply_rows()], ["thinking"])
+        stub.release()
+        settle(watch)
+        # Append-only: the placeholder row stays, the final row supersedes it.
+        self.assertEqual([r["status"] for r in self.reply_rows()],
+                         ["thinking", "done"])
+        self.assertEqual(len(self.collapsed()), 1)
+        self.assertEqual(self.collapsed()[0]["status"], "done")
+
+    def test_the_request_carries_the_trip_context_at_note_time(self):
+        stub = StubAgent()
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).route_match(12.0)
+        b.advance(1000).action("UPDATE_VEHICLE_MATCH", {
+            "consecutiveMatches": 3, "emptyPolls": 0,
+            "match": {"confidence": "high", "vehicleId": "1:900",
+                      "label": "5", "distanceMeters": 18.0}})
+        b.advance(1000).progress(stops=3, prog=45.0, status="on_track")
+        b.advance(1000).note("driver blew past my stop")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        req = stub.calls[0]["request"]
+        self.assertTrue(req["tripActive"])
+        self.assertEqual(req["notes"][0]["text"], "driver blew past my stop")
+        self.assertEqual(req["notes"][0]["context"]["stopsRemaining"], 3)
+        trip = req["trip"]
+        self.assertEqual(trip["session"], SESSION)
+        self.assertIn("BUS 5", trip["itinerary"])
+        self.assertEqual(len(trip["itinerarySummary"]["legs"]), 3)
+        self.assertEqual(trip["state"]["legIndex"], 1)
+        self.assertEqual(trip["state"]["legProgress"], 45.0)
+        self.assertEqual(trip["state"]["status"], "on_track")
+        self.assertEqual(trip["state"]["stopsRemaining"], 3)
+        self.assertEqual(trip["riding"]["tripId"], "1:100")
+        self.assertEqual(trip["routeMatch"]["distanceFromRoute"], 12.0)
+        self.assertEqual(trip["vehicleMatch"]["confidence"], "high")
+        self.assertEqual(trip["vehicleMatch"]["vehicleId"], "1:900")
+        # Pointers, so the agent can go and read the raw evidence itself.
+        self.assertTrue(req["debugLogPath"].endswith(".jsonl"))
+        self.assertEqual(req["goModeSource"]["branch"], "feature/go-mode")
+        self.assertIn("otp-react-redux", req["goModeSource"]["path"])
+
+    def test_the_request_carries_the_recent_findings(self):
+        stub = StubAgent()
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)   # stop-count-collapse
+        b.advance(1000).note("it says one stop left, that is wrong")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        rules = [f["rule"] for f in stub.calls[0]["request"]["recentFindings"]]
+        self.assertIn("stop-count-collapse", rules)
+
+    def test_only_one_agent_runs_at_a_time(self):
+        stub = StubAgent(block=True)
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("first")
+        b.advance(1000).note("second")
+        b.advance(1000).note("third")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(len(watch.reply_queue), 2)
+        stub.release()
+        settle(watch)
+
+    def test_notes_that_arrive_mid_answer_are_coalesced_into_the_next_run(self):
+        """Three notes, two agents, and the second one sees notes 2 and 3."""
+        stub = StubAgent(block=True)
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("first")
+        b.advance(1000).note("second")
+        b.advance(1000).note("third")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        stub.release()
+        settle(watch)
+        self.assertEqual(stub.notes_seen(),
+                         [["first"], ["second", "third"]])
+        self.assertEqual(len(watch.replies), 2)
+        self.assertEqual(watch.replies[1]["noteTsMs"],
+                         [n["tsMs"] for n in watch.trips[SESSION].notes[1:]])
+
+    def test_the_per_trip_reply_budget_is_capped(self):
+        stub = StubAgent()
+        watch = quiet_watch(self.tmp, spawn_reply=stub)
+        b = StreamBuilder().start()
+        watch.process(b.events[0])
+        b.advance(1000).progress(stops=4)
+        watch.process(b.events[-1])
+        # One at a time, settling in between, so each note gets its own agent
+        # rather than being coalesced into a batch.
+        for i in range(ride_watch.REPLY_MAX_PER_TRIP + 2):
+            b.advance(1000).note("note %d" % i)
+            watch.process(b.events[-1])
+            settle(watch)
+        self.assertEqual(len(stub.calls), ride_watch.REPLY_MAX_PER_TRIP)
+        self.assertEqual(len(watch.replies), ride_watch.REPLY_MAX_PER_TRIP + 2)
+        over = watch.replies[ride_watch.REPLY_MAX_PER_TRIP:]
+        for rep in over:
+            self.assertEqual(rep["status"], "error")
+            self.assertIn("budget spent", rep["text"])
+        # The notes themselves are still filed for the post-ride report.
+        self.assertEqual(len(watch.trips[SESSION].notes),
+                         ride_watch.REPLY_MAX_PER_TRIP + 2)
+
+    def test_a_wedged_agent_is_killed_and_frees_the_slot(self):
+        hung = StubAgent(hang=True)
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("hello")
+        watch = self.run_stream(b, finalize=False, spawn_reply=hung)
+        settle(watch)
+        self.assertTrue(hung.procs[0].killed)
+        self.assertEqual(watch.replies[0]["status"], "error")
+        self.assertIn("timed out", watch.replies[0]["text"])
+        self.assertIsNone(watch.reply_inflight)
+        # ...and the next note is answered normally.
+        good = StubAgent(answer="Still here.")
+        watch.spawn_reply = good
+        b.advance(1000).note("again")
+        watch.process(b.events[-1])
+        settle(watch)
+        self.assertEqual(len(good.calls), 1)
+        self.assertEqual(watch.replies[1]["text"], "Still here.")
+
+    def test_an_agent_that_exits_without_writing_records_an_error(self):
+        stub = StubAgent(answer=None, rc=1)
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("hello")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        self.assertEqual(watch.replies[0]["status"], "error")
+        self.assertIn("without writing", watch.replies[0]["text"])
+
+    def test_an_answer_printed_to_stdout_is_still_used(self):
+        stub = StubAgent(answer="Nothing in the telemetry covers that.",
+                         to_stdout=True)
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("did it reroute me")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        self.assertEqual(watch.replies[0]["status"], "done")
+        self.assertEqual(watch.replies[0]["text"],
+                         "Nothing in the telemetry covers that.")
+
+    def test_a_note_outside_any_trip_is_still_answered(self):
+        stub = StubAgent(answer="No trip running.")
+        b = StreamBuilder().at(0).note("thinking out loud")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        self.assertEqual(watch.trips, {})
+        self.assertEqual(watch.all_findings, [])     # still no finding
+        self.assertEqual(len(stub.calls), 1)
+        req = stub.calls[0]["request"]
+        self.assertFalse(req["tripActive"])
+        self.assertIsNone(req["trip"])
+        self.assertEqual(req["notes"][0]["text"], "thinking out loud")
+        self.assertEqual(watch.replies[0]["text"], "No trip running.")
+        self.assertTrue(any(f.endswith("-no-trip.replies.jsonl")
+                            for f in os.listdir(self.tmp)))
+
+    def test_a_reply_never_pages_the_rider(self):
+        stub = StubAgent(answer="Confirmed. Logged for after the ride.")
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        for text in ("this is broken", "PAGE ME", "urgent"):
+            b.advance(1000).note(text)
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        self.assertTrue(watch.replies)
+        self.assertEqual(watch.push_log, [])
+        self.assertEqual(watch.trips[SESSION].pages_sent, 0)
+
+    def test_replies_are_persisted_with_the_api_payload_shape(self):
+        stub = StubAgent(answer="4 stops left.")
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("stops?")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        rows = self.collapsed()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        for key in ("id", "tsMs", "noteTsMs", "text", "status"):
+            self.assertIn(key, row)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["text"], "4 stops left.")
+        self.assertEqual(row["noteTsMs"],
+                         [watch.trips[SESSION].notes[0]["tsMs"]])
+        # ...and the file is named for the trip, beside its findings.
+        self.assertTrue(any(f.endswith("-%s.replies.jsonl" % SESSION)
+                            for f in os.listdir(self.tmp)))
+
+    def test_replies_render_in_the_status_file(self):
+        stub = StubAgent(answer="Confirmed at 18% of the leg.")
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("wrong stop count")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        watch.write_status(force=True)
+        text = read_text(os.path.join(self.tmp, "current-ride.md"))
+        self.assertIn("Agent replies (1", text)
+        self.assertIn("Confirmed at 18% of the leg.", text)
+
+    def test_a_long_answer_is_truncated_before_the_rider_sees_it(self):
+        stub = StubAgent(answer="x" * (ride_watch.REPLY_MAX_CHARS + 500))
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("go on")
+        watch = self.run_stream(b, finalize=False, spawn_reply=stub)
+        settle(watch)
+        self.assertEqual(len(watch.replies[0]["text"]),
+                         ride_watch.REPLY_MAX_CHARS)
+
+    def test_dry_run_without_a_stub_never_starts_a_real_agent(self):
+        """--replay and RIDE_WATCH_DRY_RUN must not spend money."""
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        b.advance(1000).note("replaying an old ride")
+        watch = self.run_stream(b, finalize=False)   # no stub, dry_run=True
+        settle(watch)
+        self.assertEqual(watch.replies[0]["status"], "error")
+        self.assertIn("dry run", watch.replies[0]["text"])
 
 
 class TestPushoverCreds(unittest.TestCase):

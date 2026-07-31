@@ -4,9 +4,9 @@
 Follows the day's debug JSONL stream (written by the Flask sidecar's
 /api/debug-log endpoint), runs a per-trip rule engine over the redux action
 stream, pages the rider via Pushover for at most 2 high-value findings per
-ride, keeps a live status file any Claude session can read, and requests a
-post-ride report from a headless `claude -p` run when a ride with findings
-ends.
+ride, keeps a live status file any Claude session can read, answers the
+rider's mid-ride notes from a headless `claude -p` run, and requests a
+post-ride report from another one when a ride with findings ends.
 
 stdlib only. See README.md next to this file.
 
@@ -49,6 +49,13 @@ REPO_DIR = os.environ.get(
     "RIDE_WATCH_REPO", os.path.join(HOME, "projects", "otp-minneapolis")
 )
 PROMPT_PATH = os.path.join(REPO_DIR, "ride-watch", "report-prompt.md")
+REPLY_PROMPT_PATH = os.path.join(REPO_DIR, "ride-watch", "reply-prompt.md")
+# Pointer handed to the reply agent so it can read the Go Mode source when a
+# note reports a bug. It never edits it — see reply-prompt.md.
+GO_MODE_SRC = os.environ.get(
+    "RIDE_WATCH_GO_MODE_SRC",
+    os.path.join(HOME, "projects", "otprr", "otp-react-redux"))
+GO_MODE_BRANCH = "feature/go-mode"
 
 # Rule thresholds (ms unless noted)
 STARTUP_LOOKBACK_MS = 5 * 60 * 1000        # scan back this far at startup
@@ -67,6 +74,28 @@ PUSH_MIN_INTERVAL_MS = 120 * 1000
 STATUS_DEBOUNCE_MS = 2000
 STOP_INCREASE_COOLDOWN_MS = 60 * 1000
 RIDER_NOTE_MAX_CHARS = 500                 # matches the sidecar's own cap
+
+# Mid-ride replies. A note used to go into the void: the rider typed it, the
+# daemon filed it, and nothing came back until the post-ride report hours
+# later. So a note now spawns a headless `claude -p` that answers it on the
+# /ride console.
+#
+# Three limits, all about not letting a chat feature run away with a commute:
+#   * ONE agent in flight at a time. Notes that arrive while it is thinking are
+#     queued and handed to the *next* run together — three notes in a row cost
+#     one agent, and it sees all three, which is also the better answer.
+#   * REPLY_MAX_PER_TRIP runs per trip. Past that the console says the budget is
+#     spent rather than silently ignoring the rider.
+#   * REPLY_TIMEOUT_S wall clock per run, enforced by a watchdog thread that
+#     kills the process and frees the slot. An agent that wedges must not cost
+#     the rider every remaining answer of the ride.
+# None of this ever pages: the console is the surface for replies, and the two
+# Pushover interrupts per ride stay reserved for safety findings.
+REPLY_TIMEOUT_S = 180
+REPLY_MAX_PER_TRIP = 8
+REPLY_RECENT_FINDINGS = 12                 # findings handed to the reply agent
+REPLY_MAX_CHARS = 1200                     # hard cap on an answer we will show
+REPLY_STDOUT_FALLBACK_MAX = 2000
 
 # Page coalescing. A failure rarely produces one finding: on 2026-07-29 the
 # app flipped the riding tripId at 17:28:45 and only eight seconds later
@@ -278,9 +307,12 @@ class Trip:
         self.reroute_times = collections.deque()
         self.reroute_storm_last_ms = 0
         self.prev_dist = None
+        self.last_route_match = None               # last UPDATE_ROUTE_MATCH
+        self.last_vehicle_match = None             # last UPDATE_VEHICLE_MATCH
         self.last_rider_action_ms = 0
         self.console_seen = set()
         self.notes = []                           # rider-typed notes, in order
+        self.replies_spawned = 0                  # reply agents run for this trip
         self.findings = []
         self.pages_sent = 0
         self.pending_pages = []                   # page candidates in the window
@@ -309,7 +341,8 @@ class Trip:
 
 
 class RideWatch:
-    def __init__(self, dry_run=DRY_RUN, replay=False, watch_dir=WATCH_DIR, log=None):
+    def __init__(self, dry_run=DRY_RUN, replay=False, watch_dir=WATCH_DIR,
+                 log=None, spawn_reply=None):
         self.dry_run = dry_run
         self.replay = replay
         self.watch_dir = watch_dir
@@ -326,6 +359,17 @@ class RideWatch:
         self._status_dirty = True
         self._status_last_write = 0
         self._report_threads = []
+        # -- mid-ride reply agent ------------------------------------------
+        # spawn_reply is the injection seam: tests hand in a stub so the suite
+        # never spends money on (or waits for) a real `claude` run.
+        self.spawn_reply = spawn_reply
+        self._reply_lock = threading.RLock()
+        self.reply_queue = []          # notes waiting for the next agent
+        self.reply_inflight = None     # {"id", "startedMs"} while one runs
+        self.reply_threads = []        # watchdog threads (tests join them)
+        self.replies = []              # every reply record, newest last
+        self.orphan_replies = 0        # budget for notes outside any trip
+        self._reply_seq = 0
 
     # -- clock ------------------------------------------------------------
 
@@ -405,7 +449,9 @@ class RideWatch:
             elif typ == "UPDATE_PROGRESS":
                 self._on_progress(trip, t, obj.get("payload") or {})
             elif typ == "UPDATE_ROUTE_MATCH":
-                self._rule_distance_spike(trip, t, obj.get("payload") or {})
+                self._on_route_match(trip, t, obj.get("payload") or {})
+            elif typ == "UPDATE_VEHICLE_MATCH":
+                self._on_vehicle_match(trip, t, obj.get("payload") or {})
             elif typ == "SET_RIDING":
                 self._on_set_riding(trip, t, obj.get("payload") or {})
             elif typ == "CLEAR_RIDING":
@@ -508,6 +554,10 @@ class RideWatch:
                               {"lastFixMs": trip.last_pos_ms})
             # deviated-streak may mature between UPDATE_PROGRESS ticks
             self._check_deviated_streak(trip, now)
+        # Belt and braces: the watchdog thread normally drains the queue as
+        # soon as an answer lands, but the tick guarantees a queued note is
+        # never stranded by a thread that died on its way there.
+        self._maybe_spawn_reply()
 
     # -- rules --------------------------------------------------------------
 
@@ -594,6 +644,35 @@ class RideWatch:
                 {"sinceMs": trip.deviated_since_ms, "onTransit": on_transit},
                 push_body="Shown deviated %ds while on the bus. Position tracking may be off." % secs
                           if on_transit else None)
+
+    def _on_route_match(self, trip, t, p):
+        """Remember where the app thinks the rider is, then run the spike rule.
+
+        The snapshot is not used by any rule — it is context for the reply
+        agent, which gets asked things like "is it actually following me?" and
+        needs the last number the app computed, not a rule's verdict on it.
+        """
+        trip.last_route_match = {
+            "tMs": t,
+            "legIndex": p.get("legIndex"),
+            "distanceFromRoute": p.get("distanceFromRoute"),
+            "isOnRoute": p.get("isOnRoute"),
+            "progressAlongLeg": p.get("progressAlongLeg"),
+        }
+        self._rule_distance_spike(trip, t, p)
+
+    def _on_vehicle_match(self, trip, t, p):
+        """Last live-vehicle match: which bus the app believes is theirs."""
+        match = p.get("match") if isinstance(p.get("match"), dict) else None
+        trip.last_vehicle_match = {
+            "tMs": t,
+            "consecutiveMatches": p.get("consecutiveMatches"),
+            "emptyPolls": p.get("emptyPolls"),
+            "confidence": (match or {}).get("confidence"),
+            "vehicleId": (match or {}).get("vehicleId"),
+            "label": (match or {}).get("label"),
+            "distanceMeters": (match or {}).get("distanceMeters"),
+        }
 
     def _rule_distance_spike(self, trip, t, p):
         d = p.get("distanceFromRoute")
@@ -742,16 +821,23 @@ class RideWatch:
             if len(active) == 1:
                 trip = active[0]
         if trip is None:
+            # No trip to attach it to, so it produces no finding — but it is
+            # still the rider asking a question, and a question outside a trip
+            # deserves an answer too (with less context to answer it from).
             self.log.info("rider note outside any trip (session=%s): %s"
                           % (session, text))
+            self._enqueue_reply(None, {"tsMs": int(t), "time": fmt_hms(t),
+                                       "text": text, "context": None})
             return
         trip.last_event_ms = max(trip.last_event_ms, t)
         context = self._trip_context(trip)
         context["text"] = text
-        trip.notes.append({"tsMs": int(t), "time": fmt_hms(t), "text": text,
-                           "context": context})
+        note = {"tsMs": int(t), "time": fmt_hms(t), "text": text,
+                "context": context}
+        trip.notes.append(note)
         self._finding(trip, t, "rider-note", "info",
                       "rider note: %s" % text[:160], context)
+        self._enqueue_reply(trip, note)
 
     # -- findings, paging, surfaces ----------------------------------------
 
@@ -974,6 +1060,281 @@ class RideWatch:
         th.start()
         self._report_threads.append(th)
 
+    # -- mid-ride replies ---------------------------------------------------
+    #
+    # The rider types a note; a headless `claude -p` reads a context file the
+    # daemon writes and answers on the console.
+    #
+    # How the answer comes back: the agent writes plain text to the path in
+    # RIDE_WATCH_REPLY_OUT and exits. No HTTP endpoint, no new nginx route, no
+    # auth to get wrong, and nothing to be up — a file the daemon already knows
+    # the name of is the smallest thing that works. If the agent exits without
+    # writing it, its captured stdout is used as a fallback, because an answer
+    # that got printed instead of written is still an answer.
+    #
+    # Replies are stored append-only in <date>-<session>.replies.jsonl next to
+    # the findings, one row per state change, collapsed by `id` on read: the
+    # "thinking" placeholder is written the instant the agent is spawned (so
+    # the console can show it immediately) and the final row supersedes it.
+    # Append-only means a crash mid-answer leaves a truthful "thinking" record
+    # rather than a half-written file.
+
+    def _replies_path(self, trip):
+        if trip is not None:
+            return os.path.join(
+                self.watch_dir,
+                "%s-%s.replies.jsonl" % (fmt_date(trip.start_ms), trip.session))
+        return os.path.join(
+            self.watch_dir, "%s-no-trip.replies.jsonl" % fmt_date(self.now_ms()))
+
+    def _enqueue_reply(self, trip, note):
+        with self._reply_lock:
+            self.reply_queue.append({"trip": trip, "note": note})
+        self._maybe_spawn_reply()
+
+    def _reply_budget(self, trip):
+        """(used, cap) for whichever budget this reply spends."""
+        if trip is not None:
+            return trip.replies_spawned, REPLY_MAX_PER_TRIP
+        return self.orphan_replies, REPLY_MAX_PER_TRIP
+
+    def _maybe_spawn_reply(self):
+        """Start an agent if one is not already running and notes are waiting.
+
+        Everything queued is handed to the same run: three notes typed while an
+        agent thinks cost one agent, and it answers them knowing about all
+        three. The trip used for context is the newest one any of them
+        mentioned, so a note typed just before the trip started does not force
+        the whole batch to be answered blind.
+        """
+        with self._reply_lock:
+            if self.reply_inflight is not None or not self.reply_queue:
+                return
+            batch = self.reply_queue
+            self.reply_queue = []
+            trip = None
+            for item in batch:
+                if item["trip"] is not None:
+                    trip = item["trip"]
+            notes = [item["note"] for item in batch]
+
+            used, cap = self._reply_budget(trip)
+            if used >= cap:
+                self.log.info("reply budget spent (%d/%d); %d note(s) unanswered"
+                              % (used, cap, len(notes)))
+                self._record_reply(
+                    trip, self._new_reply_record(notes), "error",
+                    "Reply budget spent for this ride (%d answers). Notes are "
+                    "still logged for the post-ride report." % cap)
+                return
+
+            record = self._new_reply_record(notes)
+            if trip is not None:
+                trip.replies_spawned += 1
+            else:
+                self.orphan_replies += 1
+            self.reply_inflight = {"id": record["id"], "startedMs": self.now_ms()}
+            self._record_reply(trip, record, "thinking", "")
+            self._start_reply_agent(trip, notes, record)
+
+    def _new_reply_record(self, notes):
+        self._reply_seq += 1
+        return {
+            "id": "%d-%d" % (self.now_ms(), self._reply_seq),
+            "tsMs": self.now_ms(),
+            "noteTsMs": [n["tsMs"] for n in notes],
+            "noteText": [n["text"] for n in notes],
+            "text": "",
+            "status": "thinking",
+        }
+
+    def _record_reply(self, trip, record, status, text):
+        """Append the record at its current status and mirror it in memory."""
+        record["status"] = status
+        record["text"] = text
+        record["updatedMs"] = self.now_ms()
+        row = dict(record)
+        with self._reply_lock:
+            existing = next((r for r in self.replies
+                             if r["id"] == record["id"]), None)
+            if existing is None:
+                self.replies.append(row)
+            else:
+                existing.update(row)
+        try:
+            with open(self._replies_path(trip), "a") as f:
+                f.write(json.dumps(row) + "\n")
+        except OSError as exc:
+            self.log.error("could not append reply: %r" % exc)
+        self._mark_dirty()
+
+    def _finish_reply(self, trip, record, status, text):
+        self._record_reply(trip, record, status, text)
+        self.log.info("reply %s [%s]: %s" % (record["id"], status, text[:160]))
+        with self._reply_lock:
+            if self.reply_inflight and self.reply_inflight["id"] == record["id"]:
+                self.reply_inflight = None
+        self.write_status(force=True)
+        # Anything typed while this one was thinking goes out now rather than
+        # waiting for the next telemetry line or the 5s tick.
+        self._maybe_spawn_reply()
+
+    def _write_reply_request(self, trip, notes, record, out_path):
+        """Everything the agent needs, in one file, with no lookups required."""
+        active = trip is not None and trip.session in self.trips
+        req = {
+            "replyId": record["id"],
+            "requestedAtMs": record["tsMs"],
+            "requestedAt": fmt_hms(record["tsMs"]),
+            "answerPath": out_path,
+            "notes": notes,
+            "tripActive": active,
+            "trip": None,
+            "lastTrip": None if trip is not None else self.last_trip_summary,
+            "recentFindings": [],
+            "debugLogPath": current_log_path(),
+            "statusPath": os.path.join(self.watch_dir, "current-ride.md"),
+            "goModeSource": {"path": GO_MODE_SRC, "branch": GO_MODE_BRANCH},
+        }
+        if trip is not None:
+            req["trip"] = {
+                "session": trip.session,
+                "date": fmt_date(trip.start_ms),
+                "startedAt": fmt_hms(trip.start_ms),
+                "startMs": trip.start_ms,
+                "itinerary": itinerary_one_liner(trip.itinerary),
+                "itinerarySummary": trip.itinerary,
+                "itinerarySwaps": trip.swap_seq,
+                "state": self._trip_context(trip),
+                "riding": trip.riding,
+                "routeMatch": trip.last_route_match,
+                "vehicleMatch": trip.last_vehicle_match,
+                "pagesSent": trip.pages_sent,
+                "findingsPath": self._findings_path(trip),
+                "repliesPath": self._replies_path(trip),
+                "notesThisTrip": trip.notes,
+            }
+            req["recentFindings"] = trip.findings[-REPLY_RECENT_FINDINGS:]
+        else:
+            req["recentFindings"] = self.all_findings[-REPLY_RECENT_FINDINGS:]
+        path = os.path.join(self.watch_dir, "reply-request-%s.json" % record["id"])
+        with open(path, "w") as f:
+            json.dump(req, f, indent=2)
+        return path
+
+    def _popen_reply(self, argv, env, log_path):
+        """Default spawner. The parent's copy of the log fd is closed right
+        away — the child has its own dup, and the watchdog must not have to
+        own a file handle to do its job."""
+        out = open(log_path, "a")
+        try:
+            return subprocess.Popen(
+                argv, cwd=REPO_DIR, env=env, stdout=out,
+                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        finally:
+            out.close()
+
+    def _start_reply_agent(self, trip, notes, record):
+        out_path = os.path.join(self.watch_dir,
+                                "reply-out-%s.txt" % record["id"])
+        log_path = os.path.join(self.watch_dir,
+                                "reply-claude-%s.log" % record["id"])
+        spawn = self.spawn_reply
+        if spawn is None:
+            if self.dry_run:
+                # --replay and RIDE_WATCH_DRY_RUN=1 must never spend money or
+                # touch a real agent, but the rider should still see why.
+                self._finish_reply(trip, record, "error",
+                                   "Reply agent disabled (dry run).")
+                return
+            spawn = self._popen_reply
+        try:
+            with open(REPLY_PROMPT_PATH) as f:
+                prompt = f.read()
+        except OSError as exc:
+            self.log.error("reply prompt unreadable: %r" % exc)
+            self._finish_reply(trip, record, "error",
+                               "No answer — the reply prompt is missing.")
+            return
+        try:
+            req_path = self._write_reply_request(trip, notes, record, out_path)
+        except OSError as exc:
+            self.log.error("reply request unwritable: %r" % exc)
+            self._finish_reply(trip, record, "error",
+                               "No answer — could not write the request file.")
+            return
+        env = dict(os.environ)
+        env["RIDE_WATCH_REPLY_REQUEST"] = req_path
+        env["RIDE_WATCH_REPLY_OUT"] = out_path
+        try:
+            proc = spawn([CLAUDE_BIN, "-p", prompt], env, log_path)
+        except FileNotFoundError:
+            self.log.error("claude binary not found (%s)" % CLAUDE_BIN)
+            self._finish_reply(trip, record, "error",
+                               "No answer — the agent could not be started.")
+            return
+        except OSError as exc:
+            self.log.error("reply agent spawn failed: %r" % exc)
+            self._finish_reply(trip, record, "error",
+                               "No answer — the agent could not be started.")
+            return
+        self.log.info("reply agent started (id %s, pid %s, %d note(s))"
+                      % (record["id"], getattr(proc, "pid", "?"), len(notes)))
+
+        th = threading.Thread(
+            target=self._reply_watchdog,
+            args=(proc, trip, record, out_path, log_path), daemon=True)
+        th.start()
+        self.reply_threads.append(th)
+
+    def _reply_watchdog(self, proc, trip, record, out_path, log_path):
+        """Wait for the agent, bounded. A wedged agent frees its slot."""
+        try:
+            rc = proc.wait(timeout=REPLY_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            self.log.error("reply agent %s timed out after %ds; killing"
+                           % (record["id"], REPLY_TIMEOUT_S))
+            for step in (proc.kill, proc.wait):
+                try:
+                    step()
+                except Exception:
+                    pass
+            self._finish_reply(
+                trip, record, "error",
+                "No answer — the agent timed out after %ds." % REPLY_TIMEOUT_S)
+            return
+        except Exception as exc:
+            self.log.error("reply agent %s wait failed: %r" % (record["id"], exc))
+            self._finish_reply(trip, record, "error",
+                               "No answer — the agent failed.")
+            return
+        text = self._read_reply_text(out_path, log_path)
+        if text:
+            # A non-zero exit that still produced an answer is worth showing;
+            # the rider cares about the sentence, not the exit code.
+            if rc:
+                self.log.warn("reply agent %s exited %s but wrote an answer"
+                              % (record["id"], rc))
+            self._finish_reply(trip, record, "done", text)
+        else:
+            self._finish_reply(
+                trip, record, "error",
+                "No answer — the agent exited %s without writing one." % rc)
+
+    def _read_reply_text(self, out_path, log_path):
+        """The answer file, else the agent's stdout, else nothing."""
+        for path, limit in ((out_path, None),
+                            (log_path, REPLY_STDOUT_FALLBACK_MAX)):
+            try:
+                with open(path) as f:
+                    raw = f.read().strip()
+            except OSError:
+                continue
+            if not raw or (limit is not None and len(raw) > limit):
+                continue
+            return " ".join(raw.split())[:REPLY_MAX_CHARS]
+        return ""
+
     # -- live status file ---------------------------------------------------
 
     def _mark_dirty(self):
@@ -1004,7 +1365,9 @@ class RideWatch:
                         s.get("reason")))
             else:
                 lines.append("No active trip. Last: none recorded yet.")
-        for trip in self.trips.values():
+        # list(): the reply watchdog thread also writes the status file when an
+        # answer lands, and the tailer may be starting or ending a trip.
+        for trip in list(self.trips.values()):
             now = self.now_ms()
             lines.append("## Active trip — session %s%s" % (
                 trip.session, " (adopted mid-stream)" if trip.adopted else ""))
@@ -1058,6 +1421,18 @@ class RideWatch:
                         fnd["time"], fnd["severity"], fnd["rule"], fnd["summary"]))
             else:
                 lines.append("### Findings: none")
+            lines.append("")
+        # Outside the per-trip loop: a note typed between rides is answered
+        # too, and that answer still belongs in the live view.
+        if self.replies:
+            pending = sum(1 for r in self.replies if r["status"] == "thinking")
+            lines.append("### Agent replies (%d%s, newest first)" % (
+                len(self.replies), ", %d thinking" % pending if pending else ""))
+            lines.append("")
+            for rep in reversed(self.replies[-10:]):
+                body = rep["text"] if rep["status"] != "thinking" else "…"
+                lines.append("- %s [%s] %s" % (
+                    fmt_hms(rep["tsMs"]), rep["status"], body))
             lines.append("")
         path = os.path.join(self.watch_dir, "current-ride.md")
         try:

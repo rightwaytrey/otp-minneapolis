@@ -9,8 +9,14 @@ ExecStart=/usr/bin/python3 /home/rwt/projects/otp-minneapolis/ride-watch/ride_wa
 WorkingDirectory=/home/rwt/projects/otp-minneapolis
 Restart=on-failure
 RestartSec=10
-# The post-ride report agent is spawned as a child and outlives nothing;
-# give it room to finish rather than killing it with the daemon.
+# `claude` lives in ~/.local/bin, which is NOT on a systemd user service's
+# default PATH — without this both agents (the post-ride report and the
+# mid-ride reply) die at spawn with "claude binary not found". The stable
+# symlink is on the path rather than the versioned binary, so a CLI upgrade
+# does not silently disarm them.
+Environment=PATH=/home/rwt/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The report and reply agents are spawned as children and outlive nothing;
+# give them room to finish rather than killing them with the daemon.
 KillMode=process
 TimeoutStopSec=30
 StandardOutput=null
