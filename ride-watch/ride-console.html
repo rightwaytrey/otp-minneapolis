@@ -23,8 +23,10 @@
   Constraints this file is built around:
   - Self-contained. No external requests of any kind — the phone may be on
     cell, in a tunnel, or on a dying battery.
-  - One-handed. Every tap target is at least 48px and the composer is pinned to
-    the bottom of the screen where a thumb reaches.
+  - One-handed. The composer is pinned to the bottom of the screen where a
+    thumb reaches. It is an ORDINARY single-line input with an inline Send —
+    the first cut used a 76px textarea and a 62px full-width button, which the
+    rider rejected as oversized; it grows only if they type past one line.
   - 16px minimum font in the textarea, or iOS zooms the page on focus and the
     rider has to pinch back out mid-ride.
   - Nothing is lost. A failed send is queued in localStorage and retried; the
@@ -205,19 +207,24 @@
     border-top: 2px solid var(--line); background: var(--bg);
     padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
   }
+  /* One line, ordinary input + inline button — the size of a normal text field
+     anywhere else, not a kiosk control. The row grows only if the rider types
+     past one line (rows=1 + auto-grow in JS, capped). */
+  #row { display: flex; gap: 8px; align-items: flex-end; }
   #note {
-    display: block; width: 100%; min-height: 76px; resize: none;
-    font: 600 18px/1.35 var(--font);   /* >=16px: iOS zooms the page below that */
+    flex: 1 1 auto; min-width: 0; display: block; resize: none;
+    max-height: 96px; overflow-y: auto;
+    font: 500 16px/1.3 var(--font);   /* 16px exactly: iOS zooms below that */
     color: var(--fg); background: var(--panel);
-    border: 2px solid var(--line); border-radius: 12px; padding: 12px 14px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
   }
   #note:focus { outline: none; border-color: var(--accent); }
-  #note::placeholder { color: var(--fg-dim); font-weight: 500; }
+  #note::placeholder { color: var(--fg-dim); font-weight: 400; }
   #send {
-    display: block; width: 100%; min-height: 62px; margin-top: 10px;
-    font: 800 21px/1 var(--font); letter-spacing: 0.3px;
+    flex: 0 0 auto; height: 36px; padding: 0 16px;
+    font: 600 15px/1 var(--font);
     color: #fff; background: var(--accent);
-    border: none; border-radius: 14px; cursor: pointer;
+    border: none; border-radius: 8px; cursor: pointer;
   }
   #send:disabled { opacity: 0.45; }
   #send:active:not(:disabled) { transform: scale(0.99); filter: brightness(0.9); }
@@ -248,10 +255,12 @@
 </div>
 
 <div id="composer">
-  <textarea id="note" rows="3" maxlength="500" autocapitalize="sentences"
+  <div id="row">
+  <textarea id="note" rows="1" maxlength="500" autocapitalize="sentences"
             autocorrect="on" spellcheck="true" enterkeyhint="send"
             placeholder="What just happened?"></textarea>
-  <button id="send" type="button">Send note</button>
+  <button id="send" type="button">Send</button>
+  </div>
   <div id="toast">&nbsp;</div>
 </div>
 
@@ -360,6 +369,13 @@
     }
   }
 
+  // Stay one line until the rider actually needs a second one; the CSS
+  // max-height caps the growth and hands over to scrolling after that.
+  function autoGrow() {
+    el.note.style.height = "auto";
+    el.note.style.height = el.note.scrollHeight + "px";
+  }
+
   function send() {
     var text = el.note.value.trim();
     if (!text) { el.note.focus(); return; }
@@ -369,6 +385,7 @@
     // who has to watch a spinner before they can look up at the road has been
     // handed the wrong trade.
     el.note.value = "";
+    autoGrow();
     el.note.blur();
     enqueue(text);
     // They just sent it; put it where they can see it without scrolling.
@@ -381,6 +398,8 @@
     });
   }
 
+  el.note.addEventListener("input", autoGrow);
+  autoGrow();
   el.send.addEventListener("click", send);
 
   // --- polling -----------------------------------------------------------
