@@ -72,6 +72,27 @@ REROUTE_STORM_COUNT = 3                    # "> 3 in 5 min" pages on the 4th
 DISTANCE_SPIKE_FAR_M = 2000.0
 DISTANCE_SPIKE_NEAR_M = 200.0
 RIDER_ACTION_WINDOW_MS = 30 * 1000         # explicit action shields aboard-swap
+# aboard-swap corroboration: the app must have seen the rider's bus in the feed
+# this recently for "while aboard" to mean anything. Same scale as the app's own
+# VEHICLE_MATCH_FRESH_MS, which is what stops a confirmed match from looking
+# healthy forever after its vehicle drops out of the feed.
+ABOARD_MATCH_FRESH_MS = 90 * 1000
+# match-vs-riding disagreement (8/2 §11): the confirmed match reported trip
+# 1:1191630 while the rider was confirmed on 1:1201789, for the whole ride. One
+# tick of disagreement is a poll landing mid-rebind; a sustained one means the
+# match and the board state have genuinely parted company.
+MATCH_TRIP_DISAGREE_MS = 60 * 1000
+# ...and its distance was ~10,268 km, a real haversine against null island.
+# Anything past this is not "the bus you are sitting on" under any reading.
+MATCH_DISTANCE_ABSURD_M = 5000.0
+# stalled-progress (8/2 §12): the rider sat at one spot for 34 minutes inside a
+# bike leg, 640 m short of the destination, with Go Mode active and progress
+# frozen. Internally consistent, so no existing rule had anything to say. This
+# distinguishes "parked" from "tracking broken" only by duration — long enough
+# that a light, a queue, or a shop stop never trips it.
+STALL_MS = 15 * 60 * 1000
+STALL_RADIUS_M = 60.0
+STALL_COOLDOWN_MS = 15 * 60 * 1000
 # notification-repeat. On 2026-07-31 the app pushed the identical turn alert
 # ("Turn right on Village Lane") to a stationary rider 14 times, 30.5s apart,
 # for seven minutes — the turn-cue dedup is a 30s rate limiter, not the
@@ -397,6 +418,11 @@ class Trip:
         self.prev_dist = None
         self.last_route_match = None               # last UPDATE_ROUTE_MATCH
         self.last_vehicle_match = None             # last UPDATE_VEHICLE_MATCH
+        self.match_disagree_since_ms = None        # match tripId != riding's
+        self.match_disagree_fired = False
+        self.match_distance_fired = False          # re-arms when sane again
+        self.stall_anchor = None                   # ((lat, lon), first_seen_ms)
+        self.stall_fired_ms = 0
         self.last_rider_action_ms = 0
         self.console_seen = set()
         self.notes = []                           # rider-typed notes, in order
@@ -554,6 +580,8 @@ class RideWatch:
             elif typ == "CLEAR_RIDING":
                 trip.riding = None
                 self._mark_dirty()
+            elif typ == "TRANSITION_LEG":
+                self._on_transition_leg(trip, t, obj.get("payload") or {})
             elif typ == "ADD_NOTIFICATION":
                 self._on_notification(trip, t, obj.get("payload") or {})
             elif typ == "START_REROUTE":
@@ -674,6 +702,7 @@ class RideWatch:
                               {"lastFixMs": trip.last_pos_ms})
             # deviated-streak may mature between UPDATE_PROGRESS ticks
             self._check_deviated_streak(trip, now)
+            self._check_stalled(trip, now)
             self._maybe_heartbeat(trip, now)
 
     # -- rules --------------------------------------------------------------
@@ -773,6 +802,10 @@ class RideWatch:
         lat, lon = coords.get("latitude"), coords.get("longitude")
         if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
             trip.last_fix = (lat, lon)
+            # Stall anchor: the oldest fix the rider has not meaningfully left.
+            anchor = trip.stall_anchor
+            if anchor is None or meters_between(anchor[0], (lat, lon)) > STALL_RADIUS_M:
+                trip.stall_anchor = ((lat, lon), trip.last_pos_ms)
 
     def _check_progress_without_motion(self, trip, t, p):
         """Leg progress advancing faster than the rider physically moved.
@@ -836,6 +869,43 @@ class RideWatch:
                 push_body="Shown deviated %ds while on the bus. Position tracking may be off." % secs
                           if on_transit else None)
 
+    def _check_stalled(self, trip, now):
+        """The rider has not moved for a long time, mid-leg, trip still active.
+
+        8/2: stationary at one point from 21:50 to 22:24 — 34 minutes, 640 m
+        short of the destination — with Go Mode active, currentLegProgress 0
+        and timeRemaining frozen at 217 s. Every number was internally
+        consistent (no movement, no progress), which is exactly why no existing
+        rule had anything to say about it.
+
+        This cannot tell "parked" from "tracking broken" and does not pretend
+        to: it reports the fact and lets the post-ride triage decide. Warn, not
+        page — a rider who stopped somewhere knows they stopped, and the one
+        who has been abandoned by a frozen tracker is not helped by a buzz.
+        Re-arms on a cooldown so a long lunch is one finding, not twenty.
+        """
+        anchor = trip.stall_anchor
+        if anchor is None or trip.last_fix is None:
+            return
+        # A GPS gap is a different fault with its own rule; do not double-report
+        # a rider who simply stopped sending fixes as one who stopped moving.
+        if now - trip.last_pos_ms > GPS_GAP_MS:
+            return
+        held_ms = now - anchor[1]
+        if held_ms < STALL_MS:
+            return
+        if now - trip.stall_fired_ms < STALL_COOLDOWN_MS:
+            return
+        trip.stall_fired_ms = now
+        leg = (trip.progress or {}).get("currentLegIndex")
+        self._finding(
+            trip, now, "stalled-progress", "warn",
+            "stationary %dm inside leg %s with the trip still active" % (
+                held_ms // 60000, leg),
+            {"heldMs": held_ms, "legIndex": leg,
+             "lat": anchor[0][0], "lon": anchor[0][1],
+             "legProgress": (trip.progress or {}).get("currentLegProgress")})
+
     def _on_route_match(self, trip, t, p):
         """Remember where the app thinks the rider is, then run the spike rule.
 
@@ -862,8 +932,74 @@ class RideWatch:
             "confidence": (match or {}).get("confidence"),
             "vehicleId": (match or {}).get("vehicleId"),
             "label": (match or {}).get("label"),
+            "tripId": (match or {}).get("tripId"),
             "distanceMeters": (match or {}).get("distanceMeters"),
         }
+        self._rule_match_distance_absurd(trip, t, match)
+        self._rule_match_trip_disagrees(trip, t, match)
+
+    def _rule_match_distance_absurd(self, trip, t, match):
+        """The rider is not 10,000 km from the bus they are sitting on.
+
+        8/2: every UPDATE_VEHICLE_MATCH while aboard reported ~10,268 km,
+        decaying ~10 m/s — a real haversine against a null-island coordinate
+        the feed published for the rider's own vehicle. Confidence still read
+        'confirmed' because the match keys on vehicleId, so nothing downstream
+        noticed. Diagnostic, not actionable: the rider cannot do anything with
+        this, so it warns rather than pages.
+        """
+        if not match:
+            return
+        d = match.get("distanceMeters")
+        if not isinstance(d, (int, float)) or d <= MATCH_DISTANCE_ABSURD_M:
+            # Back to a plausible distance — re-arm, so a second episode later
+            # in the ride is still reported.
+            trip.match_distance_fired = False
+            return
+        if trip.match_distance_fired:
+            return
+        # Once per episode, not once per tick: on 8/2 this condition held for
+        # the entire ride and would otherwise have written 582 identical
+        # findings into the ledger the post-ride report reads.
+        trip.match_distance_fired = True
+        self._finding(
+            trip, t, "match-distance-absurd", "warn",
+            "vehicle match reports %.0f km to the rider's own bus" % (d / 1000.0),
+            {"distanceMeters": d, "vehicleId": match.get("vehicleId"),
+             "tripId": match.get("tripId"),
+             "confidence": match.get("confidence")})
+
+    def _rule_match_trip_disagrees(self, trip, t, match):
+        """The matched trip and the boarded trip have parted company.
+
+        8/2: the match sat on 1:1191630 (the ghost record for the vehicle's
+        NEXT block trip) while SET_RIDING held 1:1201789 for the whole ride.
+        That disagreement is what armed the boarded-earlier replan loop. One
+        tick of it is a poll landing mid-rebind, so it has to be sustained.
+        """
+        riding = trip.riding
+        if not match or not riding:
+            trip.match_disagree_since_ms = None
+            return
+        m_trip, r_trip = match.get("tripId"), riding.get("tripId")
+        if not m_trip or not r_trip or m_trip == r_trip:
+            trip.match_disagree_since_ms = None
+            return
+        if trip.match_disagree_since_ms is None:
+            trip.match_disagree_since_ms = t
+            return
+        if t - trip.match_disagree_since_ms < MATCH_TRIP_DISAGREE_MS:
+            return
+        if trip.match_disagree_fired:
+            return
+        trip.match_disagree_fired = True
+        self._finding(
+            trip, t, "match-trip-disagrees", "warn",
+            "vehicle match trip %s disagrees with riding trip %s for %ds"
+            % (m_trip, r_trip, (t - trip.match_disagree_since_ms) // 1000),
+            {"matchTripId": m_trip, "ridingTripId": r_trip,
+             "vehicleId": match.get("vehicleId"),
+             "confidence": match.get("confidence")})
 
     def _rule_distance_spike(self, trip, t, p):
         d = p.get("distanceFromRoute")
@@ -905,8 +1041,60 @@ class RideWatch:
         trip.riding = new
         self._mark_dirty()
 
+    def _on_transition_leg(self, trip, t, p):
+        """Mirror the app's alight clear.
+
+        The app never dispatches CLEAR_RIDING on alighting — TRANSITION_LEG's
+        own reducer sets riding: null when the new leg is past the boarded one
+        (reducers/go-mode.ts, "Advancing past the boarded transit leg means the
+        rider alighted"). This daemon mirrors action TYPES, not reducers, so it
+        held the riding fact for the whole ride: on 2026-08-02 it still thought
+        the rider was aboard the Orange Line at 22:24, 53 minutes after they
+        got off, which is what let ordinary bike-leg reroutes fire aboard-swap.
+
+        An un-anchored fact (legIndex -1, the rider is aboard but we don't know
+        which leg) is deliberately NOT cleared — same as the app, which asserts
+        exactly that in __tests__/util/go-mode/riding.ts.
+        """
+        leg_index = p.get("legIndex")
+        if not isinstance(leg_index, int):
+            return
+        riding = trip.riding
+        if riding is None:
+            return
+        ridden_leg = riding.get("legIndex")
+        if not isinstance(ridden_leg, int) or ridden_leg < 0:
+            return
+        if leg_index > ridden_leg:
+            trip.riding = None
+            self.log.info(
+                "riding cleared on alight: session=%s leg %s -> %s"
+                % (trip.session, ridden_leg, leg_index))
+            self._mark_dirty()
+
     def _rule_aboard_swap(self, trip, t):
         if trip.riding is None:
+            return
+        # Being "aboard" has to mean aboard NOW. The sticky fact alone was the
+        # bug: on 8/2 it was still set 53 minutes after the rider got off, so
+        # three ordinary bike-leg deviation replans read as aboard-swaps. The
+        # real fix is upstream — _on_transition_leg now clears the fact on
+        # alight, exactly as the app does — and that alone removes all three.
+        #
+        # This is the remaining corroboration: the app must have SEEN the
+        # rider's bus in the feed recently. A confirmed match keeps its
+        # confidence long after its vehicle drops out (the app's own
+        # VEHICLE_MATCH_FRESH_MS rule), so a fact with no recent sighting
+        # behind it is not evidence the rider is aboard right now.
+        #
+        # Deliberately NOT also requiring a transit current leg, though the
+        # backlog item asked for it. Measured against both recorded rides it
+        # suppresses two GENUINE detections (7/29 17:28:48, 8/2 21:29:25) and
+        # prevents no false positive — because a swap that lands the rider on
+        # a walk leg while they are physically on a bus is the starkest form
+        # of the very thing this rule exists to catch, not a reason to go quiet.
+        match = trip.last_vehicle_match
+        if not match or t - (match.get("tMs") or 0) > ABOARD_MATCH_FRESH_MS:
             return
         if t - trip.last_rider_action_ms <= RIDER_ACTION_WINDOW_MS:
             return  # rider explicitly picked a new itinerary

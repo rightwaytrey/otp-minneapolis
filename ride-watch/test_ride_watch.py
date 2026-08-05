@@ -153,6 +153,25 @@ class StreamBuilder:
             "tripId": trip_id, "vehicleId": vehicle, "legIndex": leg,
             "routeId": "1:5", "headsign": "Downtown", "boardedAt": self.t})
 
+    def vehicle_match(self, vehicle="1:900", trip_id="1:100",
+                      confidence="confirmed", distance=40.0, consecutive=1):
+        """A live-vehicle match, as UPDATE_VEHICLE_MATCH carries it.
+
+        A rider who is genuinely aboard produces these continuously — which is
+        why aboard-swap now asks for a recent one before believing the sticky
+        riding fact.
+        """
+        return self.action("UPDATE_VEHICLE_MATCH", {
+            "consecutiveMatches": consecutive, "emptyPolls": 0,
+            "match": {"confidence": confidence, "vehicleId": vehicle,
+                      "tripId": trip_id, "label": "8140",
+                      "distanceMeters": distance}})
+
+    def transition_leg(self, leg):
+        """The app advancing to a new leg. Its reducer — not any action —
+        is what clears the riding fact on alighting."""
+        return self.action("TRANSITION_LEG", {"legIndex": leg})
+
     def route_match(self, dist, leg=1, on_route=True):
         return self.action("UPDATE_ROUTE_MATCH", {
             "legIndex": leg, "distanceFromRoute": dist,
@@ -367,11 +386,72 @@ class TestRules(RuleTestCase):
     def test_c_aboard_swap_pages(self):
         b = StreamBuilder().start().advance(1000).progress(stops=5)
         b.advance(1000).riding()
-        b.advance(60000).start()
+        b.advance(59000).vehicle_match()
+        b.advance(1000).start()
         watch = self.run_stream(b)
         hits = self.find(watch, "aboard-swap")
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "page")
+
+    def test_c_no_aboard_swap_without_a_recent_sighting(self):
+        """The riding fact alone is not evidence the rider is aboard NOW.
+
+        A confirmed match keeps its confidence long after its vehicle leaves
+        the feed, so "aboard" has to be backed by the app actually having seen
+        the bus recently.
+        """
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding().vehicle_match()
+        b.advance(5 * 60000).start()   # last sighting is now 5 min stale
+        watch = self.run_stream(b)
+        self.assertNotIn("aboard-swap", self.rules(watch))
+
+    def test_c_aboard_swap_still_fires_when_the_swap_lands_on_a_walk_leg(self):
+        """The starkest form of the defect must not be the quiet one.
+
+        A swap that puts the rider on a non-transit leg while they are
+        physically on a bus is exactly what this rule is for. Requiring a
+        transit current leg would have silenced it — measured against the 7/29
+        and 8/2 recordings it suppressed two genuine detections and prevented
+        no false positive, so it is deliberately not required.
+        """
+        b = StreamBuilder().start().advance(1000).progress(leg=0, stops=5)
+        b.advance(1000).riding(leg=0).vehicle_match()
+        # Progress now says leg 1, which the itinerary summary calls a walk.
+        b.advance(1000).progress(leg=1, stops=None)
+        b.advance(30000).start()
+        watch = self.run_stream(b)
+        self.assertIn("aboard-swap", self.rules(watch))
+
+    def test_transition_leg_clears_the_riding_fact_on_alight(self):
+        """The app never dispatches CLEAR_RIDING — its TRANSITION_LEG reducer
+        does the clearing. Mirroring only action types left the daemon holding
+        the fact for the whole 8/2 ride, 53 minutes after the rider got off."""
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding(leg=1).vehicle_match()
+        b.advance(1000).transition_leg(2)          # advanced past the bus leg
+        b.advance(30000).start()                   # a bike-leg replan
+        watch = self.run_stream(b)
+        # No longer aboard, so an ordinary replan is not an aboard-swap.
+        self.assertNotIn("aboard-swap", self.rules(watch))
+
+    def test_transition_leg_keeps_the_fact_when_not_past_the_bus_leg(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding(leg=2).vehicle_match()
+        b.advance(1000).transition_leg(2)   # onto the bus leg, not past it
+        b.advance(30000).start()
+        watch = self.run_stream(b)
+        self.assertIn("aboard-swap", self.rules(watch))
+
+    def test_transition_leg_never_clears_an_unanchored_fact(self):
+        """legIndex -1 means aboard but not yet tied to a leg. The app
+        deliberately keeps it (asserted in its own riding.ts) — so do we."""
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding(leg=-1).vehicle_match()
+        b.advance(1000).transition_leg(3)
+        b.advance(30000).start()
+        watch = self.run_stream(b)
+        self.assertIn("aboard-swap", self.rules(watch))
 
     def test_c_no_aboard_swap_after_explicit_rider_action(self):
         b = StreamBuilder().start().advance(1000).progress(stops=5)
@@ -622,6 +702,110 @@ class TestRules(RuleTestCase):
             b.advance(1000).route_match(d)
         watch = self.run_stream(b)
         self.assertNotIn("distance-spike", self.rules(watch))
+
+    def test_k_absurd_match_distance_warns(self):
+        """8/2: ~10,268 km to the bus the rider was sitting on — a real
+        haversine against a null-island coordinate the feed published."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding()
+        b.advance(1000).vehicle_match(distance=10267729.06)
+        watch = self.run_stream(b)
+        hits = self.find(watch, "match-distance-absurd")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "warn")
+        self.assertGreater(hits[0]["context"]["distanceMeters"], 1e6)
+
+    def test_k_absurd_distance_is_reported_once_per_episode(self):
+        """It held for the whole 8/2 ride: 582 identical findings, unlatched."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding()
+        for _ in range(50):
+            b.advance(15000).vehicle_match(distance=10267729.06)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "match-distance-absurd")), 1)
+
+    def test_k_a_second_episode_is_reported_again(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding()
+        b.advance(1000).vehicle_match(distance=10267729.06)
+        b.advance(15000).vehicle_match(distance=40.0)      # recovers
+        b.advance(15000).vehicle_match(distance=9900000.0)  # and breaks again
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "match-distance-absurd")), 2)
+
+    def test_k_ordinary_feed_lag_is_not_absurd(self):
+        """A bus outrunning its own feed position is normal, not a fault."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding()
+        b.advance(1000).vehicle_match(distance=1200.0)
+        watch = self.run_stream(b)
+        self.assertNotIn("match-distance-absurd", self.rules(watch))
+
+    def test_k_sustained_trip_disagreement_warns(self):
+        """8/2: the match sat on the ghost trip 1:1191630 while the rider was
+        confirmed on 1:1201789 — the disagreement that armed the replan loop."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:1201789")
+        b.advance(1000).vehicle_match(trip_id="1:1191630")
+        b.advance(ride_watch.MATCH_TRIP_DISAGREE_MS + 5000)
+        b.vehicle_match(trip_id="1:1191630")
+        watch = self.run_stream(b)
+        hits = self.find(watch, "match-trip-disagrees")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "warn")
+        self.assertEqual(hits[0]["context"]["matchTripId"], "1:1191630")
+        self.assertEqual(hits[0]["context"]["ridingTripId"], "1:1201789")
+
+    def test_k_one_tick_of_disagreement_is_a_rebind_not_a_fault(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:1201789")
+        b.advance(1000).vehicle_match(trip_id="1:1191630")
+        b.advance(2000).vehicle_match(trip_id="1:1201789")
+        b.advance(ride_watch.MATCH_TRIP_DISAGREE_MS + 5000)
+        b.vehicle_match(trip_id="1:1201789")
+        watch = self.run_stream(b)
+        self.assertNotIn("match-trip-disagrees", self.rules(watch))
+
+    def test_k_disagreement_fires_once_not_per_tick(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:1201789")
+        for _ in range(12):
+            b.advance(ride_watch.MATCH_TRIP_DISAGREE_MS // 2)
+            b.vehicle_match(trip_id="1:1191630")
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "match-trip-disagrees")), 1)
+
+    def test_l_stalled_progress_warns(self):
+        """8/2 §12: 34 minutes stationary inside a bike leg, 640 m short of the
+        destination, every number internally consistent."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, prog=0.0)
+        b.advance(1000).position()
+        # Sit still, still sending fixes, well past the stall threshold.
+        for _ in range(20):
+            b.advance(60 * 1000).position_metres_north(1)
+        watch = self.run_stream(b)
+        hits = self.find(watch, "stalled-progress")
+        self.assertGreaterEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "warn")
+        self.assertGreaterEqual(hits[0]["context"]["heldMs"],
+                                ride_watch.STALL_MS)
+
+    def test_l_a_rider_who_is_moving_never_stalls(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=2, prog=0.0)
+        for i in range(30):
+            b.advance(60 * 1000).position_metres_north(200 * (i + 1))
+        watch = self.run_stream(b)
+        self.assertNotIn("stalled-progress", self.rules(watch))
+
+    def test_l_a_gps_gap_is_not_reported_as_a_stall(self):
+        """Two different faults. A rider who stopped sending fixes has not
+        been shown to have stopped moving — gps-gap already covers that."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, prog=0.0)
+        b.advance(1000).position()
+        b.advance(40 * 60 * 1000).progress(leg=2, prog=0.0)
+        watch = self.run_stream(b)
+        self.assertNotIn("stalled-progress", self.rules(watch))
+        self.assertIn("gps-gap", self.rules(watch))
 
 
 class TestPaging(RuleTestCase):
