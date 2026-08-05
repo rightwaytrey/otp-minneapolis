@@ -59,6 +59,24 @@ safety layer. It does not need you and you must not duplicate it.
   numbers, contradict it with the number that contradicts it, or say the
   telemetry is silent — and if it is silent, that is a finding: name the rule
   that would have caught it.
+- **Record what the rider tells you, once, as you receive it.** A note the rider
+  types INTO THIS CONVERSATION reaches nothing else: the daemon only sees the
+  telemetry stream, so on 2026-08-02 three notes about a real bug arrived here
+  and the wrap-up was handed "0 note(s)". If it dies with this tmux pane it is
+  gone. So when the rider says something about the ride — an observation, a
+  complaint, a correction — put it in the stream first, in their words:
+
+  ```
+  curl -s -X POST http://127.0.0.1:8092/api/ride-note \
+    -H 'Content-Type: application/json' \
+    -d '{"source":"ride-thread","text":"<their words>"}'
+  ```
+
+  Their words, not your paraphrase, and once per note — it is the spec for the
+  post-ride report. It will not be echoed back at you (the daemon suppresses
+  the push for notes it recorded from here), so record it and then answer
+  normally in the same reply. Do NOT record a note that arrived as a
+  `[ride-watch]` digest push: that one is already in the stream.
 - **Stay quiet otherwise.** Milestones only. Do not narrate the ride.
 
 ## Hard prohibitions while the trip is live
@@ -91,6 +109,11 @@ yourself — no other agent is coming:
    a note with a machine finding within a minute or two: one incident, one
    entry. `ride-watch/report-prompt.md` is the long-form brief for this and is
    still worth reading if the ride was complicated.
+
+   `notesCount` counts notes that reached the telemetry stream. If the rider
+   told you something in this conversation that is not in `riderNotes`, it is
+   still a rider note — use it, and say in the report that it came from the
+   thread. "0 recorded note(s)" never means the rider said nothing.
 2. **Build the replay fixture** so the ride can be re-run offline:
    `cd ~/projects/otprr/otp-react-redux && node lib/util/go-mode/replay/build-fixture.js --session <id> --label <short label>`.
    If the telemetry is somewhere other than `~/otp-debug-logs`, pass
@@ -107,5 +130,6 @@ yourself — no other agent is coming:
 5. **Stay available.** Do not exit. The rider often asks follow-ups after they
    are off the bus, and you still hold the entire ride.
 
-If the trip ended with zero findings and zero notes, skip the report: reply with
-one line saying the ride was clean, and stay available.
+If the trip ended with zero findings and zero notes — including anything the
+rider told you here — skip the report: reply with one line saying the ride was
+clean, and stay available.

@@ -665,7 +665,12 @@ class RideWatch:
         # The wrap-up is the thread's job now (no headless report agent): tell
         # it the ride is over and where the request file is, and it writes the
         # vault report from the context it has been holding all ride.
-        line = "trip ended (%s) after %dm — %d finding(s), %d note(s)" % (
+        # "%d recorded note(s)", not "%d note(s)": the count is of notes that
+        # reached the telemetry stream. On 8/2 it read "0 note(s)" to a thread
+        # the rider had typed three notes into, which invited the wrap-up to
+        # report that the rider said nothing. The thread's own conversation is
+        # the other half, and the sysprompt tells it to use both.
+        line = "trip ended (%s) after %dm — %d finding(s), %d recorded note(s)" % (
             reason, max(0, (t - trip.start_ms) // 60000), n, len(trip.notes))
         if req_path:
             line += " — wrap-up now; request: %s" % req_path
@@ -1251,19 +1256,27 @@ class RideWatch:
                           % (session, text))
             return
         trip.last_event_ms = max(trip.last_event_ms, t)
+        source = obj.get("source") or "console"
         context = self._trip_context(trip)
         context["text"] = text
+        context["source"] = source
         note = {"tsMs": int(t), "time": fmt_hms(t), "text": text,
-                "context": context}
+                "source": source, "context": context}
         trip.notes.append(note)
         # The finding is what reaches the ride thread (see _finding), so the
-        # note is answered in the conversation the rider is already reading.
+        # note is answered in the conversation the rider is already reading —
+        # UNLESS the thread is where it came from. A thread-recorded note is
+        # already in that conversation; pushing it back would echo the rider's
+        # own words at them. It still lands in the ledger, the digest and the
+        # report request, which is the whole point of recording it.
         self._finding(trip, t, "rider-note", "info",
-                      "rider note: %s" % text[:160], context)
+                      "rider note: %s" % text[:160], context,
+                      thread_push=(source != "ride-thread"))
 
     # -- findings, paging, surfaces ----------------------------------------
 
-    def _finding(self, trip, ts_ms, rule, severity, summary, context, push_body=None):
+    def _finding(self, trip, ts_ms, rule, severity, summary, context,
+                 push_body=None, thread_push=True):
         finding = {
             "tsMs": int(ts_ms),
             "time": fmt_hms(ts_ms),
@@ -1292,7 +1305,8 @@ class RideWatch:
         line = (summary if rule == "rider-note"
                 else "finding [%s] %s: %s" % (severity, rule, summary))
         self._thread_event(trip, ts_ms, line)
-        self._thread_push(trip, line)
+        if thread_push:
+            self._thread_push(trip, line)
         self._mark_dirty()
 
     def _persist_finding(self, trip, finding):

@@ -18,7 +18,11 @@
     "A third, found during the end-to-end run: an env-var PREFIX defeats a",
     "command rule (`DEBUG_LOG_DIR=... node build-fixture.js` matched no rule",
     "and prompted the rider mid-wrap-up), so the prefixed forms are listed",
-    "explicitly and the sysprompt tells the thread to prefer --logs-dir."
+    "explicitly and the sysprompt tells the thread to prefer --logs-dir.",
+    "The one POST allowed here is /api/ride-note on localhost: notes the rider",
+    "types straight into this conversation are otherwise invisible to the",
+    "daemon (2026-08-02: three notes, `0 note(s)` in the wrap-up), and this",
+    "puts them into the same stream the console writes to."
   ],
   "permissions": {
     "defaultMode": "manual",
@@ -46,6 +50,7 @@
       "Bash(stat:*)",
       "Bash(cd:*)",
       "Bash(mkdir -p /home/rwt/obsidian-vault/Claude/ride-watch)",
+      "Bash(curl -s -X POST http://127.0.0.1:8092/api/ride-note*)",
       "Bash(node lib/util/go-mode/replay/build-fixture.js:*)",
       "Bash(node /home/rwt/projects/otprr/otp-react-redux/lib/util/go-mode/replay/build-fixture.js:*)",
       "Bash(DEBUG_LOG_DIR=* node lib/util/go-mode/replay/build-fixture.js:*)",

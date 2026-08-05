@@ -177,13 +177,16 @@ class StreamBuilder:
             "legIndex": leg, "distanceFromRoute": dist,
             "progressAlongLeg": 0.1, "isOnRoute": on_route})
 
-    def note(self, text, session=None):
+    def note(self, text, session=None, source=None):
         """A rider note exactly as the Flask sidecar writes it to the JSONL."""
-        self.events.append({
+        rec = {
             "kind": "rider-note", "event": "RIDER_NOTE", "text": text,
             "t": self.t, "recv": self.t / 1000.0,
             "session": self.session if session is None else session,
-            "ip": "10.0.0.5"})
+            "ip": "10.0.0.5"}
+        if source is not None:
+            rec["source"] = source
+        self.events.append(rec)
         return self
 
 
@@ -1312,6 +1315,40 @@ class TestRideThread(RuleTestCase):
         watch, thread = self.ride(b)
         self.assertEqual(thread.kinds(), ["start", "note"])
         self.assertIn("driver blew past my stop", thread.of_kind("note")[0]["line"])
+
+    def test_a_thread_recorded_note_is_kept_but_not_echoed_back(self):
+        """The 8/2 gap: notes typed straight into the thread reached nothing.
+
+        The thread can now put them in the stream itself, which is what gets
+        them into the ledger, the digest and the wrap-up request. What it must
+        NOT do is bounce the rider's own words back at the conversation they
+        just typed them into.
+        """
+        b = StreamBuilder().start().advance(1000).progress(stops=5, prog=30.0)
+        b.advance(1000).note("2 bus legs, I'm only on one bus",
+                             source="ride-thread")
+        watch, thread = self.ride(b)
+        trip = watch.trips[SESSION]
+        # Recorded everywhere the report will look...
+        self.assertEqual(len(trip.notes), 1)
+        self.assertEqual(trip.notes[0]["source"], "ride-thread")
+        self.assertIn("rider-note", [f["rule"] for f in watch.all_findings])
+        # ...but never pushed back at the thread.
+        self.assertEqual(thread.kinds(), ["start"])
+
+    def test_a_console_note_is_still_pushed_to_the_thread(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5, prog=30.0)
+        b.advance(1000).note("driver blew past my stop", source="console")
+        watch, thread = self.ride(b)
+        self.assertIn("note", thread.kinds())
+
+    def test_a_note_with_no_source_is_treated_as_a_console_note(self):
+        """Older sidecars send no `source` — the console is the default."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5, prog=30.0)
+        b.advance(1000).note("still wrong")
+        watch, thread = self.ride(b)
+        self.assertIn("note", thread.kinds())
+        self.assertEqual(watch.trips[SESSION].notes[0]["source"], "console")
 
     def test_a_note_no_longer_spawns_a_process(self):
         """The whole reason this feature exists — no more `claude -p` per note."""
