@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh the Tailscale TLS certificate for nginx
+Documentation=file:///home/rwt/projects/otp-minneapolis/scripts/renew-tailscale-cert.sh
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/rwt/projects/otp-minneapolis/scripts/renew-tailscale-cert.sh
+# The cert is only re-fetched near expiry, so a failed run is not urgent —
+# but it must be visible rather than silent, which is exactly how the
+# certbot failures went unnoticed for four weeks.
+StandardOutput=journal
+StandardError=journal

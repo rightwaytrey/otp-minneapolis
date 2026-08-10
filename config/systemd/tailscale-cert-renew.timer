@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Tailscale TLS certificate refresh for nginx
+
+[Timer]
+# Daily at 04:30, before the 05:00 nightly verify — so if the cert ever does
+# rotate, the verify run exercises the new one rather than discovering it later.
+OnCalendar=*-*-* 04:30:00
+# Catch up after the box has been off; the whole point is that an expiry can
+# never quietly slip past a missed window again.
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target
