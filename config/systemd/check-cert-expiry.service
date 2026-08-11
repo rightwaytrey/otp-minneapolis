@@ -1,0 +1,14 @@
+[Unit]
+Description=Check served TLS certificates and page before they expire
+Documentation=file:///home/rwt/projects/otp-minneapolis/scripts/check-cert-expiry.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as the owning user: it only needs to open a TLS connection and read the
+# Pushover credentials in ~/.config, never the private keys.
+User=rwt
+ExecStart=/home/rwt/projects/otp-minneapolis/scripts/check-cert-expiry.sh
+StandardOutput=journal
+StandardError=journal

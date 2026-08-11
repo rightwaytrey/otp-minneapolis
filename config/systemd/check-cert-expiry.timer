@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily TLS certificate expiry check (pages Pushover before expiry)
+
+[Timer]
+# 04:45 — after the tailscale cert refresh at 04:30, so a cert that rotated
+# overnight is checked in its new state rather than its old one.
+OnCalendar=*-*-* 04:45:00
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target
