@@ -53,20 +53,24 @@ echo "    zone id: $ZONE_ID"
 
 echo "==> Installing the certbot Cloudflare DNS plugin..."
 # All three steps are required and the order matters (certbot's own docs):
+#   set      - MUST come first. Installing the plugin fires certbot's
+#              prepare-plug-plugin hook, which refuses to auto-connect until
+#              this acknowledgement exists ("Only connect this interface if you
+#              trust the plugin author to have root"). Install-then-set fails
+#              the install outright. Note snap set takes key=value; "key: value"
+#              is rejected as invalid configuration.
 #   install  - the plugin snap
-#   set      - snap set takes key=value; "key: value" is rejected outright.
-#              Without it, classic certbot refuses to load a root-run plugin.
 #   connect  - wires the plugin into certbot's plugin slot; without it certbot
 #              still reports "unrecognized arguments: --dns-cloudflare".
 # Errors are NOT suppressed here: hiding the install failure behind a fallback
 # "refresh" only produced the misleading "is not installed".
+snap set certbot trust-plugin-with-root=ok
 if snap list certbot-dns-cloudflare >/dev/null 2>&1; then
     echo "    already installed; refreshing"
     snap refresh certbot-dns-cloudflare || true
 else
     snap install certbot-dns-cloudflare
 fi
-snap set certbot trust-plugin-with-root=ok
 snap connect certbot:plugin certbot-dns-cloudflare || true
 
 # Prove the plugin actually loaded before spending a Let's Encrypt rate-limit
