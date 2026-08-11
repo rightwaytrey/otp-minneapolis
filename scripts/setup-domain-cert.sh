@@ -52,11 +52,32 @@ fi
 echo "    zone id: $ZONE_ID"
 
 echo "==> Installing the certbot Cloudflare DNS plugin..."
-# Install first, THEN grant trust: snap set takes key=value (not "key: value",
-# which it rejects as invalid configuration), and the trust flag is what lets
-# classic certbot actually load a root-run plugin.
-snap install certbot-dns-cloudflare 2>/dev/null || snap refresh certbot-dns-cloudflare
+# All three steps are required and the order matters (certbot's own docs):
+#   install  - the plugin snap
+#   set      - snap set takes key=value; "key: value" is rejected outright.
+#              Without it, classic certbot refuses to load a root-run plugin.
+#   connect  - wires the plugin into certbot's plugin slot; without it certbot
+#              still reports "unrecognized arguments: --dns-cloudflare".
+# Errors are NOT suppressed here: hiding the install failure behind a fallback
+# "refresh" only produced the misleading "is not installed".
+if snap list certbot-dns-cloudflare >/dev/null 2>&1; then
+    echo "    already installed; refreshing"
+    snap refresh certbot-dns-cloudflare || true
+else
+    snap install certbot-dns-cloudflare
+fi
 snap set certbot trust-plugin-with-root=ok
+snap connect certbot:plugin certbot-dns-cloudflare || true
+
+# Prove the plugin actually loaded before spending a Let's Encrypt rate-limit
+# slot on a request that cannot work.
+if ! certbot plugins 2>/dev/null | grep -q "dns-cloudflare"; then
+    echo "ERROR: certbot still cannot see the dns-cloudflare plugin." >&2
+    echo "       'certbot plugins' output:" >&2
+    certbot plugins 2>&1 | sed 's/^/         /' >&2
+    exit 1
+fi
+echo "    plugin loaded."
 
 echo "==> Writing credentials..."
 install -d -m 700 /etc/letsencrypt
