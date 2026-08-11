@@ -112,6 +112,15 @@ certbot certonly \
     --non-interactive --agree-tos -m "$EMAIL" \
     --deploy-hook "systemctl reload nginx"
 
+# This box cannot reach its own public IP (no NAT hairpin), so anything running
+# HERE that talks to the app by name — the :9967 dev app in a browser, every
+# scripts/verify-*.js, the nightly suite — resolves $DOMAIN to nothing without
+# this. nginx still picks the right server block, because SNI carries the name.
+if ! grep -q "[[:space:]]$DOMAIN\$\|[[:space:]]$DOMAIN[[:space:]]" /etc/hosts; then
+    echo "==> Mapping $DOMAIN to 127.0.0.1 in /etc/hosts (no NAT hairpin here)..."
+    echo "127.0.0.1 $DOMAIN" >> /etc/hosts
+fi
+
 echo
 echo "======================================"
 echo "Certificate installed:"

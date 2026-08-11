@@ -8,7 +8,12 @@
 # All locally relevant modes of transport in the 'modes: transitModes' section;
 # If needed, any language codes and names in the 'language' section.
 api:
-  host: https://tre.hopto.org
+  # HOST-DEPENDENT. tre.hopto.org's cert expired 2026-08-09 and cannot be
+  # renewed (LE needs :80/:443, unreachable here since 2026-07-12), so every
+  # API call was refused before HTTP. api.transit-nav.com renews over DNS-01.
+  # This box cannot reach its own public IP, so /etc/hosts maps the name to
+  # 127.0.0.1 locally; nginx picks the right server block by SNI either way.
+  host: https://api.transit-nav.com
   # Path will be deprecated once the REST API is deprecated, which will be soon.
   # If the OTP server is hosted at /otp, then no path needs to be configured
   # path: /otp/routers/default  # Not used in OTP 2.x
