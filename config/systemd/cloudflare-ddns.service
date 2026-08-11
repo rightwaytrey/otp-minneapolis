@@ -1,0 +1,11 @@
+[Unit]
+Description=Cloudflare dynamic DNS update for the TransitNav API hostname
+Documentation=file:///home/rwt/projects/otp-minneapolis/scripts/cloudflare-ddns.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/rwt/projects/otp-minneapolis/scripts/cloudflare-ddns.sh
+StandardOutput=journal
+StandardError=journal

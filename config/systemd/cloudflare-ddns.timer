@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep the app's A record pointed at this box's public IP
+
+[Timer]
+# Every 5 minutes. The record's TTL is 120s, so a lease change costs a few
+# minutes of downtime at worst — versus a stale record, where the app simply
+# stops resolving until someone notices.
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
