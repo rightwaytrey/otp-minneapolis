@@ -52,10 +52,11 @@ fi
 echo "    zone id: $ZONE_ID"
 
 echo "==> Installing the certbot Cloudflare DNS plugin..."
-# Snap certbot refuses root-trusted plugins until told to; without this the
-# plugin installs but certbot will not load it.
-snap set certbot trust-plugin-with-root: ok
+# Install first, THEN grant trust: snap set takes key=value (not "key: value",
+# which it rejects as invalid configuration), and the trust flag is what lets
+# classic certbot actually load a root-run plugin.
 snap install certbot-dns-cloudflare 2>/dev/null || snap refresh certbot-dns-cloudflare
+snap set certbot trust-plugin-with-root=ok
 
 echo "==> Writing credentials..."
 install -d -m 700 /etc/letsencrypt
