@@ -77,6 +77,16 @@ RIDER_ACTION_WINDOW_MS = 30 * 1000         # explicit action shields aboard-swap
 # VEHICLE_MATCH_FRESH_MS, which is what stops a confirmed match from looking
 # healthy forever after its vehicle drops out of the feed.
 ABOARD_MATCH_FRESH_MS = 90 * 1000
+# Backwards-itinerary rules (8/9). A leg starting before the previous one ends
+# is never right, but clocks and rounding differ across the wire, so only call
+# it an inversion past a threshold a rider could actually see on a trip sheet.
+# The 8/9 START_GO_MODE was inverted by 692,303 ms.
+LEG_INVERSION_MS = 60 * 1000
+# An alight candidate whose bus arrival is already this far behind the moment
+# it was computed is a stale feed reading, not a prediction. 8/9's worst was
+# 578,912 ms behind on the FIRST optimize, five minutes before the rider was
+# shown anything.
+STALE_CANDIDATE_MS = 60 * 1000
 # match-vs-riding disagreement (8/2 §11): the confirmed match reported trip
 # 1:1191630 while the rider was confirmed on 1:1201789, for the whole ride. One
 # tick of disagreement is a poll landing mid-rebind; a sustained one means the
@@ -180,6 +190,9 @@ PAGE_COALESCE_MS = 15 * 1000
 #                           instruction they can act on this second
 PAGE_RANK = {
     "stop-count-collapse": 50,
+    # itinerary-backwards  every time on the trip sheet is suspect; the rider
+    #                      is reading it right now to decide what to do
+    "itinerary-backwards": 45,
     "missed-bus-while-riding": 40,
     "notification-repeat": 35,
     "aboard-swap": 30,
@@ -243,6 +256,14 @@ def fmt_hms(ms):
 
 def fmt_date(ms):
     return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+
+
+def fmt_ms_span(ms):
+    """A duration a rider reads at a glance: "11m20s", "45s"."""
+    secs = int(round(abs(ms) / 1000.0))
+    if secs < 60:
+        return "%ds" % secs
+    return "%dm%02ds" % (secs // 60, secs % 60)
 
 
 def fmt_pct(v):
@@ -472,6 +493,10 @@ class RideWatch:
         self.all_findings = []        # every finding this process has emitted
         self.ended_trips = []         # Trip objects, for replay/test inspection
         self.recently_ended = {}      # session -> end_ms (blocks re-adoption)
+        # Onboard-flow anomalies seen BEFORE a trip exists. The "I'm already on
+        # a bus" flow runs entirely pre-START_GO_MODE, so its findings have no
+        # trip to hang on yet; they are flushed when the trip opens.
+        self.pending_onboard = {}     # session -> [(t, rule, summary, ctx, push)]
         self.last_trip_summary = self._load_state()
         self.clock_ms = 0             # replay: max event t; live: wall clock
         self.last_push_ms = 0         # global rate limit (shared w/ fallback)
@@ -562,6 +587,12 @@ class RideWatch:
             # the `trip is not None` branch because the note's session id is a
             # best-effort guess by the sidecar and may not match a known trip.
             self._on_rider_note(session, t, obj, trip)
+        elif typ in ("START_ONBOARD_OPTIMIZE", "SET_ONBOARD_RESULT"):
+            # Before the `trip is not None` chain on purpose: the onboard flow
+            # runs entirely BEFORE START_GO_MODE opens a trip, so on 8/9 every
+            # one of these fell through and the daemon saw none of it.
+            self._rule_stale_alight_candidate(session, t, typ,
+                                              obj.get("payload"), trip)
         elif trip is not None:
             if kind == "console":
                 self._rule_console(trip, t, obj)
@@ -638,7 +669,114 @@ class RideWatch:
             self._thread_event(trip, t, "itinerary swap #%d -> %s" % (
                 trip.swap_seq, itinerary_one_liner(summary)))
             self._rule_aboard_swap(trip, t)
+        self._flush_pending_onboard(trip)
+        self._rule_itinerary_backwards(trip, t, summary)
         self._mark_dirty()
+
+    def _flush_pending_onboard(self, trip):
+        """Emit onboard-flow findings that had no trip to hang on yet."""
+        for (ts, rule, summary, ctx) in self.pending_onboard.pop(
+                trip.session, []):
+            self._finding(trip, ts, rule, "warn", summary, ctx)
+
+    def _rule_itinerary_backwards(self, trip, t, summary):
+        """A leg that starts before the previous one ends (8/9).
+
+        The rider photographed this: a trip sheet reading 7:29 PM above 7:18 PM,
+        because the onboard optimizer grafted an onward plan anchored to a
+        realtime arrival that was already nine minutes stale. The daemon watched
+        the whole ride and raised nothing, which is why the bug was found days
+        later in a photo instead of during the ride.
+
+        summarize_itinerary already carries each leg's startTime/endTime, so
+        this is a walk over what we have.
+        """
+        legs = (summary or {}).get("legs") or []
+        worst = None
+        for i in range(1, len(legs)):
+            prev_end = legs[i - 1].get("endTime")
+            start = legs[i].get("startTime")
+            if not isinstance(prev_end, (int, float)):
+                continue
+            if not isinstance(start, (int, float)):
+                continue
+            by = prev_end - start
+            if by > LEG_INVERSION_MS and (worst is None or by > worst[1]):
+                worst = (i, by)
+        if worst is None:
+            return
+        idx, by = worst
+        self._finding(
+            trip, t, "itinerary-backwards", "page",
+            "leg %d starts %s before leg %d ends — the trip sheet runs backwards"
+            % (idx, fmt_ms_span(by), idx - 1),
+            {"byMs": int(by), "leg": idx,
+             "legs": [{k: leg.get(k) for k in
+                       ("mode", "route", "startTime", "endTime")}
+                      for leg in legs]},
+            push_body="Trip times run backwards (leg %d starts %s before leg %d "
+                      "ends). Check the trip sheet before you act on it."
+                      % (idx, fmt_ms_span(by), idx - 1))
+
+    def _rule_stale_alight_candidate(self, session, t, typ, payload, trip):
+        """An alight option computed from an arrival already behind the clock.
+
+        The earlier half of the same 8/9 failure, and the earlier warning: the
+        FIRST optimize that evening already carried a candidate 578,912 ms
+        behind its own timestamp, five minutes before the rider was shown the
+        options that sent them to a route 22 that had gone.
+
+        WARN, not page, and once per trip. Measured against the 8/9 log it
+        fires four times — and pages are capped at 2 per trip, first come — so
+        as a page it spent the whole budget on the precursor and suppressed
+        itinerary-backwards, the one finding the rider could actually act on.
+        A stale candidate on its own asks nothing of a rider beyond "look
+        before you pick"; if it goes on to produce a backwards trip sheet, that
+        rule pages. This one belongs in the ledger and the post-ride report.
+        """
+        if typ == "START_ONBOARD_OPTIMIZE":
+            items = (payload or {}).get("candidates") or []
+        else:
+            items = payload if isinstance(payload, list) else []
+        worst = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            epoch = item.get("busArrivalEpoch")
+            if not isinstance(epoch, (int, float)):
+                continue
+            behind = t - epoch
+            if behind > STALE_CANDIDATE_MS and (worst is None
+                                                or behind > worst[1]):
+                worst = (item, behind)
+        if worst is None:
+            return
+        item, behind = worst
+        name = item.get("stopName") or item.get("stopId") or "a stop"
+        summary = ("alight candidate for %s is dated %s in the past — the feed "
+                   "reading is stale, not a prediction" % (name,
+                                                           fmt_ms_span(behind)))
+        ctx = {"behindMs": int(behind), "eventType": typ,
+               "stopId": item.get("stopId"), "stopName": item.get("stopName"),
+               "busArrivalEpoch": item.get("busArrivalEpoch"),
+               "realtime": item.get("realtime")}
+        if trip is not None:
+            # Once per trip: one bad feed reading produces an optimize per
+            # rediscovery, and four identical lines say nothing the first did.
+            if any(f["rule"] == "stale-alight-candidate"
+                   for f in trip.findings):
+                return
+            self._finding(trip, t, "stale-alight-candidate", "warn",
+                          summary, ctx)
+        else:
+            # No trip yet — the onboard flow runs before START_GO_MODE. Hold
+            # the first one for the trip that is about to open.
+            held = self.pending_onboard.setdefault(session, [])
+            if held:
+                return
+            held.append((t, "stale-alight-candidate", summary, ctx))
+            self.log.info("held onboard finding for session %s: %s"
+                          % (session, summary))
 
     def _end_trip(self, trip, t, reason):
         # Flush first: a page must not be lost because the trip ended three

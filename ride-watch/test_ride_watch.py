@@ -939,14 +939,14 @@ class TestPageRanking(RuleTestCase):
 
     def test_the_ranking_covers_every_page_rule(self):
         """A page rule with no rank would silently fall back to mid-pack."""
-        page_rules = {"stop-count-collapse", "missed-bus-while-riding",
-                      "notification-repeat", "aboard-swap", "riding-flip",
-                      "deviated-streak"}
+        page_rules = {"stop-count-collapse", "itinerary-backwards",
+                      "missed-bus-while-riding", "notification-repeat",
+                      "aboard-swap", "riding-flip", "deviated-streak"}
         self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
         self.assertEqual(
-            ["stop-count-collapse", "missed-bus-while-riding",
-             "notification-repeat", "aboard-swap", "riding-flip",
-             "deviated-streak"],
+            ["stop-count-collapse", "itinerary-backwards",
+             "missed-bus-while-riding", "notification-repeat", "aboard-swap",
+             "riding-flip", "deviated-streak"],
             sorted(ride_watch.PAGE_RANK, key=ride_watch.PAGE_RANK.get,
                    reverse=True))
 
@@ -1764,6 +1764,159 @@ class TestNotificationStormReplay(unittest.TestCase):
             self.assertNotIn("!", p["body"])
         sent = [p for p in self.watch.push_log if p.get("sent")]
         self.assertTrue(any("Ignore the buzzing" in p["body"] for p in sent))
+
+
+# The 2026-08-09 backwards itinerary: the rider photographed a trip sheet
+# reading 7:29 PM above 7:18 PM. The onboard optimizer anchored an onward plan
+# to stop 1:53313's realtime arrival, which the feed published as UPDATED with
+# delay 0 while its neighbours ran ~11 min late — 9m13.9s behind the clock.
+# The daemon watched the whole ride and raised nothing.
+LOG_0809 = os.path.join(
+    os.path.expanduser("~"), "otp-debug-logs", "debug-2026-08-10.jsonl")
+SESSION_0809 = "msmhi3j5-lnt6uw"
+
+
+def backwards_itinerary(inversion_ms):
+    """A walk -> bus -> walk trip whose bus leg starts before the walk ends."""
+    payload = transit_itinerary()
+    legs = payload["itinerary"]["legs"]
+    legs[0]["startTime"] = T0
+    legs[0]["endTime"] = T0 + 600000
+    legs[1]["startTime"] = T0 + 600000 - inversion_ms
+    legs[1]["endTime"] = T0 + 1200000
+    legs[2]["startTime"] = T0 + 1200000
+    legs[2]["endTime"] = T0 + 1500000
+    return payload
+
+
+class TestBackwardsItineraryRules(RuleTestCase):
+    """The two 8/9 rules, on synthetic streams."""
+
+    def test_a_backwards_itinerary_pages(self):
+        b = StreamBuilder().start(backwards_itinerary(680170))
+        hits = self.find(self.run_stream(b), "itinerary-backwards")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "page")
+        self.assertEqual(hits[0]["context"]["leg"], 1)
+        self.assertEqual(hits[0]["context"]["byMs"], 680170)
+
+    def test_a_forward_itinerary_is_silent(self):
+        b = StreamBuilder().start()
+        self.assertEqual(self.find(self.run_stream(b), "itinerary-backwards"), [])
+
+    def test_a_sub_threshold_overlap_is_not_an_inversion(self):
+        """Clocks and rounding differ across the wire; a rider sees neither."""
+        b = StreamBuilder().start(backwards_itinerary(1500))
+        self.assertEqual(self.find(self.run_stream(b), "itinerary-backwards"), [])
+
+    def test_a_a_mid_trip_swap_is_checked_too(self):
+        b = StreamBuilder().start().advance(60000)
+        b.start(backwards_itinerary(680170))
+        self.assertEqual(
+            len(self.find(self.run_stream(b), "itinerary-backwards")), 1)
+
+    def test_b_a_stale_alight_candidate_pages(self):
+        # The onboard flow runs BEFORE the trip exists, so this finding is held
+        # and flushed when START_GO_MODE opens the trip.
+        b = StreamBuilder()
+        b.action("START_ONBOARD_OPTIMIZE", {"candidates": [
+            {"busArrivalEpoch": T0 - 553857, "realtime": True,
+             "stopId": "1:53313", "stopName": "2nd Ave S & 7th St"}]})
+        b.advance(20000).start()
+        hits = self.find(self.run_stream(b), "stale-alight-candidate")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["context"]["stopId"], "1:53313")
+        self.assertEqual(hits[0]["context"]["behindMs"], 553857)
+        # WARN, not page: as a page it spent the 2/trip budget on the precursor
+        # and suppressed itinerary-backwards, the actionable one.
+        self.assertEqual(hits[0]["severity"], "warn")
+
+    def test_b_a_candidate_in_the_future_is_silent(self):
+        b = StreamBuilder()
+        b.action("START_ONBOARD_OPTIMIZE", {"candidates": [
+            {"busArrivalEpoch": T0 + 600000, "stopId": "1:53314"}]})
+        b.advance(20000).start()
+        self.assertEqual(
+            self.find(self.run_stream(b), "stale-alight-candidate"), [])
+
+    def test_b_the_offered_results_are_checked_as_well(self):
+        b = StreamBuilder()
+        b.action("SET_ONBOARD_RESULT", [
+            {"busArrivalEpoch": T0 - 553857, "stopId": "1:53313",
+             "stopName": "2nd Ave S & 7th St"}])
+        b.advance(20000).start()
+        self.assertEqual(
+            len(self.find(self.run_stream(b), "stale-alight-candidate")), 1)
+
+    def test_b_a_repeat_optimize_does_not_say_it_twice(self):
+        """One bad feed reading, one line — 8/9 produced four optimizes."""
+        b = StreamBuilder()
+        for _ in range(3):
+            b.action("START_ONBOARD_OPTIMIZE", {"candidates": [
+                {"busArrivalEpoch": T0 - 553857, "stopId": "1:53313"}]})
+            b.advance(5000)
+        b.start().advance(5000)
+        b.action("START_ONBOARD_OPTIMIZE", {"candidates": [
+            {"busArrivalEpoch": T0 - 553857, "stopId": "1:53313"}]})
+        self.assertEqual(
+            len(self.find(self.run_stream(b), "stale-alight-candidate")), 1)
+
+    def test_b_only_the_worst_candidate_of_a_batch_is_reported(self):
+        """One optimize is one anomaly, not five."""
+        b = StreamBuilder()
+        b.action("START_ONBOARD_OPTIMIZE", {"candidates": [
+            {"busArrivalEpoch": T0 - 100000, "stopId": "1:a"},
+            {"busArrivalEpoch": T0 - 553857, "stopId": "1:b"},
+            {"busArrivalEpoch": T0 - 200000, "stopId": "1:c"}]})
+        b.advance(20000).start()
+        hits = self.find(self.run_stream(b), "stale-alight-candidate")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["context"]["stopId"], "1:b")
+
+
+@unittest.skipUnless(os.path.exists(LOG_0809), "%s not present" % LOG_0809)
+class TestBackwardsItineraryReplay(unittest.TestCase):
+    """Replay the real 8/9 ride: would these rules have caught it?"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="ride-watch-0809-")
+        cls.watch = run_replay(LOG_0809, watch=quiet_watch(cls.tmp))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def hits(self, rule):
+        return [f for f in self.watch.all_findings
+                if f["rule"] == rule and f["session"] == SESSION_0809]
+
+    def test_the_backwards_itinerary_is_caught(self):
+        hits = self.hits("itinerary-backwards")
+        self.assertTrue(hits, "the 8/9 START_GO_MODE ran backwards and was "
+                              "not flagged")
+        # Leg 1 started 692,303 ms before leg 0 ended.
+        self.assertEqual(hits[0]["context"]["leg"], 1)
+        self.assertGreater(hits[0]["context"]["byMs"], 600000)
+
+    def test_the_stale_candidate_is_caught_before_the_rider_is_shown_it(self):
+        hits = self.hits("stale-alight-candidate")
+        self.assertTrue(hits, "every onboard optimize fell through the "
+                              "dispatch before this rule existed")
+        # The first one fires at 19:24:38, five minutes before the rider was
+        # sent to a route 22 that had already gone.
+        self.assertLess(hits[0]["tsMs"], 1786321773307)
+
+    def test_the_backwards_trip_sheet_is_what_reaches_the_rider(self):
+        # Pages are capped at 2/trip, first come. The precursor rule fires
+        # four times and would have spent the whole budget before the trip
+        # sheet ever ran backwards, which is why it warns instead.
+        paged = [p for p in self.watch.push_log if p.get("sent")]
+        self.assertTrue(paged, "the whole incident raised nothing to the rider")
+        self.assertTrue(
+            any("backwards" in p["body"] for p in paged),
+            "the rider was paged, but not about the thing they photographed: "
+            "%s" % [p["body"] for p in paged])
 
 
 if __name__ == "__main__":
