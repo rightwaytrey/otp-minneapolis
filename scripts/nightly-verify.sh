@@ -19,8 +19,22 @@ WEB_REPO=/home/rwt/projects/otprr/otp-react-redux
 APP_URL=${APP_URL:-http://localhost:9967/}
 VAULT_DIR=/home/rwt/obsidian-vault/Claude/verify-nightly
 LOG_ROOT=/home/rwt/projects/otp-minneapolis/data/nightly-verify
-PER_SCRIPT_TIMEOUT=300 # seconds
+PER_SCRIPT_TIMEOUT=300 # seconds — the default; see script_timeout() for the exceptions
 KEEP_DAYS=14
+
+# Two scripts replay a whole recorded ride at 25x and legitimately need longer
+# than the default. Both were reported TIMEOUT every night from 2026-08-01 to
+# 2026-08-16 while dying at ~92% of their replay (3311/3657 and 3322/3560) — the
+# 300s cap cut them off just short of their assertions, so the suite's two
+# longest end-to-end checks went 16 days without once completing. The cap is
+# per-script rather than raised globally so a genuinely hung script still dies
+# quickly.
+script_timeout() {
+  case "$1" in
+    verify-transit-trust | verify-onboard-loop-0802) echo 600 ;;
+    *) echo "$PER_SCRIPT_TIMEOUT" ;;
+  esac
+}
 
 DATE=$(date +%F)
 RUN_DIR="$LOG_ROOT/$DATE"
@@ -65,14 +79,15 @@ failures=""
 for script in "$WEB_REPO"/scripts/verify-*.js; do
   name=$(basename "$script" .js)
   log="$RUN_DIR/$name.log"
+  limit=$(script_timeout "$name")
   start=$(date +%s)
   if (cd "$WEB_REPO" && APP_URL="$APP_URL" OUT_DIR="$RUN_DIR" \
       PUPPETEER_EXECUTABLE_PATH=/opt/google/chrome/chrome \
-      timeout "$PER_SCRIPT_TIMEOUT" node "$script") > "$log" 2>&1; then
+      timeout "$limit" node "$script") > "$log" 2>&1; then
     status=PASS; pass=$((pass + 1))
   else
     rc=$?
-    [ "$rc" -eq 124 ] && status=TIMEOUT || status=FAIL
+    if [ "$rc" -eq 124 ]; then status="TIMEOUT (${limit}s cap)"; else status=FAIL; fi
     fail=$((fail + 1))
     failures+=$'\n'"## $name — $status"$'\n\n```\n'"$(tail -25 "$log")"$'\n```\n'
   fi
