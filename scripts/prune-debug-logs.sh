@@ -24,7 +24,15 @@ set -uo pipefail
 
 LOG_DIR=${DEBUG_LOG_DIR:-/home/rwt/otp-debug-logs}
 COMPRESS_AFTER_DAYS=${COMPRESS_AFTER_DAYS:-3}
-DELETE_AFTER_DAYS=${DELETE_AFTER_DAYS:-30}
+# 90, not 30. Compression already took the directory from 147MB to 13MB, so
+# deletion is no longer about space — it is only about bounding growth. The
+# rider reads these back weeks later when triaging a ride (the 7/13, 7/29 and
+# 8/02 post-mortems all did), and 30 days would have destroyed that material
+# before it was used. 90 days deletes nothing that exists today (the oldest
+# file is 63 days old) and still caps the directory. Tighten it here if other
+# people's location traces start landing in it — a shorter window is the right
+# answer once the logs stop being only the owner's own rides.
+DELETE_AFTER_DAYS=${DELETE_AFTER_DAYS:-90}
 
 [ -d "$LOG_DIR" ] || { echo "$(date -Is) no such dir: $LOG_DIR"; exit 0; }
 
