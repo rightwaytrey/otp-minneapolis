@@ -20,10 +20,13 @@ All served through nginx at `https://api.transit-nav.com:9966` (public,
 rate-limited) — that is the name the bundled app is built against, and the
 contract is against that name.
 
-`tre.hopto.org:9966` serves the same config and the same routes, but its
-HTTP-01 cert expired on 2026-08-09 and has not been renewed (the `:80`
-port-forward it needs is gone). Treat it as dead for client purposes:
-`api.transit-nav.com` renews over DNS-01 and is the one to use.
+`tre.hopto.org:9966` serves the same config and the same routes and is working
+again (its `:80` forward was restored 2026-08-17 and the cert renews through
+2026-11-15). Prefer `api.transit-nav.com` anyway: its HTTP-01 challenge needs
+that inbound port to keep existing, and when it went missing on 2026-07-12
+certbot failed 58 straight runs and the cert expired unnoticed on 2026-08-09,
+taking address search and trip planning down together. DNS-01 has no such
+dependency.
 
 ## Rules
 
