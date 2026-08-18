@@ -47,7 +47,7 @@ file. Read it first; everything you need is either in it or pointed at by it.
   "recentFindings": [ {tsMs, time, rule, severity, summary, context} ],
   "debugLogPath",      // ~/otp-debug-logs/debug-<UTC date>.jsonl
   "statusPath",        // the daemon's current-ride.md
-  "goModeSource": {"path": ".../otprr/otp-react-redux", "branch": "feature/go-mode"}
+  "goModeSource": {"path": ".../otprr/otp-react-redux", "branch": "main"}
 }
 ```
 

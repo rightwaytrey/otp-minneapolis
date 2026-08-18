@@ -34,7 +34,7 @@ Deeper evidence, when you need it:
 | raw telemetry, one JSON action per line | `~/otp-debug-logs/debug-<UTC date>.jsonl` (filter on the digest's `session`) |
 | findings, append-only | `~/otp-debug-logs/ride-watch/<date>-<session>.findings.jsonl` |
 | live status the daemon keeps for anyone | `~/otp-debug-logs/ride-watch/current-ride.md` |
-| Go Mode source (READ ONLY, see below) | `~/projects/otprr/otp-react-redux`, branch `feature/go-mode` |
+| Go Mode source (READ ONLY, see below) | `~/projects/otprr/otp-react-redux`, branch `main` |
 | how the rules work | `~/projects/otp-minneapolis/ride-watch/README.md` |
 
 The daemon's rule engine and its Pushover pages are a separate, deterministic
