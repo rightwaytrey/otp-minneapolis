@@ -1027,6 +1027,44 @@ class TestSurfaces(RuleTestCase):
         self.assertIn("1:100", text)
         self.assertIn("4 stops left", text)
 
+    def test_each_trip_also_gets_a_status_file_of_its_own(self):
+        """The combined file is the operator's view; a rider must not read it.
+
+        current-ride.md describes every trip on the server at once, so handing
+        it to a rider's /ride console would show them somebody else's live
+        position. The per-session file is what the console reads once it can
+        say whose it is.
+        """
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(stops=4, prog=42.0)
+        watch = self.run_stream(b, finalize=False)
+        watch.write_status(force=True)
+
+        sessions = list(watch.trips.keys())
+        self.assertEqual(len(sessions), 1)
+        own = read_text(os.path.join(self.tmp, "%s.current-ride.md" % sessions[0]))
+        self.assertIn("Active trip", own)
+        self.assertIn("42%", own)
+        # It opens like a document, not like a fragment.
+        self.assertTrue(own.startswith("# Ride watch"), own[:40])
+
+    def test_one_riders_status_file_never_mentions_another_trip(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(stops=4, prog=42.0)
+        watch = self.run_stream(b, finalize=False)
+        # A second rider appears on the same server.
+        other = ride_watch.Trip("sess-someone-else", watch.now_ms(), None)
+        watch.trips["sess-someone-else"] = other
+        watch.write_status(force=True)
+
+        mine = [s for s in watch.trips if s != "sess-someone-else"][0]
+        own = read_text(os.path.join(self.tmp, "%s.current-ride.md" % mine))
+        self.assertNotIn("sess-someone-else", own)
+        # The combined file still carries both, for the operator.
+        combined = read_text(os.path.join(self.tmp, "current-ride.md"))
+        self.assertIn("sess-someone-else", combined)
+        self.assertIn(mine, combined)
+
     def test_findings_are_appended_as_jsonl(self):
         b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
         b.advance(1000).progress(stops=1, prog=21.0)

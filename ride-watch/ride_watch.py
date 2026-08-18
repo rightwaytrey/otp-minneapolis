@@ -1994,19 +1994,22 @@ class RideWatch:
                         s.get("reason")))
             else:
                 lines.append("No active trip. Last: none recorded yet.")
+        # Every per-session file opens with the same header as the combined one.
+        header = lines[:3]
         # list(): the tailer may be starting or ending a trip while this runs.
         for trip in list(self.trips.values()):
             now = self.now_ms()
-            lines.append("## Active trip — session %s%s" % (
+            section = []
+            section.append("## Active trip — session %s%s" % (
                 trip.session, " (adopted mid-stream)" if trip.adopted else ""))
-            lines.append("")
-            lines.extend(self._trip_state_lines(trip, now))
-            lines.append("")
+            section.append("")
+            section.extend(self._trip_state_lines(trip, now))
+            section.append("")
             # The rider's own words go above the machine findings: when both
             # exist, the note is the one that says what actually went wrong.
             if trip.notes:
-                lines.append("### Rider notes (%d, newest first)" % len(trip.notes))
-                lines.append("")
+                section.append("### Rider notes (%d, newest first)" % len(trip.notes))
+                section.append("")
                 for note in reversed(trip.notes[-20:]):
                     c = note["context"]
                     where = "leg %s" % c.get("legIndex")
@@ -2016,26 +2019,46 @@ class RideWatch:
                         where += ", %s stops left" % c["stopsRemaining"]
                     if c.get("status"):
                         where += ", %s" % c["status"]
-                    lines.append("- %s — %s  _(%s)_" % (
+                    section.append("- %s — %s  _(%s)_" % (
                         note["time"], note["text"], where))
-                lines.append("")
+                section.append("")
             if trip.findings:
-                lines.append("### Findings (%d, newest first)" % len(trip.findings))
-                lines.append("")
+                section.append("### Findings (%d, newest first)" % len(trip.findings))
+                section.append("")
                 for fnd in reversed(trip.findings[-30:]):
-                    lines.append("- %s [%s] %s: %s" % (
+                    section.append("- %s [%s] %s: %s" % (
                         fnd["time"], fnd["severity"], fnd["rule"], fnd["summary"]))
             else:
-                lines.append("### Findings: none")
-            lines.append("")
-        path = os.path.join(self.watch_dir, "current-ride.md")
+                section.append("### Findings: none")
+            section.append("")
+            lines.extend(section)
+            # ...and the same section on its own, named for the rider it
+            # belongs to. The combined file above is the operator's view and
+            # describes every trip on the server at once; handing that to a
+            # rider's console would show them somebody else's live position.
+            # /api/ride-status reads this one when it knows whose console is
+            # asking. See _session_for_device in preferences_api.py.
+            self._write_atomic(
+                os.path.join(self.watch_dir, "%s.current-ride.md" % trip.session),
+                "\n".join(header + section) + "\n")
+
+        self._write_atomic(
+            os.path.join(self.watch_dir, "current-ride.md"),
+            "\n".join(lines) + "\n")
+
+    def _write_atomic(self, path, text):
+        """Write via a temp file and rename, so a reader never sees a half file.
+
+        The /ride console polls these every few seconds; os.replace is what
+        keeps it from catching one mid-write.
+        """
         try:
             tmp = path + ".tmp"
             with open(tmp, "w") as f:
-                f.write("\n".join(lines) + "\n")
+                f.write(text)
             os.replace(tmp, path)
         except OSError as exc:
-            self.log.error("status write failed: %r" % exc)
+            self.log.error("status write failed (%s): %r" % (path, exc))
 
     # -- finalize (replay EOF / shutdown) -----------------------------------
 

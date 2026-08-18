@@ -276,7 +276,35 @@
   var NOTE_URL = "/api/ride-note";
   var POLL_MS = 5000;
   var QUEUE_KEY = "rideConsole.queue.v1";
+  var DEVICE_KEY = "rideConsole.deviceId.v1";
   var MAX_NOTE_CHARS = 500;
+
+  // Which rider is this page? The app mints a durable device id and sends it
+  // with its telemetry; opening this console from the app carries the same id
+  // here in ?device=, and we keep it so the bookmark still knows next time.
+  //
+  // Without it the server can only answer with whoever wrote last — which,
+  // with two riders out, is the other one. It refuses rather than guess, so a
+  // console that has never been opened from the app shows an explanation
+  // instead of somebody else's ride.
+  var deviceId = (function () {
+    try {
+      var fromUrl = new URLSearchParams(window.location.search).get("device");
+      if (fromUrl) {
+        window.localStorage.setItem(DEVICE_KEY, fromUrl);
+        return fromUrl;
+      }
+      return window.localStorage.getItem(DEVICE_KEY) || "";
+    } catch (e) {
+      return "";
+    }
+  })();
+
+  function statusUrl() {
+    return deviceId
+      ? STATUS_URL + "?device=" + encodeURIComponent(deviceId)
+      : STATUS_URL;
+  }
 
   var el = {
     scroll: document.getElementById("scroll"),
@@ -339,7 +367,11 @@
       return fetch(NOTE_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: note.text, tsMs: note.tsMs })
+        body: JSON.stringify({
+          text: note.text,
+          tsMs: note.tsMs,
+          deviceId: deviceId || undefined
+        })
       }).then(function (res) {
         if (!res.ok) throw new Error("http " + res.status);
         var rest = loadQueue();
@@ -413,9 +445,13 @@
   // --- polling -----------------------------------------------------------
 
   function poll() {
-    return fetch(STATUS_URL, { cache: "no-store" })
+    return fetch(statusUrl(), { cache: "no-store" })
       .then(function (res) {
-        if (!res.ok) throw new Error("http " + res.status);
+        // 409 is the server declining to guess whose ride this is: it carries
+        // a normal body explaining that, so render it rather than throw.
+        if (!res.ok && res.status !== 409) {
+          throw new Error("http " + res.status);
+        }
         return res.json();
       })
       .then(function (data) {
