@@ -50,9 +50,19 @@ CONTROL_EXPECT="Example Domain"
 # Relays, tried in order. Each takes a URL-encoded target and returns the body
 # verbatim. More than one because depending on a single free service to tell you
 # your app is down is its own single point of failure.
+# corsproxy.io was here and is not any more: it now answers server-side requests
+# with {"error":"Server-side requests are not allowed on your plan"}, which is a
+# 200-shaped refusal. The control check below catches that correctly (it fails
+# for example.com too, so the run is INCONCLUSIVE rather than a false alarm) but
+# a relay that can never succeed is dead weight.
+#
+# These are free services and they are flaky by nature — during one testing
+# session allorigins began returning 520 for a URL it had served correctly two
+# minutes earlier. That is exactly why there is a control URL and a two-strike
+# rule: a relay having a bad day must never read as "the app is down".
 RELAYS=(
     "https://api.allorigins.win/raw?url="
-    "https://corsproxy.io/?"
+    "https://api.codetabs.com/v1/proxy?quest="
 )
 
 # Consecutive failures before paging. One failure is a flaky relay or a dropped
