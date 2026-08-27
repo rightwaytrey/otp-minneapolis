@@ -388,9 +388,13 @@ itinerary:
   groupTransitModes: true
   # Whether to merge itineraries with the same origin, destination, and transit modes
   mergeItineraries: true
-  # When merging, only collapse itineraries that use the SAME route sequence (same
-  # routeIds), so same-route/different-departure trips fold into the soonest one
-  # (later departures shown as a clickable list), while different routes stay as
+  # When merging, collapse itineraries by the routes they RIDE — the same route
+  # sequence is one row no matter where the rider joins or leaves it. OTP will
+  # return one chain several times over, alighting a stop or two apart so only
+  # the closing bike leg differs; those are one trip to a rider, and spending a
+  # result row on each pushes genuinely different options off the bottom. The
+  # soonest departure is kept and the rest hang off it as a clickable list of
+  # start times, so nothing is lost. Different route sequences always stay as
   # separate results. Set false to fall back to stop/mode-based merging.
   mergeByRouteSignature: true
   # Whether to show the first itinerary on the map. If this is set to false, routes
