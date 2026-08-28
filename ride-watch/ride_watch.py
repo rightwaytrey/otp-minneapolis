@@ -424,6 +424,8 @@ class Trip:
         self.last_pos_ms = start_ms
         self.last_fix = None                      # (lat, lon) of the last fix
         self.gps_gap_open = False
+        self.gps_gap_started_ms = None            # last_pos_ms when the gap opened
+        self.arrived_ms = None                    # SET_ARRIVED; the trip is over
         self.notification_times = collections.defaultdict(collections.deque)
         self.notification_repeat_last = {}        # key -> ms of last finding
         self.motion_anchor = None                 # where progress was last real
@@ -598,8 +600,30 @@ class RideWatch:
                 self._rule_console(trip, t, obj)
             elif typ == "UPDATE_POSITION":
                 trip.last_pos_ms = max(trip.last_pos_ms, t)
-                trip.gps_gap_open = False
+                # Only a fix that actually closes the gap closes the gap. A
+                # phone coming back onto the network replays its buffered
+                # fixes, each stamped with its own OLD time, and every one of
+                # them used to clear this flag — so check_timers re-opened the
+                # gap on the very next event and fired again. On 2026-08-27
+                # that produced sixteen gps-gap findings inside one second,
+                # with the reported gap shrinking 108s -> 60s as the backlog
+                # drained. One unbroken gap should be one finding.
+                if self.now_ms() - t < GPS_GAP_MS:
+                    trip.gps_gap_open = False
+                    trip.gps_gap_started_ms = None
                 self._on_position(trip, obj.get("payload") or {})
+            elif typ == "SET_ARRIVED":
+                # The client now latches arrival (otp-react-redux
+                # progress-calculator hasArrivedAtDestination) and dispatches
+                # this. Before that latch existed the daemon had no notion of a
+                # trip ENDING at all — only STOP_GO_MODE, a 15-minute silence,
+                # or replay EOF — which is why on 2026-08-27 it went on judging
+                # a finished trip for four and a half hours and produced ~25 of
+                # that ride's 42 findings about a rider sitting at their desk
+                # and then driving home.
+                if trip.arrived_ms is None:
+                    trip.arrived_ms = t
+                    self._thread_event(trip, t, "arrived at destination")
             elif typ == "UPDATE_PROGRESS":
                 self._on_progress(trip, t, obj.get("payload") or {})
             elif typ == "UPDATE_ROUTE_MATCH":
@@ -836,9 +860,17 @@ class RideWatch:
                 self._end_trip(trip, trip.last_event_ms, "timeout")
                 continue
             self._flush_pages(trip, now)
-            # gps-gap: no position fix for >60s mid-trip
-            if not trip.gps_gap_open and now - trip.last_pos_ms > GPS_GAP_MS:
+            # gps-gap: no position fix for >60s mid-trip.
+            # Not after arrival: a phone idle in the rider's pocket at the
+            # destination is not a diagnostic event. On 2026-08-27 the "mid-trip"
+            # wording was also simply untrue — the rider had been at 4Front for
+            # two minutes when the first one fired.
+            if (trip.arrived_ms is None
+                    and not trip.gps_gap_open
+                    and now - trip.last_pos_ms > GPS_GAP_MS
+                    and trip.gps_gap_started_ms != trip.last_pos_ms):
                 trip.gps_gap_open = True
+                trip.gps_gap_started_ms = trip.last_pos_ms
                 gap_s = (now - trip.last_pos_ms) // 1000
                 self._finding(trip, now, "gps-gap", "warn",
                               "no GPS fix for %ds mid-trip" % gap_s,
@@ -996,6 +1028,11 @@ class RideWatch:
         trip.motion_anchor = fresh
 
     def _check_deviated_streak(self, trip, now):
+        # A rider who has arrived and walked off across the campus is not deviating
+        # from a route they have finished. On 2026-08-27 this fired nine times
+        # between 15:11 and 17:11 on a trip that ended at 15:10.
+        if trip.arrived_ms is not None:
+            return
         if trip.deviated_since_ms is None or trip.deviated_fired:
             return
         dur = now - trip.deviated_since_ms
@@ -1027,6 +1064,11 @@ class RideWatch:
         who has been abandoned by a frozen tracker is not helped by a buzz.
         Re-arms on a cooldown so a long lunch is one finding, not twenty.
         """
+        # Standing still at your destination is not a stalled trip. On 2026-08-27
+        # this counted up 15/15/30/45/60/75 minutes stationary at 4Front, all of
+        # it after the rider had arrived.
+        if trip.arrived_ms is not None:
+            return
         anchor = trip.stall_anchor
         if anchor is None or trip.last_fix is None:
             return

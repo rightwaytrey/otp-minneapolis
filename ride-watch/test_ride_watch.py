@@ -549,6 +549,69 @@ class TestRules(RuleTestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "warn")
 
+    def test_g_gps_gap_is_one_finding_per_gap_not_per_replayed_fix(self):
+        # 2026-08-27: the phone came back onto the network and replayed its
+        # buffered fixes. Each was NEWER than the last one the daemon had seen
+        # (so last_pos_ms advanced) but still far behind the clock, and each
+        # used to clear gps_gap_open — so check_timers re-opened the gap on the
+        # very next event. Sixteen findings inside one second, the reported gap
+        # shrinking 108s -> 60s as the backlog drained.
+        b = StreamBuilder().start().advance(1000).position()
+        first_fix_t = b.t
+        # The clock runs on while no fix arrives.
+        b.advance(ride_watch.GPS_GAP_MS + 60000).progress()
+        # Now the backlog lands: fixes stamped between the last one and now,
+        # each newer than the last but all still stale against the clock.
+        for i in range(6):
+            b.action("UPDATE_POSITION", {
+                "coords": {"latitude": b.LAT, "longitude": b.LON,
+                           "accuracy": 5.0},
+                "timestamp": first_fix_t + (i + 1) * 5000},
+                t=first_fix_t + (i + 1) * 5000)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "gps-gap")), 1)
+
+    def test_g_gps_gap_reopens_for_a_genuinely_new_gap(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(ride_watch.GPS_GAP_MS + 15000).progress()
+        b.advance(1000).position()           # fresh fix: gap closes
+        b.advance(ride_watch.GPS_GAP_MS + 15000).progress()   # and a new one
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "gps-gap")), 2)
+
+    def test_g_no_gps_gap_after_arrival(self):
+        # A phone idle in the rider's pocket at the destination is not a
+        # diagnostic event. On 2026-08-27 the first of these fired two minutes
+        # after the rider reached 4Front, and the wording said "mid-trip".
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).action("SET_ARRIVED", 1)
+        b.advance(ride_watch.GPS_GAP_MS + 15000).progress()
+        watch = self.run_stream(b)
+        self.assertNotIn("gps-gap", self.rules(watch))
+
+    def test_g_no_deviated_streak_or_stall_after_arrival(self):
+        # ~25 of that ride's 42 findings were these two rules judging a trip
+        # that had ended: nine deviated-streaks 15:11-17:11 and stalled-progress
+        # counting up to 75 minutes, all after arrival at 15:10.
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).action("SET_ARRIVED", 1)
+        b.advance(1000).progress(status="deviated")
+        b.advance(ride_watch.DEVIATED_STREAK_MS + 5000).progress(
+            status="deviated")
+        b.advance(ride_watch.STALL_MS + 5000).progress(status="deviated")
+        watch = self.run_stream(b)
+        rules = self.rules(watch)
+        self.assertNotIn("deviated-streak", rules)
+        self.assertNotIn("stalled-progress", rules)
+
+    def test_g_deviated_streak_still_fires_before_arrival(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(status="deviated")
+        b.advance(ride_watch.DEVIATED_STREAK_MS + 5000).progress(
+            status="deviated")
+        watch = self.run_stream(b)
+        self.assertIn("deviated-streak", self.rules(watch))
+
     def test_g_no_gap_while_fixes_keep_arriving(self):
         b = StreamBuilder().start()
         for i in range(20):
