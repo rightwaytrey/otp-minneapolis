@@ -15,7 +15,7 @@
 #   3. Back up gtfs.zip / mvta-gtfs.zip / graph.obj, then swap the feeds in
 #   4. Sync config/*.json into data/
 #   5. Rebuild the graph (java --build --save) with the locally built shaded JAR
-#   6. docker restart otp-minneapolis
+#   6. Ship graph.obj to the serving box and restart it (see REMOTE_HOST)
 #   7. Verify the backend's serviceTimeRange covers today
 #   8. Prune old backups
 #
@@ -34,6 +34,18 @@ GTFS_URL="https://svc.metrotransit.org/mtgtfs/gtfs.zip"
 MVTA_GTFS_URL="https://srv.mvta.com/InfoPoint/gtfs-zip.ashx"
 CONTAINER="otp-minneapolis"
 OTP_URL="http://127.0.0.1:8090/otp/gtfs/v1"
+# --- Remote serving box (added 2026-08-25 for the Linode migration) --------
+# The graph is still BUILT here -- it needs -Xmx4G, which does not fit the 4 GB
+# server even with OTP stopped -- but it is SERVED there. So step 6 ships the
+# 460 MB graph.obj over Tailscale and restarts the remote container instead of
+# the local one. Set REMOTE_HOST empty to go back to purely local behaviour.
+#
+# Only graph.obj is pushed. router-config.json is deliberately NOT synced: the
+# server carries a lower accessEgress.maxStopCount (it has 2 vCPUs), and copying
+# this box's config over it would silently make every trip plan ~3x slower.
+REMOTE_HOST="${REMOTE_HOST:-rwt@100.126.171.72}"
+REMOTE_DATA="${REMOTE_DATA:-/home/rwt/projects/otp-minneapolis/data}"
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o BatchMode=yes)
 KEEP_BACKUPS=3
 TS="$(date +%Y%m%d-%H%M%S)"
 
@@ -135,15 +147,35 @@ log "Rebuilding OTP graph (java -Xmx4G --build --save) ... this takes a few minu
 java -Xmx4G -jar "$JAR" --build --save "$DATA_DIR"
 log "Graph rebuilt: $(du -h "$DATA_DIR/graph.obj" | cut -f1)"
 
-# 6. Restart the container so it loads the new graph
-log "Restarting container $CONTAINER ..."
-docker restart "$CONTAINER"
+# 6. Publish the new graph and restart whatever is serving it.
+if [ -n "$REMOTE_HOST" ]; then
+  log "Shipping graph.obj to $REMOTE_HOST ..."
+  if ! rsync -az --timeout=600 -e "ssh ${SSH_OPTS[*]}" \
+        "$DATA_DIR/graph.obj" "$REMOTE_HOST:$REMOTE_DATA/graph.obj"; then
+    log "ERROR: graph rsync to $REMOTE_HOST failed. The server keeps serving its"
+    log "       PREVIOUS graph, which is stale but working. Not fatal; will retry"
+    log "       on the next feed change. Investigate the tailnet path."
+    exit 1
+  fi
+  log "Restarting remote container $CONTAINER ..."
+  ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "docker restart $CONTAINER" >/dev/null || {
+    log "ERROR: remote restart failed; the new graph is on disk but not loaded."; exit 1; }
+else
+  log "Restarting local container $CONTAINER ..."
+  docker restart "$CONTAINER"
+fi
 
 # 7. Wait for OTP to come back, then verify the loaded service range covers today
 log "Waiting for OTP backend to come up ..."
 up=0
 for i in $(seq 1 60); do
-  if curl -fsS -m 3 -o /dev/null "http://127.0.0.1:8090/otp/" 2>/dev/null; then up=1; break; fi
+  if [ -n "$REMOTE_HOST" ]; then
+    # OTP binds loopback on the server, so probe it from there rather than
+    # exposing the port on the tailnet just for this check.
+    ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" 'curl -fsS -m 3 -o /dev/null http://127.0.0.1:8090/otp/' 2>/dev/null && { up=1; break; }
+  else
+    curl -fsS -m 3 -o /dev/null "http://127.0.0.1:8090/otp/" 2>/dev/null && { up=1; break; }
+  fi
   sleep 5
 done
 if [ "$up" != "1" ]; then
@@ -151,8 +183,12 @@ if [ "$up" != "1" ]; then
   exit 1
 fi
 
-RANGE_JSON="$(curl -fsS -m 10 -X POST "$OTP_URL" -H 'Content-Type: application/json' \
-  -d '{"query":"{serviceTimeRange{start end}}"}' || true)"
+if [ -n "$REMOTE_HOST" ]; then
+  RANGE_JSON="$(ssh "${SSH_OPTS[@]}" "$REMOTE_HOST" "curl -fsS -m 10 -X POST $OTP_URL -H 'Content-Type: application/json' -d '{\"query\":\"{serviceTimeRange{start end}}\"}'" 2>/dev/null || true)"
+else
+  RANGE_JSON="$(curl -fsS -m 10 -X POST "$OTP_URL" -H 'Content-Type: application/json' \
+    -d '{"query":"{serviceTimeRange{start end}}"}' || true)"
+fi
 log "serviceTimeRange response: $RANGE_JSON"
 START_TS="$(echo "$RANGE_JSON" | grep -o '"start":[0-9]*' | grep -o '[0-9]*' || true)"
 END_TS="$(echo "$RANGE_JSON" | grep -o '"end":[0-9]*' | grep -o '[0-9]*' || true)"
