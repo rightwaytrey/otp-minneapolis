@@ -227,7 +227,7 @@ geocoder:
 # Use this mode config for the enhanced Transit+ config
 modes:
   ### Optional number of itineraries to return by default - Defaults to 3.
-  numItineraries: 10
+  numItineraries: 40
   # Definition for the mode buttons to display in trip form
   modeButtons:
     - iconName: bus
