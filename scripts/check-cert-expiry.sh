@@ -25,14 +25,16 @@ PUSHOVER_CREDS="${RIDE_WATCH_PUSHOVER_CREDS:-$HOME/.config/pushover/credentials}
 # broke: api.* renews over DNS-01 (Cloudflare API), the tailnet name via
 # tailscale cert.
 #
-# tre.hopto.org is deliberately NOT here. Its cert expired 2026-08-09 and
-# cannot be renewed while :80/:443 are unreachable, so watching it would page
-# every single day about a known, accepted, unfixable state — and a monitor
-# that always fires is one you stop reading, which is precisely how the
-# original 58 failures went unnoticed. Add it back if the port ever opens.
+# tre.hopto.org was excluded while its cert was unrenewable: inbound :80 vanished
+# 2026-07-12, certbot failed 58 straight runs, and the cert expired 2026-08-09.
+# The port-80 forward was restored 2026-08-17 and the cert renewed through
+# 2026-11-15, so it is back under watch. It matters most of the three — it fronts
+# Guacamole, and the vhost sets HSTS (max-age=31536000), so an expiry there is a
+# hard lockout with no click-through, not a warning the user can dismiss.
 ENDPOINTS=(
     "api.transit-nav.com:9966"
     "rwtpc4.tail9d6464.ts.net:9966"
+    "tre.hopto.org:443"
 )
 
 WARN_DAYS=21    # certbot renews at 30 days out; 21 means it has already missed twice
