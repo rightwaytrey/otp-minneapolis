@@ -66,3 +66,10 @@ pelias/.env
 # Keep data directory structure
 !data/.gitkeep
 !data/README.md
+
+# deployment/ — Linode migration. These hold live secrets (Cloudflare token,
+# Stadia key, Tailscale auth key) and per-instance facts. The nginx templates
+# in deployment/nginx/ are safe: they carry __PLACEHOLDER__ tokens that
+# deploy-app.sh substitutes at install time.
+deployment/.env
+deployment/server-info.txt
