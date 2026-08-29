@@ -13,6 +13,7 @@ Three layers:
 Nothing here spawns a process, touches tmux, or reaches the network.
 """
 
+import glob
 import json
 import os
 import re
@@ -26,21 +27,36 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ride_watch  # noqa: E402
 from ride_watch import (  # noqa: E402
-    Log, RideWatch, read_pushover_creds, ride_thread_sessions, run_replay)
+    Log, RideWatch, Trip, read_pushover_creds, ride_thread_sessions,
+    run_replay)
 
 
 def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
                 thread_enabled=None):
-    """A watcher whose daemon log does not spam the test runner."""
+    """A watcher whose daemon log does not spam the test runner.
+
+    report_dir is pinned under the temp dir: _report_path stats the vault to
+    pick a non-colliding name, and a test must neither read the rider's real
+    notes nor hand back a path pointing into them.
+    """
     log = Log(os.path.join(watch_dir, "daemon.log"), echo=False)
+    reports = os.path.join(watch_dir, "reports")
+    os.makedirs(reports, exist_ok=True)
     return RideWatch(dry_run=True, replay=replay, watch_dir=watch_dir, log=log,
                      spawn_thread=spawn_thread, push_line=push_line,
-                     thread_enabled=thread_enabled)
+                     thread_enabled=thread_enabled, report_dir=reports)
 
 
 def read_text(path):
     with open(path) as f:
         return f.read()
+
+
+def report_requests(watch_dir):
+    """Every request file in the dir. The name carries the ride's start time
+    (one file per ride, not per session), so tests match on the session stem."""
+    return sorted(glob.glob(os.path.join(
+        watch_dir, "report-request-%s-*.json" % SESSION)))
 
 REAL_LOG = os.path.join(
     os.path.expanduser("~"), "otp-debug-logs", "debug-2026-07-29.jsonl")
@@ -1146,13 +1162,50 @@ class TestSurfaces(RuleTestCase):
         b.advance(1000).progress(stops=1, prog=21.0)
         b.advance(1000).stop()
         watch = self.run_stream(b, finalize=False)
-        path = os.path.join(self.tmp, "report-request-%s.json" % SESSION)
-        self.assertTrue(os.path.exists(path))
-        req = json.loads(read_text(path))
+        paths = report_requests(self.tmp)
+        self.assertEqual(len(paths), 1)
+        req = json.loads(read_text(paths[0]))
         for key in ("session", "date", "startMs", "endMs", "findingsPath",
-                    "itinerarySummary"):
+                    "reportPath", "findingsFrom", "itinerarySummary"):
             self.assertIn(key, req)
         self.assertEqual(req["session"], SESSION)
+        self.assertEqual(req["findingsFrom"], req["startMs"])
+
+    def test_two_rides_on_one_session_do_not_share_a_report_path(self):
+        """The phone keeps one session id for as long as the app stays loaded.
+
+        Both 2026-08-27 and 2026-08-28 ran two trips under one id; the wrap-up
+        path was derived from that id alone, so ride 2 resolved to the file
+        ride 1's report was already in. The daemon now hands the thread a
+        non-colliding name instead of hoping it notices.
+        """
+        watch = quiet_watch(self.tmp)
+        session = "mtdh67f3-0z5p24"
+        first = Trip(session, 1787953260021, None)     # 16:41
+        second = Trip(session, 1787968604000, None)    # 20:56, same session
+
+        p1 = watch._report_path(first)
+        self.assertTrue(p1.endswith("-0z5p24.md"), p1)
+        # Nothing on disk yet, so both rides want the same name.
+        self.assertEqual(watch._report_path(second), p1)
+
+        # Once ride 1's report exists, ride 2 is handed the next free name.
+        with open(p1, "w") as f:
+            f.write("# ride 1\n")
+        p2 = watch._report_path(second)
+        self.assertTrue(p2.endswith("-0z5p24-ride2.md"), p2)
+        self.assertNotEqual(p1, p2)
+
+        with open(p2, "w") as f:
+            f.write("# ride 2\n")
+        self.assertTrue(watch._report_path(second).endswith("-ride3.md"))
+        # ride 1's report is untouched.
+        self.assertEqual(read_text(p1), "# ride 1\n")
+
+        # The request files are per-ride too, so ride 2 cannot destroy ride 1's
+        # inputs before anyone has read them.
+        self.assertNotEqual(watch._report_request_path(first),
+                            watch._report_request_path(second))
 
     def test_clean_ride_requests_no_report(self):
         b = StreamBuilder().start()
@@ -1161,8 +1214,7 @@ class TestSurfaces(RuleTestCase):
         b.advance(1000).stop()
         watch = self.run_stream(b, finalize=False)
         self.assertEqual(watch.all_findings, [])
-        self.assertFalse(os.path.exists(
-            os.path.join(self.tmp, "report-request-%s.json" % SESSION)))
+        self.assertEqual(report_requests(self.tmp), [])
         watch.write_status(force=True)
         self.assertIn("clean ride",
                       read_text(os.path.join(self.tmp, "current-ride.md")))
@@ -1264,8 +1316,7 @@ class TestRiderNotes(RuleTestCase):
         b.advance(1000).note("app said 1 stop left, it was 6")
         b.advance(1000).stop()
         watch = self.run_stream(b, finalize=False)
-        req = json.loads(read_text(
-            os.path.join(self.tmp, "report-request-%s.json" % SESSION)))
+        req = json.loads(read_text(report_requests(self.tmp)[0]))
         self.assertEqual(req["notesCount"], 1)
         self.assertEqual(req["riderNotes"][0]["text"],
                          "app said 1 stop left, it was 6")
@@ -1475,7 +1526,7 @@ class TestRideThread(RuleTestCase):
         end = thread.of_kind("end")
         self.assertEqual(len(end), 1)
         self.assertIn("1 finding(s)", end[0]["line"])
-        self.assertIn("report-request-%s.json" % SESSION, end[0]["line"])
+        self.assertIn("report-request-%s-" % SESSION, end[0]["line"])
 
     def test_a_clean_ride_ends_without_a_request_file(self):
         b = StreamBuilder().start().advance(1000).progress(stops=5)

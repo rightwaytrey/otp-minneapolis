@@ -95,14 +95,18 @@ safety layer. It does not need you and you must not duplicate it.
 
 ## On the trip-end ping
 
-The daemon has written `~/otp-debug-logs/ride-watch/report-request-<session>.json`
-(session, date, startMs/endMs, findingsPath, itinerarySummary, findingsCount,
-notesCount, riderNotes, pagesSent, endReason). Read it, then do the wrap-up
+The daemon has written `~/otp-debug-logs/ride-watch/report-request-<session>-<HHMM>.json`
+(session, date, startMs/endMs, findingsPath, **reportPath**, **findingsFrom**,
+itinerarySummary, findingsCount, notesCount, riderNotes, pagesSent, endReason).
+The trip-end ping gives you its exact path. Read it, then do the wrap-up
 yourself — no other agent is coming:
 
-1. **Write the report** to
-   `~/obsidian-vault/Claude/ride-watch/<date>-<session-short>.md`
-   (`<session-short>` = the part after the last `-` in the session id). Triage
+1. **Write the report** to the request's `reportPath`, verbatim. Do not derive
+   the path yourself and do not write over a file that is already there: the
+   phone keeps one session id across every trip it takes, so an evening's
+   second ride shares a session with the first, and `reportPath` is how the
+   daemon hands you a name that will not overwrite the earlier ride's report
+   (it appends `-ride2`, `-ride3`, … when it must). Triage
    every finding and every rider note as **real-bug**, **app-behaved-correctly**,
    **watcher-false-positive**, or **no-rule-covers-this**, each with the
    telemetry that decides it — timestamps and values, not adjectives. Correlate
@@ -110,12 +114,21 @@ yourself — no other agent is coming:
    entry. `ride-watch/report-prompt.md` is the long-form brief for this and is
    still worth reading if the ride was complicated.
 
+   `findingsPath` is a per-day, per-session ledger and may hold an earlier
+   ride's findings as well as yours. **Only records with `tsMs >= findingsFrom`
+   belong to this ride** — triage those and leave the rest alone; they were
+   written up when that ride ended. `findingsCount` counts only yours, so if it
+   disagrees with the line count of the file, the timestamp filter is right.
+
    `notesCount` counts notes that reached the telemetry stream. If the rider
    told you something in this conversation that is not in `riderNotes`, it is
    still a rider note — use it, and say in the report that it came from the
    thread. "0 recorded note(s)" never means the rider said nothing.
 2. **Build the replay fixture** so the ride can be re-run offline:
    `cd ~/projects/otprr/otp-react-redux && node lib/util/go-mode/replay/build-fixture.js --session <id> --label <short label>`.
+   Put the ride's start time in the label when the session has carried more
+   than one trip, so the second ride's fixture does not collide with the
+   first's.
    If the telemetry is somewhere other than `~/otp-debug-logs`, pass
    `--logs-dir <path>` — do **not** put `DEBUG_LOG_DIR=…` in front of the
    command, which is not on the allowlist and stops the wrap-up to ask the

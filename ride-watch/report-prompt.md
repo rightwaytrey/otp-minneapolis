@@ -3,8 +3,10 @@
      Nothing spawns `claude -p` with this any more. The wrap-up is written by
      the ride thread (ride-thread-sysprompt.md), which is pointed here for the
      long-form triage brief when a ride was complicated. The daemon still
-     writes report-request-<session>.json exactly as described below; the
-     reader changed, the contract did not. -->
+     writes the request file described below; the reader changed, the
+     contract did not. It is now named report-request-<session>-<HHMM>.json
+     (one per ride, since a session can carry several) and carries two extra
+     keys, reportPath and findingsFrom — see ride-thread-sysprompt.md. -->
 
 You are writing a post-ride diagnostic report for a transit-navigation app
 (Go Mode) after the ride-watch daemon flagged anomalies during a real trip
@@ -122,10 +124,12 @@ Quote the note verbatim. Do not paraphrase the rider.
 
 ## Output
 
-Write the report to
-`/home/rwt/obsidian-vault/Claude/ride-watch/<date>-<session-short>.md`
-where `<session-short>` is the part of the session id after the last `-`.
-Create the `ride-watch` directory if needed. Write **only** into
+Write the report to the request's `reportPath`, verbatim — do not derive it
+and do not write over a file that already exists. It is
+`/home/rwt/obsidian-vault/Claude/ride-watch/<date>-<session-short>.md` for a
+session's first ride and `…-ride2.md`, `…-ride3.md` for the ones after it,
+because one session id can carry several trips. Create the `ride-watch`
+directory if needed. Write **only** into
 `/home/rwt/obsidian-vault/Claude/` — the rest of the vault is the rider's own
 notes and is read-only.
 

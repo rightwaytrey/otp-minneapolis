@@ -145,7 +145,9 @@ Two files back all of this:
   findings newest-first. When no trip is running it names the last one and
   whether it was a clean ride.
 - `~/otp-debug-logs/ride-watch/<date>-<session>.findings.jsonl` — raw findings,
-  append-only, each with its final paging verdict.
+  append-only, each with its final paging verdict. One file per session per
+  day, so a session that carried two rides has both rides' findings in it —
+  split them on the ride's start time, not the session id.
 
 ## The ride thread
 
@@ -212,8 +214,23 @@ ask what the digest already says. Hard prohibitions while the trip is live —
 the phone the rider is navigating by) and **never send a notification** (paging
 is the daemon's job).
 
-On the trip-end ping it writes the report to
-`~/obsidian-vault/Claude/ride-watch/<date>-<session-short>.md`, triaging every
+On the trip-end ping it writes the report to the `reportPath` the daemon put in
+the request file — `~/obsidian-vault/Claude/ride-watch/<date>-<session-short>.md`
+for the session's first ride, `…-ride2.md`, `…-ride3.md` for the ones after it.
+**The path is keyed on the ride, not the session.** The phone keeps one session
+id for as long as the app stays loaded, so every trip taken in an evening
+shares it; deriving the name from the id alone meant an evening's second
+wrap-up silently overwrote the first ride's report. That happened on 08-27 and
+again on 08-28 — twice under `mtdh67f3-0z5p24`, an hour apart — and only
+survived because the thread improvised a `-ride2` suffix by hand. The daemon
+picks the name now (`_report_path`): it is the only party that can see the
+earlier ride's file. The request file is per-ride for the same reason
+(`report-request-<session>-<HHMM>.json`), so ride 2 cannot destroy ride 1's
+inputs before anyone has read them.
+
+The findings ledger stays per-day-per-session and therefore holds both rides;
+the request carries `findingsFrom` (the ride's start) and the thread triages
+only records at or after it. The report triages every
 finding and note as **real-bug**, **app-behaved-correctly**,
 **watcher-false-positive** or **no-rule-covers-this** with telemetry evidence;
 builds the replay fixture; lists the fix backlog; gives the rider three lines in

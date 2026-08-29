@@ -59,6 +59,13 @@ DRY_RUN = os.environ.get("RIDE_WATCH_DRY_RUN") == "1"
 REPO_DIR = os.environ.get(
     "RIDE_WATCH_REPO", os.path.join(HOME, "projects", "otp-minneapolis")
 )
+# Where the ride thread writes its wrap-up. The daemon never writes here; it
+# only computes the path, because only the daemon knows how many rides this
+# session has already taken (see _report_path).
+REPORT_DIR = os.environ.get(
+    "RIDE_REPORT_DIR",
+    os.path.join(HOME, "obsidian-vault", "Claude", "ride-watch"),
+)
 
 # Rule thresholds (ms unless noted)
 STARTUP_LOOKBACK_MS = 5 * 60 * 1000        # scan back this far at startup
@@ -485,10 +492,11 @@ class Trip:
 class RideWatch:
     def __init__(self, dry_run=DRY_RUN, replay=False, watch_dir=WATCH_DIR,
                  log=None, spawn_thread=None, push_line=None,
-                 thread_enabled=None):
+                 thread_enabled=None, report_dir=REPORT_DIR):
         self.dry_run = dry_run
         self.replay = replay
         self.watch_dir = watch_dir
+        self.report_dir = report_dir
         os.makedirs(watch_dir, exist_ok=True)
         self.log = log or Log(os.path.join(watch_dir, "daemon.log"))
         self.trips = {}               # session -> Trip (active)
@@ -1611,6 +1619,48 @@ class RideWatch:
     # request file is unchanged — it is now an input to a conversation instead
     # of to a headless `claude -p`.
 
+    def _ride_slug(self, trip):
+        """`<date>-<session-short>`, the stem every wrap-up artifact hangs off."""
+        return "%s-%s" % (fmt_date(trip.start_ms),
+                          trip.session.rsplit("-", 1)[-1])
+
+    def _report_path(self, trip):
+        """Vault path for this ride's report — keyed on the ride, not the session.
+
+        The phone keeps one session id for as long as the app stays loaded, so
+        every trip taken in an evening shares it. The wrap-up path used to be
+        derived from that id alone, which meant ride 2 resolved to the file
+        ride 1's report was already in and overwrote it. On 2026-08-28 the
+        rider took two Orange Line trips on session mtdh67f3-0z5p24 an hour
+        apart; on 2026-08-27 the same thing happened and only survived because
+        the thread noticed the collision by hand and invented `-ride2`.
+
+        So the daemon picks the name — it is the only party that can see the
+        earlier ride's file — and the suffix is the convention that was already
+        being improvised. Existing single-ride reports keep their names.
+        """
+        base = os.path.join(self.report_dir, self._ride_slug(trip))
+        if not os.path.exists(base + ".md"):
+            return base + ".md"
+        n = 2
+        while os.path.exists("%s-ride%d.md" % (base, n)):
+            n += 1
+        return "%s-ride%d.md" % (base, n)
+
+    def _report_request_path(self, trip):
+        """One request file per ride, not per session.
+
+        Same reason as _report_path: two rides on one session id used to write
+        the same request file, so the second ride destroyed the first ride's
+        inputs before anyone had read them. The start time is the ride's only
+        stable identity; the session id stays in the name so a grep by session
+        still finds every ride the app took under it.
+        """
+        return os.path.join(
+            self.watch_dir, "report-request-%s-%s.json"
+            % (trip.session, datetime.datetime.fromtimestamp(
+                trip.start_ms / 1000).strftime("%H%M")))
+
     def _write_report_request(self, trip):
         req = {
             "session": trip.session,
@@ -1618,6 +1668,13 @@ class RideWatch:
             "startMs": trip.start_ms,
             "endMs": trip.end_ms,
             "findingsPath": self._findings_path(trip),
+            # Where to write the wrap-up. Use it verbatim: deriving a path from
+            # `session` collides with an earlier ride on the same session id.
+            "reportPath": self._report_path(trip),
+            # findingsPath is a per-DAY, per-session ledger and can hold an
+            # earlier ride's findings too. Only records at or after this
+            # timestamp belong to this ride; findingsCount counts only those.
+            "findingsFrom": trip.start_ms,
             "itinerarySummary": trip.itinerary or {"unavailable": True},
             "findingsCount": len(trip.findings),
             # The rider's notes are in findingsPath too (rule "rider-note"),
@@ -1628,7 +1685,7 @@ class RideWatch:
             "pagesSent": trip.pages_sent,
             "endReason": trip.end_reason,
         }
-        path = os.path.join(self.watch_dir, "report-request-%s.json" % trip.session)
+        path = self._report_request_path(trip)
         with open(path, "w") as f:
             json.dump(req, f, indent=2)
         self.log.info("report request written: %s" % path)
@@ -1820,8 +1877,7 @@ class RideWatch:
         L.append("- Findings: %s" % self._findings_path(trip))
         L.append("- Live status: %s"
                  % os.path.join(self.watch_dir, "current-ride.md"))
-        req = os.path.join(self.watch_dir,
-                           "report-request-%s.json" % trip.session)
+        req = self._report_request_path(trip)
         if os.path.exists(req):
             L.append("- Report request (wrap-up): %s" % req)
         L.append("")
@@ -2249,11 +2305,13 @@ def run_replay(path, watch=None, watch_dir=None):
 
     Always dry-run: replayed telemetry must never page the rider or spawn
     report agents. Output goes to a separate directory by default so a
-    replay can never clobber the live daemon's current-ride.md.
+    replay can never clobber the live daemon's current-ride.md — reportPath
+    included, so a replayed ride cannot name a real vault report either.
     """
     if watch is None:
-        watch = RideWatch(dry_run=True, replay=True,
-                          watch_dir=watch_dir or os.path.join(WATCH_DIR, "replay"))
+        wd = watch_dir or os.path.join(WATCH_DIR, "replay")
+        watch = RideWatch(dry_run=True, replay=True, watch_dir=wd,
+                          report_dir=os.path.join(wd, "reports"))
     watch.dry_run = True
     watch.replay = True
     with open(path, "rb") as f:
