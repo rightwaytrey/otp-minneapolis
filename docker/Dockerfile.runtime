@@ -1,0 +1,39 @@
+# Runtime-only OTP image — no Maven, no source tree.
+#
+# docker/Dockerfile builds OTP from the vendored OpentripPlanner/ source in a
+# multi-stage Maven build. That is right on the desktop, which builds the graph
+# and the JAR anyway. It is wrong on the 4 GB Linode: it would drag the 883 MB
+# source tree up and run a Maven build on a box sized for 3.2 GB steady state.
+#
+# The server already receives the prebuilt shaded JAR (it is in the migration
+# plan's ship list), so it only needs a JRE wrapped around it. Build context is
+# the repo root, same as the other Dockerfile:
+#
+#   docker build -f docker/Dockerfile.runtime -t docker-otp .
+#
+# Keep the image tag and container name identical to the from-source build, so
+# cron-gtfs-refresh.sh's `docker restart otp-minneapolis` keeps working.
+FROM eclipse-temurin:21-jre
+
+LABEL description="OpenTripPlanner (Minneapolis) — prebuilt JAR, runtime only"
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Built on the desktop by scripts/build.sh; shipped up by deploy-app.sh.
+COPY OpentripPlanner/otp-shaded/target/otp-shaded-*.jar /app/otp.jar
+COPY config/ /etc/otp/
+
+VOLUME /var/opentripplanner
+EXPOSE 8080
+
+# Measured peak is 1.99 GiB with a 4G cap, so 2G is the real requirement and
+# the 4G cap is what breaks a 4 GB box's budget.
+ENV JAVA_OPTS="-Xmx2G"
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8080/otp/routers/default || exit 1
+
+ENTRYPOINT java $JAVA_OPTS -jar /app/otp.jar --load /var/opentripplanner
+CMD []

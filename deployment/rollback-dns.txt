@@ -1,0 +1,9 @@
+# Written at cutover 2026-08-25T13:13:58-05:00. Restores api.transit-nav.com to the desktop.
+# TTL is 120s, so this takes effect in about two minutes.
+ZONE_ID=14932f87d307b44f92255b33c07ea2fa
+RECORD_ID=ec3759c426fd234ac56e05144c60c1de
+PREVIOUS_IP=65.128.203.6
+NEW_IP=172.238.175.38
+# source .env first for CF_TOKEN, then:
+# curl -X PATCH -H "Authorization: Bearer $CF_TOKEN" -H 'content-type: application/json' \
+#   https://api.cloudflare.com/client/v4/zones/14932f87d307b44f92255b33c07ea2fa/dns_records/ec3759c426fd234ac56e05144c60c1de -d '{"content":"65.128.203.6"}'

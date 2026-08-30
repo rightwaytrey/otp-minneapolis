@@ -1,0 +1,32 @@
+# Server-side compose: OTP only.
+#
+# Differs from docker/docker-compose.yml in three ways, each load-bearing:
+#   1. Dockerfile.runtime — the prebuilt JAR, no Maven build on a 4 GB box.
+#   2. JAVA_OPTS=-Xmx2G — measured peak is 1.99 GiB; the repo's -Xmx4G is what
+#      makes the memory budget not fit.
+#   3. No nominatim-proxy (wired to nothing), no frontend-dev (the phone runs a
+#      bundled build and nginx serves the static one), no Pelias — geocoding
+#      goes to Stadia. Those three are why 4 GB is enough.
+#
+# The graph is built on the desktop and rsynced in; this only ever --loads it.
+services:
+  otp:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.runtime
+    image: docker-otp
+    container_name: otp-minneapolis
+    ports:
+      - "127.0.0.1:8090:8080"
+    volumes:
+      - ../data:/var/opentripplanner:ro
+      - ../config:/etc/otp:ro
+    environment:
+      - JAVA_OPTS=-Xmx2G
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/otp/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
