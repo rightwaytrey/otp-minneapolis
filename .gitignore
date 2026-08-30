@@ -73,3 +73,6 @@ pelias/.env
 # deploy-app.sh substitutes at install time.
 deployment/.env
 deployment/server-info.txt
+
+# Nightly verify output: cron artifacts from scripts/nightly-verify.sh (~1.4 MB/night).
+data/nightly-verify/
