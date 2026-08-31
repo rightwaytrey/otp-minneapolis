@@ -20,7 +20,38 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TRANSITNAV="$HOME/projects/transitnav"
 
 SERVER_IP="${1:-}"
-[ -n "$SERVER_IP" ] || { echo "${RED}Usage: $0 <SERVER_IP>${NC}"; exit 1; }
+[ -n "$SERVER_IP" ] || {
+  echo "${RED}Usage: $0 <SERVER_IP> [--only step,step] [--skip step,step] [--yes-www]${NC}"
+  echo "  steps: repo graph jar web otp prefs nginx   (default: all)"
+  echo "  e.g.:  $0 1.2.3.4 --only nginx      # install the snippet, touch nothing else"
+  exit 1
+}
+shift
+
+# Step selection. This script used to be all-or-nothing, and that was a trap:
+# on 2026-08-31 a session needed only two new nginx locations and would have
+# shipped the desktop's entire /var/www build to production to get them --
+# 34 deletions and 215 changed files, including unreleased place-editor work.
+# Adding an nginx location must not be able to publish a frontend.
+ALL_STEPS="repo graph jar web otp prefs nginx"
+ONLY=""; SKIP=""; YES_WWW=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --only) ONLY="${2//,/ }"; shift 2 ;;
+    --skip) SKIP="${2//,/ }"; shift 2 ;;
+    --yes-www) YES_WWW=1; shift ;;
+    *) echo "${RED}Unknown argument: $1${NC}"; exit 1 ;;
+  esac
+done
+for s in $ONLY $SKIP; do
+  case " $ALL_STEPS " in *" $s "*) ;; *) echo "${RED}Unknown step: $s${NC}"; exit 1 ;; esac
+done
+want() {
+  [ -z "$ONLY" ] || case " $ONLY " in *" $1 "*) ;; *) return 1 ;; esac
+  case " $SKIP " in *" $1 "*) return 1 ;; esac
+  return 0
+}
+[ -n "$ONLY$SKIP" ] && echo "${YELLOW}Steps: ${ONLY:-$ALL_STEPS}${SKIP:+ (minus: $SKIP)}${NC}"
 [ -f "$SCRIPT_DIR/.env" ] || { echo "${RED}Error: .env not found${NC}"; exit 1; }
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
@@ -39,9 +70,12 @@ JAR="$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name 'otp-shaded-*.j
 [ -n "$JAR" ] || { echo "${RED}Error: OTP shaded JAR not found. Run scripts/build.sh${NC}"; exit 1; }
 [ -f "$REPO_ROOT/data/graph.obj" ] || { echo "${RED}Error: data/graph.obj not found${NC}"; exit 1; }
 
+if want repo; then
 echo "${GREEN}=== 1/7  Repo skeleton ===${NC}"
 ssh "${SSH_OPTS[@]}" "$RUSER" "mkdir -p '$RREPO'/{data,config,docker,deployment/nginx,scripts} '$RTNAV'"
+fi
 
+if want graph; then
 echo "${GREEN}=== 2/7  OTP graph + runtime config ===${NC}"
 # router-config.json is the ONLY config OTP needs at runtime — it holds just the
 # external Metro Transit and MVTA GTFS-RT updater URLs. build-config.json points
@@ -74,13 +108,17 @@ fi
 rsync -az "$RC_SRC" "$RUSER:$RREPO/data/router-config.json"
 rsync -az "$RC_SRC" "$RUSER:$RREPO/config/router-config.json"
 rsync -az "$REPO_ROOT/config/build-config.json"  "$RUSER:$RREPO/data/"
+fi
 
+if want jar; then
 echo "${GREEN}=== 3/7  OTP JAR + runtime image definition ===${NC}"
 ssh "${SSH_OPTS[@]}" "$RUSER" "mkdir -p '$RREPO/OpentripPlanner/otp-shaded/target'"
 rsync -az --info=progress2 "$JAR" "$RUSER:$RREPO/OpentripPlanner/otp-shaded/target/"
 rsync -az "$REPO_ROOT/docker/Dockerfile.runtime" "$RUSER:$RREPO/docker/"
 rsync -az "$SCRIPT_DIR/docker-compose.server.yml" "$RUSER:$RREPO/deployment/"
+fi
 
+if want web; then
 echo "${GREEN}=== 4/7  Flask sidecar + static web root ===${NC}"
 rsync -az \
   "$TRANSITNAV/preferences_api.py" "$TRANSITNAV/onboard_api.py" \
@@ -97,14 +135,43 @@ sed -e "s#^PREFS_ALLOWED_ORIGIN=.*#PREFS_ALLOWED_ORIGIN=https://$DOMAIN:$APP_POR
 # every gated request, which reads like a permissions bug rather than a missing
 # file. Root-owned on the desktop, so it is read through a container (docker is
 # passwordless here) and written straight to the server as root.
+# Seed it only when the server has none. This used to overwrite unconditionally
+# from the desktop's copy, which silently reverts any credential added on the
+# server since the last deploy.
+if ssh "${SSH_OPTS[@]}" "$RROOT" 'test -s /etc/nginx/.htpasswd'; then
+  echo "  .htpasswd already present on the server, left alone"
+else
 sudo -n docker run --rm -v /etc/nginx:/m:ro alpine:latest cat /m/.htpasswd 2>/dev/null \
   | ssh "${SSH_OPTS[@]}" "$RROOT" 'cat > /etc/nginx/.htpasswd && chmod 640 /etc/nginx/.htpasswd && chown root:www-data /etc/nginx/.htpasswd'
+fi
 ssh "${SSH_OPTS[@]}" "$RROOT" 'test -s /etc/nginx/.htpasswd' \
   || { echo "${RED}Error: .htpasswd did not transfer${NC}"; exit 1; }
 
+# PUBLISHING THE FRONTEND. /var/www/transitnav on this desktop is a build
+# output directory, not a release: whatever the last local build left there is
+# what --delete makes production match, unreleased work included. So say what
+# the mirror would do and make the destructive case opt in.
+#
+# The count comes from the real rsync in dry-run against the server's own tree,
+# because the desktop cannot otherwise know what production is currently
+# serving.
+WWW_PLAN="$(rsync -az --delete --dry-run --itemize-changes \
+  -e "ssh ${SSH_OPTS[*]}" /var/www/transitnav/ "$RUSER:/var/www/transitnav/" 2>/dev/null || true)"
+WWW_DELETES="$(printf '%s\n' "$WWW_PLAN" | grep -c '^\*deleting' || true)"
+WWW_CHANGES="$(printf '%s\n' "$WWW_PLAN" | grep -cv '^\*deleting' || true)"
+echo "  frontend mirror: ${WWW_CHANGES} new/changed, ${WWW_DELETES} deleted"
+if [ "$WWW_DELETES" -gt 0 ] && [ "$YES_WWW" -ne 1 ]; then
+  echo "${RED}Refusing to publish the frontend: ${WWW_DELETES} file(s) would be DELETED from production.${NC}"
+  echo "${YELLOW}That means the desktop build differs from what is live. Check you are shipping"
+  echo "what you think you are, then re-run with --yes-www, or --skip web to leave it alone.${NC}"
+  printf '%s\n' "$WWW_PLAN" | grep '^\*deleting' | head -10
+  exit 1
+fi
 rsync -az --delete /var/www/transitnav/ "$RUSER:/tmp/transitnav-www/"
 ssh "${SSH_OPTS[@]}" "$RROOT" "rsync -a --delete /tmp/transitnav-www/ /var/www/transitnav/ && chown -R $APP_USER:www-data /var/www/transitnav && rm -rf /tmp/transitnav-www"
+fi
 
+if want otp; then
 echo "${GREEN}=== 5/7  Build and start OTP ===${NC}"
 ssh "${SSH_OPTS[@]}" "$RUSER" bash -s <<REMOTE
 set -euo pipefail
@@ -112,7 +179,9 @@ cd '$RREPO'
 docker build -q -f docker/Dockerfile.runtime -t docker-otp . >/dev/null
 docker compose -f deployment/docker-compose.server.yml up -d
 REMOTE
+fi
 
+if want prefs; then
 echo "${GREEN}=== 6/7  prefs-api (systemd user unit) ===${NC}"
 ssh "${SSH_OPTS[@]}" "$RUSER" bash -s <<REMOTE
 set -euo pipefail
@@ -145,7 +214,9 @@ systemctl --user daemon-reload
 systemctl --user enable prefs-api >/dev/null 2>&1 || true
 systemctl --user restart prefs-api
 REMOTE
+fi
 
+if want nginx; then
 echo "${GREEN}=== 7/7  nginx ===${NC}"
 # Substitute the deploy-time placeholders. The Stadia key lives only in .env and
 # on the server; it must never be committed into config/nginx.
@@ -194,3 +265,4 @@ echo "Verify through nginx on this box first:"
 echo "  curl --resolve $DOMAIN:$APP_PORT:$SERVER_IP https://$DOMAIN:$APP_PORT/pelias/v1/autocomplete?text=target%20field"
 echo "  curl -o /dev/null -w '%{http_code}\\n' -X POST -H 'content-type: application/json' -d '{\"text\":\"\"}' \\"
 echo "       --resolve $DOMAIN:$APP_PORT:$SERVER_IP https://$DOMAIN:$APP_PORT/api/preferences   # expect 400, NOT 401"
+fi
