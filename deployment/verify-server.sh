@@ -91,6 +91,42 @@ esac
 code=$(curl -s "${RES[@]}" -o /dev/null -w '%{http_code}' --max-time 20 "$BASE/api/debug-log" -X POST -H 'content-type: application/json' -d '{}')
 [ "$code" != "401" ] && [ "$code" != "404" ] && ok "/api/debug-log reachable ($code)" || bad "/api/debug-log -> $code"
 
+# Live web-bundle updates. Checked here because the absence of these two
+# locations is INVISIBLE from every other check in this script: without them
+# the paths fall through to the SPA catch-all, which inherits the server-level
+# auth_basic, so the phone's unauthenticated POST gets a 401 Basic Auth
+# challenge. The capacitor-updater plugin reads anything without
+# version+url+checksum as "no update", so it fails silently and for ever — the
+# app simply stops receiving web fixes and nothing anywhere says so.
+#
+# That is not hypothetical: the routes went in on 2026-08-28 but were only ever
+# deployed to the house, and this script passed a server on which live updates
+# were entirely absent for three days. A 401 or 404 here means the nginx
+# snippet on the box predates the OTA lane.
+resp=$(curl -s "${RES[@]}" --max-time 20 -X POST -H 'content-type: application/json' \
+  -d '{"app_id":"org.rightwaytrey.transitnav","platform":"ios","device_id":"verify-server","version_name":"0.0.0","version_build":"999.0.0"}' \
+  -w '\n%{http_code}' "$BASE/api/app-update")
+code=${resp##*$'\n'}; body=${resp%$'\n'*}; body=${body%%[$'\n'$'\r' ]}
+case "$code" in
+  200) case "$body" in
+         *'"checksum"'*|*'"message"'*) ok "/api/app-update -> 200 $body" ;;
+         *) bad "/api/app-update -> 200 but body is not an update or a message: $body" ;;
+       esac ;;
+  401) bad "/api/app-update -> 401 — nginx has no location block; the phone can never update" ;;
+  404) bad "/api/app-update -> 404 — prefs-api on the box predates the OTA lane" ;;
+  *)   bad "/api/app-update -> $code (expected 200)" ;;
+esac
+
+# The bundle download itself. An unknown version must 404 from the API rather
+# than 401 from nginx: 401 means the location is missing and every download
+# would fail even when a manifest is published.
+code=$(curl -s "${RES[@]}" -o /dev/null -w '%{http_code}' --max-time 20 "$BASE/api/app-bundle/0000.0000.0")
+case "$code" in
+  404) ok "/api/app-bundle/ reachable (404 for an unknown version, as expected)" ;;
+  401) bad "/api/app-bundle/ -> 401 — nginx has no location block; bundle downloads cannot work" ;;
+  *)   warn "/api/app-bundle/ -> $code (expected 404 for an unknown version)" ;;
+esac
+
 echo
 echo "=== 5. CORS for the bundled app (capacitor://localhost) ==="
 acao=$(curl -s "${RES[@]}" -D - -o /dev/null --max-time 20 -H 'Origin: capacitor://localhost' \
