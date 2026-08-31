@@ -65,13 +65,6 @@ tree_branch=$(git -C "$WEB_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)
   echo
 } > "$REPORT"
 
-# Dev server must be up (docker restart otp-frontend-dev fixes a clobbered
-# config; see the dev-server notes).
-if ! curl -sf -o /dev/null --max-time 15 "$APP_URL"; then
-  echo "**ABORTED: $APP_URL is not responding — no scripts were run.**" >> "$REPORT"
-  exit 1
-fi
-
 # A script may exit 75 to say "the thing under test could not be exercised, and
 # that is not a defect" -- e.g. verify-onboard-options at 05:00, when no bus is
 # out of the garage to board. That is not a pass and it is not a failure; either
@@ -82,6 +75,55 @@ pass=0 fail=0 skip=0
 results=""
 failures=""
 skips=""
+
+# --- Static config checks --------------------------------------------------
+# These need no dev server and no network, so they run BEFORE the :9967 gate --
+# a config that has drifted is worth reporting on a night the dev server is
+# down, which is exactly when nobody is looking.
+#
+# Both guard invariants that span files no single repo's test suite can see, and
+# both are here because the same failure shape has now bitten three times: a
+# change lands in one of several places that must agree, every health check
+# stays green, and the symptom shows up days later in a ride nobody can replay.
+for check in check-config-ladder.py check-nginx-parity.py; do
+  name="${check%.py}"
+  log="$RUN_DIR/$name.log"
+  start=$(date +%s)
+  if python3 "$(dirname "$0")/$check" > "$log" 2>&1; then
+    status=PASS; pass=$((pass + 1))
+  else
+    rc=$?
+    if [ "$rc" -eq "$EXIT_SKIP" ]; then
+      status=SKIP
+      skip=$((skip + 1))
+      skips+=$'\n'"## $name — SKIP"$'\n\n```\n'"$(tail -25 "$log")"$'\n```\n'
+    else
+      status=FAIL
+      fail=$((fail + 1))
+      failures+=$'\n'"## $name — FAIL"$'\n\n```\n'"$(tail -25 "$log")"$'\n```\n'
+    fi
+  fi
+  dur=$(( $(date +%s) - start ))
+  results+="| $name | $status | ${dur}s |"$'\n'
+done
+
+# Dev server must be up (docker restart otp-frontend-dev fixes a clobbered
+# config; see the dev-server notes).
+if ! curl -sf -o /dev/null --max-time 15 "$APP_URL"; then
+  {
+    echo "**ABORTED: $APP_URL is not responding — no verify-*.js scripts were run.**"
+    echo
+    echo "The static config checks above do not need it, and their results stand:"
+    echo
+    echo "| check | result | duration |"
+    echo "| --- | --- | --- |"
+    printf '%s' "$results"
+    [ -n "$failures" ] && { echo; echo "$failures"; }
+    [ -n "$skips" ] && { echo; echo "$skips"; }
+  } >> "$REPORT"
+  [ "$fail" -eq 0 ] || exit 1
+  exit 1
+fi
 
 for script in "$WEB_REPO"/scripts/verify-*.js; do
   name=$(basename "$script" .js)
