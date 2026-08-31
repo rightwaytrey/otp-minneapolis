@@ -1,0 +1,20 @@
+[Unit]
+Description=Restart ride-watch when its source changes on disk
+Documentation=file:///home/rwt/projects/otp-minneapolis/ride-watch/README.md
+# NOT INSTALLED BY DEFAULT. See "Knowing which daemon is running" in README.md
+# for the argument and the install command. Nothing here restarts anything
+# until a human runs `systemctl --user enable --now ride-watch-restart.path`.
+
+[Path]
+# Every way the file can change, not just `git commit`: a pull, a checkout, a
+# rebase, another agent editing this shared worktree. On 2026-08-28 the daemon
+# was five days stale because the file moved under a running process, and no
+# commit-time hook in this shell would have seen it. A post-commit hook also
+# lives in .git/hooks, which is not versioned and is silently absent after a
+# fresh clone — the mechanism most likely to be missing is the wrong one for a
+# failure whose whole shape is "the thing that should have kept it current was
+# not running".
+PathChanged=/home/rwt/projects/otp-minneapolis/ride-watch/ride_watch.py
+
+[Install]
+WantedBy=default.target

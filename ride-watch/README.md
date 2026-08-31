@@ -42,11 +42,13 @@ line (`{kind:"console", level, args}`), or a session marker.
 | `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby | page |
 | `riding-flip` | `SET_RIDING` tripId changes on the same transit leg | page |
 | `missed-bus-while-riding` | `MISSED_BUS` notification while riding is held | page |
-| `notification-repeat` | the same `(title, message)` alert 3+ times in 5 minutes | page |
+| `notification-repeat` | the same alert (id stem + title) twice in 5 minutes | page |
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
 | `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip | warn |
 | `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m | warn |
 | `reroute-storm` | more than 3 `START_REROUTE` in 5 minutes | warn |
+| `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
+| `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
 | `console-error` | a `console.error` line (deduped by message) | info |
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
 
@@ -55,13 +57,43 @@ finding was a rider note** — the engine had nothing to say while the app
 buzzed a stationary rider 14 times with the same turn alert, and the rider
 typed the complaint out by hand on a bike.
 
-- **`notification-repeat`** keys on `(title, message)` rather than the
-  notification id, because the id carries a fresh `Date.now()` on every fire —
-  that is the app bug that let the storm through in the first place. It fires
-  **once per alert per ride**: the finding says "ignore the buzzing", and
-  saying it twice would spend the rider's other interrupt on something they
-  have already been told to ignore. On the 7/31 log it fires at **11:53:38**,
-  the 3rd of 14 buzzes and six minutes before the rider gave up.
+- **`notification-repeat`** keys on the notification id **minus its
+  `Date.now()` suffix**, plus the title — `ROUTE_DEVIATION_deviation`,
+  `UPCOMING_TURN_<legStart>_<cue>_<stage>`. It was keyed on `(title, message)`
+  until 2026-08-31, which is byte-exact and so was beaten by the one thing
+  every repeated alert does: drift. 8/28's five "Off Route" pushes said 121m,
+  121m, 124m, 120m, 124m and were counted as four separate alerts, none of
+  which ever reached the threshold — the rule written for exactly this class
+  of bug saw neither of the two deviation storms it was next asked about.
+  The threshold is **two** in the window for the same reason: on 8/28 the only
+  pair inside any five-minute window was 17:12:57 / 17:14:45, so at three the
+  rule would have fired at 17:39:28, five seconds before the rider gave up and
+  stopped Go Mode. It fires **once per alert per ride**: the finding says
+  "ignore the buzzing", and saying it twice would spend the rider's other
+  interrupt on something they have already been told to ignore. On the 7/31
+  log it fires at **11:53:07**, the 2nd of 14 buzzes.
+- **`replan-not-converging`** is the half `reroute-storm` cannot do.
+  `reroute-storm` counts reroute *events* and never looks at whether they are
+  working, so it cannot tell "re-planning and converging" from "re-planning in
+  circles". This one folds `UPDATE_PROGRESS.distanceToDestination` in and
+  counts re-plans since that distance last improved by 50m. On 2026-08-28 the
+  destination sat inside the State Fairgrounds, where the street graph stops at
+  the fence: 32 minutes of re-planning into the venue interior, never inside
+  427m, and the rider was told nothing.
+  The thresholds **mirror the client's own guard**
+  (`lib/util/go-mode/destination-progress.ts` in otprr — `DESTINATION_GAIN_MIN_M`
+  50, `DESTINATION_STALL_REPLANS` 3) deliberately, plus one: the client retires
+  the access mode on re-plan 3 and raises `DESTINATION_UNREACHABLE` on re-plan
+  4, so firing at 3 would page about a defect the app was in the middle of
+  reporting itself. And if that notification *does* reach the stream, the
+  daemon records it as `destination-unreachable` (info) and stays quiet — the
+  rider already has a high-priority push about it. **This rule is the second
+  line: it exists for the ride where the app's own guard failed or never ran.**
+  Caveat worth knowing: the daemon can only see re-plans that were *applied*
+  (an itinerary swap or a `START_REROUTE`), not the client's attempts, so its
+  count is a lower bound. `REROUTE_SNAPSHOT` is **not** a re-plan — it is a
+  periodic recording-only alternatives capture, every 90s, and counting it
+  would page every rider who ever waited fifteen minutes for a bus.
 - **`progress-without-motion`** asks a physical question: did the progress bar
   gain more than 5 points in the time it took the rider to cover 15m? The
   anchor resets when they genuinely travel, so the window is *adaptive* — it is
@@ -110,6 +142,7 @@ post-ride report covers that):
 | --- | --- | --- |
 | 50 | `stop-count-collapse` | the banner is lying about when to get off; acted on immediately |
 | 40 | `missed-bus-while-riding` | a wrong alert telling a seated rider to move |
+| 38 | `replan-not-converging` | the app cannot get them there and has not said so; every minute spent waiting for the next plan is spent |
 | 35 | `notification-repeat` | their phone is buzzing wrongly; "ignore it" is actionable this second |
 | 30 | `aboard-swap` | the on-screen route no longer matches their bus |
 | 20 | `riding-flip` | board state suspect, but they are on the right vehicle |
@@ -269,6 +302,23 @@ but still inside the rate limit. A replay never promises a thread, so it never
 falls back. A ride with zero findings writes no request file and pings the
 thread to say the ride was clean.
 
+That guard only ever asked *"is the pane alive?"*, which on 2026-08-28 was the
+wrong question: the thread spawned fine, took the wrap-up line, and then sat at
+a permission prompt for about three hours. Everything looked right from the
+daemon's side and **nothing paged, ever**. So a ride whose wrap-up was actually
+requested now also arms a **report deadline** (`REPORT_DEADLINE_MS`, 10 min):
+when it expires, the daemon checks whether the exact `reportPath` it handed the
+thread exists, and sends the same fallback push if it does not.
+
+Two details make it work. The deadline lives on `self.report_deadlines` as a
+plain dict, not on the `Trip` — `_end_trip` does `del self.trips[session]`, so
+`check_timers`' own loop can never see an ended ride, which is precisely how
+this case escaped every timer in the file. And it is written into `state.json`,
+so a daemon restarted inside the window re-adopts the promise instead of
+dropping it — which matters now that restarting on a commit is a thing that
+happens to this process mid-evening. A trip with no thread object at all (a
+replay, or `RIDE_THREAD_ENABLED=0`) arms nothing: nobody was asked.
+
 `RIDE_THREAD_ENABLED=0` (set in the systemd unit) disables the whole thing: the
 daemon then behaves exactly as it did before threads existed.
 `RIDE_THREAD_NAME_PREFIX` renames both the tmux session and the display name,
@@ -358,6 +408,91 @@ with `loginctl show-user rwt | grep Linger`. If it says `Linger=no`, run:
 sudo loginctl enable-linger rwt
 ```
 
+### Knowing which daemon is running
+
+On 2026-08-28 the process watching the ride had been up for five days, running
+a five-day-old copy of `ride_watch.py`. It produced five false
+`stalled-progress` findings, missed the arrival event entirely (`SET_ARRIVED`
+handling did not exist in the code that was loaded), and nearly overwrote an
+earlier ride's report. Nothing it wrote said which version it was — the digest
+header carried session / written-at / push count, the status file carried
+"Updated:", and the ride thread spent the evening reading source on disk that
+the process in memory had never loaded.
+
+So the digest and every status file now open with:
+
+```
+Daemon: ride_watch.py @ a1b2c3d-dirty (started 2026-08-31 09:12:03, source mtime 2026-08-28 21:54:11)
+```
+
+and, when the repo has moved on:
+
+```
+Tree now: e4f5g6h  ** STALE — this daemon is running a1b2c3d, 7 commit(s) behind.
+Findings may come from code that no longer exists. Restart: `systemctl --user restart ride-watch` **
+```
+
+Note this is the *opposite* of what a build script wants. A build proves the
+tree did not move under it and fails if it did; this daemon fully expects the
+tree to move underneath it, and the drift is the signal rather than an error.
+So it never aborts, never re-execs and never restarts itself — it reports,
+loudly, in the header the ride thread already reads before every reply.
+
+**The SHA is resolved once, at import, into `DAEMON_GIT_SHA`.** This is the
+whole point and it is easy to get backwards: `git rev-parse HEAD` evaluated at
+write time reports what the working tree is *now*, so a five-day-stale daemon
+would stamp today's SHA and confidently claim to be current — the mismatch the
+stamp exists to expose becomes invisible, and the header positively asserts
+something false. A header that lies about provenance is worse than one that
+omits it, because nothing contradicts it. `-dirty` comes from
+`git status --porcelain --untracked-files=no`, also once: other agents work in
+this same checkout and leave scratch files behind constantly, so a stamp that
+reads dirty every time would say nothing. If git is unavailable the stamp is
+`unknown` — the daemon must not die, or go quiet, because it could not
+introspect itself.
+
+The *comparison* against the repo's current HEAD is a separate, TTL-cached read
+(`HEAD_RECHECK_MS`, 5 min) of `rev-parse` only — read-only, takes no index
+lock, and so cannot collide with another agent's git in this shared worktree.
+It never touches the stamp.
+
+**Restart on change (optional, not installed).** `ride-watch-restart.path` and
+`ride-watch-restart.service` sit next to `ride-watch.service` in this
+directory, uninstalled:
+
+```
+cp ride-watch/ride-watch-restart.{path,service} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ride-watch-restart.path
+```
+
+Why a **path unit** and not a git hook: the daemon went stale because the file
+moved under a running process, which a `post-commit` hook only sometimes
+notices. A hook does not fire on `git pull`, `git checkout`, `git rebase`, or
+another agent's commit in this shared worktree; it lives in `.git/hooks`, which
+is not versioned and is silently absent after a fresh clone; and it fires on
+every commit whether or not it touched this directory. `PathChanged=` catches
+all of them and nothing else. A Makefile target has the opposite problem — it
+is honest and discoverable, and it only helps someone who remembers to run it,
+which is exactly the step that was missed.
+
+The restart is gated on the daemon being idle (`ExecCondition` greps
+`current-ride.md` for "No active trip"). A restart mid-ride is *safe* —
+`KillMode=process` leaves the rider's live tmux thread alone, the trip is
+re-adopted on the next `UPDATE_PROGRESS`, and the report deadline survives in
+`state.json` — but it is not free: per-trip rule state resets and the adopted
+trip spawns a **second** ride thread the rider then sees in their app. A file
+changing mid-ride is not a reason to interrupt one. The STALE line covers that
+case by telling the ride thread, live, what it is actually running.
+
+**Drift hazard:** `~/.config/systemd/user/ride-watch.service` is a real file,
+not a symlink to the copy in this directory, so the two can diverge silently.
+They are identical as of 2026-08-31. Check with:
+
+```
+diff -u ride-watch/ride-watch.service ~/.config/systemd/user/ride-watch.service
+```
+
 ## Replaying a past ride
 
 Run any historical file through the exact same code path at full speed:
@@ -407,7 +542,7 @@ states the convention outright.
 python3 ride-watch/test_ride_watch.py
 ```
 
-121 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
+193 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
 (both the firing case and the case that must stay quiet), the state machine, and
 page ranking (supersession inside the window, tie-breaking, flush on a quiet log,
 flush on trip end).
@@ -420,7 +555,7 @@ data does not work:
   interrupt, the one they get is `stop-count-collapse`, and the two progress
   teleports (17:05, 17:20) are flagged.
 - `TestNotificationStormReplay` (7/31) — `notification-repeat` fires at
-  **11:53:38**, before the rider had to type the complaint by hand, and the 14
+  **11:53:07**, before the rider had to type the complaint by hand, and the 14
   buzzes cost them one finding.
 - `TestThreadCadenceOnRealRides` (both) — every push is a milestone, one thread
   and one kickoff per ride, a push per finding and nothing extra, heartbeats
@@ -432,6 +567,19 @@ that must not stop the ride, the tmux-session filter that protects a
 hand-spawned thread, milestone cadence, the digest being current at every push,
 and the fallback page. `NoProcesses` asserts the thing this design exists for —
 **a rider note spawns no process at all.**
+
+`TestDuplicateRecords`, `TestStalledProgressContext`,
+`TestReplanNotConverging`, `TestReportDeadline` and `TestDaemonProvenance` cover
+the 2026-08-31 work. Two of those are worth calling out because the naive
+implementation passes them by accident:
+`test_a_head_that_moves_does_not_change_the_reported_running_sha` pins that the
+stamp is a startup constant and not a write-time `rev-parse` (which would make
+a stale daemon claim to be current), and
+`test_the_deadline_survives_the_trip_being_deleted` pins that the report
+deadline does not live on the `Trip` that `_end_trip` deletes.
+
+Fourteen tests skip when the real logs are only present gzipped; `gunzip -k`
+the day you need (`debug-2026-07-29`, `-07-31`, `-08-10`) to run them.
 
 Tests never touch the network, never start tmux, and never invoke the real
 `claude`; the Pushover path is verified by credential parsing only.

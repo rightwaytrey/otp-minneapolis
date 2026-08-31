@@ -128,11 +128,16 @@ class StreamBuilder:
         return self.action("STOP_GO_MODE")
 
     def progress(self, leg=1, prog=10.0, status="on_track", stops=None,
-                 next_stop="Stop B"):
+                 next_stop="Stop B", dest=None):
         p = {"currentLegIndex": leg, "currentLegProgress": prog,
              "status": status, "nextStopName": next_stop}
         if stops is not None:
             p["stopsRemaining"] = stops
+        if dest is not None:
+            # Straight-line metres to the destination. In the real stream
+            # since 2026-08-28; it is what tells a re-plan that converges from
+            # one that does not.
+            p["distanceToDestination"] = dest
         return self.action("UPDATE_PROGRESS", p)
 
     # Downtown Minneapolis, and a metre is ~9e-6 degrees of latitude — enough
@@ -664,7 +669,7 @@ class TestRules(RuleTestCase):
         self.assertEqual(hits[0]["severity"], "info")
 
     def test_k_notification_repeat_pages(self):
-        """The 7/31 storm, in miniature: three identical buzzes in five minutes."""
+        """The 7/31 storm, in miniature: identical buzzes inside five minutes."""
         b = StreamBuilder().start().advance(1000).position().progress(stops=5)
         for _ in range(3):
             b.advance(30 * 1000).notification()
@@ -672,15 +677,72 @@ class TestRules(RuleTestCase):
         hits = self.find(watch, "notification-repeat")
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["severity"], "page")
-        self.assertEqual(hits[0]["context"]["count"], 3)
+        # Two, not three, since 2026-08-31: the rule reported storms only
+        # after they were over. It fires on the second and latches.
+        self.assertEqual(hits[0]["context"]["count"], 2)
         self.assertIn("Turn right on Village Lane", hits[0]["summary"])
 
-    def test_k_two_of_the_same_alert_is_not_a_storm(self):
+    def test_k_two_of_the_same_alert_in_the_window_is_a_storm(self):
+        """8/28 evening is why. Five "Off Route" pushes, and the only pair
+        inside any five-minute window was 17:12:57 / 17:14:45 — at a threshold
+        of three the rule watched the whole storm and said nothing."""
         b = StreamBuilder().start().advance(1000).position().progress(stops=5)
         b.advance(30 * 1000).notification()
         b.advance(30 * 1000).notification()
         watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "notification-repeat")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["context"]["count"], 2)
+
+    def test_k_two_of_the_same_alert_far_apart_is_not_a_storm(self):
+        """Lowering the count did not widen the window. The same alert twice
+        in an hour is an app telling a rider two true things."""
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        b.advance(30 * 1000).notification()
+        b.advance(30 * 60 * 1000).notification()
+        watch = self.run_stream(b, finalize=False)
         self.assertNotIn("notification-repeat", self.rules(watch))
+
+    def test_k_a_drifting_distance_is_still_the_same_alert(self):
+        """The 8/28 defeat, exactly: "You are 121m…" and "You are 124m…" are
+        one alert about one fault, and the byte key made them two."""
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        for metres in (121, 124):
+            b.advance(60 * 1000).notification(
+                title="Off Route", ntype="ROUTE_DEVIATION",
+                message="You are %dm from the planned route" % metres,
+                nid="ROUTE_DEVIATION_deviation_%d" % b.t)
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "notification-repeat")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["context"]["count"], 2)
+        self.assertEqual(hits[0]["context"]["key"], "ROUTE_DEVIATION_deviation")
+
+    def test_k_the_turn_stage_is_part_of_the_alert_identity(self):
+        """`_prepare` and `_act` are two different things said about one turn
+        ("in 300 ft" then "now"), so stripping the timestamp must not collapse
+        them — the id stem keeps the cue index and the stage."""
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        for stage in ("prepare", "act"):
+            b.advance(30 * 1000).notification(
+                nid="UPCOMING_TURN_1785518021000_0_%s_%d" % (stage, b.t))
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("notification-repeat", self.rules(watch))
+
+    def test_k_a_re_posted_notification_is_not_a_second_buzz(self):
+        """8/27 13:10:42: the debug-log client re-POSTed a batch, so one
+        ROUTE_DEVIATION arrived twice — same `t`, same id, `recv` 208 ms
+        apart. It went into the ride notes as an app defect. At a threshold of
+        two, counting it would page the rider about a telemetry retry."""
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        b.advance(30 * 1000).notification(
+            nid="ROUTE_DEVIATION_deviation_%d" % b.t)
+        dup = dict(b.events[-1])
+        dup["recv"] = dup["recv"] + 0.208      # the only field that differed
+        b.events.append(dup)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("notification-repeat", self.rules(watch))
+        self.assertEqual(watch.duplicate_records, 1)
 
     def test_k_three_different_alerts_are_not_a_storm(self):
         # Three turns in a row on a fast route is the app working.
@@ -1019,13 +1081,15 @@ class TestPageRanking(RuleTestCase):
     def test_the_ranking_covers_every_page_rule(self):
         """A page rule with no rank would silently fall back to mid-pack."""
         page_rules = {"stop-count-collapse", "itinerary-backwards",
-                      "missed-bus-while-riding", "notification-repeat",
-                      "aboard-swap", "riding-flip", "deviated-streak"}
+                      "missed-bus-while-riding", "replan-not-converging",
+                      "notification-repeat", "aboard-swap", "riding-flip",
+                      "deviated-streak"}
         self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
         self.assertEqual(
             ["stop-count-collapse", "itinerary-backwards",
-             "missed-bus-while-riding", "notification-repeat", "aboard-swap",
-             "riding-flip", "deviated-streak"],
+             "missed-bus-while-riding", "replan-not-converging",
+             "notification-repeat", "aboard-swap", "riding-flip",
+             "deviated-streak"],
             sorted(ride_watch.PAGE_RANK, key=ride_watch.PAGE_RANK.get,
                    reverse=True))
 
@@ -1826,14 +1890,20 @@ class TestRealIncidentReplay(unittest.TestCase):
         self.assertEqual(collapse[0]["paged"], True)
 
     def test_the_17_28_cascade_costs_the_rider_one_interrupt(self):
-        """Four page-worthy findings in eight seconds, one page."""
+        """Five page-worthy findings in eight seconds, one page.
+
+        Four until 2026-08-31, when notification-repeat gained a stable key
+        and started seeing the two "Off Route" pushes at 17:28:49 / 17:28:53
+        that its byte key had counted as separate alerts. One more finding in
+        the window, still one interrupt — which is what the ranking is for.
+        """
         cascade = [p for p in self.watch.push_log
                    if INCIDENT_START_MS <= p["tsMs"] <= INCIDENT_END_MS]
         sent = [p for p in cascade if p.get("sent")]
         superseded = [p for p in cascade
                       if p.get("suppressed", "").startswith("superseded-by")]
         self.assertEqual(len(sent), 1)
-        self.assertEqual(len(superseded), 3)
+        self.assertEqual(len(superseded), 4)
         for p in superseded:
             self.assertEqual(p["suppressed"], "superseded-by-stop-count-collapse")
 
@@ -1888,13 +1958,19 @@ class TestNotificationStormReplay(unittest.TestCase):
         return [f for f in self.watch.all_findings
                 if f["rule"] == "notification-repeat"]
 
-    def test_the_turn_alert_storm_is_caught_at_the_third_buzz(self):
+    def test_the_turn_alert_storm_is_caught_at_the_second_buzz(self):
+        # Was 11:53:38, the 3rd buzz, until 2026-08-31. Thirty-one seconds
+        # earlier is not the point — the point is that the same change is what
+        # lets the rule see the 8/28 storms at all, and this ride proves it
+        # costs nothing on the storm it was originally written for.
         first = self.hits()[0]
-        self.assertEqual(first["time"], "11:53:38")
+        self.assertEqual(first["time"], "11:53:07")
         self.assertEqual(first["severity"], "page")
-        self.assertEqual(first["context"]["count"], 3)
+        self.assertEqual(first["context"]["count"], 2)
         self.assertEqual(first["context"]["title"],
                          "Turn right on Village Lane")
+        self.assertEqual(first["context"]["key"],
+                         "UPCOMING_TURN_1785518021000_0_prepare")
 
     def test_it_fires_six_minutes_before_the_rider_had_to_type_it(self):
         note = next(f for f in self.watch.all_findings
@@ -2069,6 +2145,413 @@ class TestBackwardsItineraryReplay(unittest.TestCase):
             any("backwards" in p["body"] for p in paged),
             "the rider was paged, but not about the thing they photographed: "
             "%s" % [p["body"] for p in paged])
+
+
+class TestDuplicateRecords(RuleTestCase):
+    """The debug-log client re-POSTs a batch it is not sure landed.
+
+    ~1,000-1,700 records a day arrive twice across 8/27-8/29 — 3.7% of the
+    8/27 stream — carrying the app's original `t` and payload id, differing
+    only in the sidecar's `recv`. Every counting rule in the daemon read that
+    stream as truth.
+    """
+
+    def test_a_re_posted_record_is_processed_once(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        dup = dict(b.events[-1])
+        dup["recv"] = dup["recv"] + 0.208
+        b.events.append(dup)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "stop-count-collapse")), 1)
+        self.assertEqual(watch.duplicate_records, 1)
+
+    def test_a_genuine_second_event_is_not_a_duplicate(self):
+        """Identity is (session, kind, type, t, payload id) — the app's own
+        clock, not arrival. Two real events have two timestamps."""
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).position()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.duplicate_records, 0)
+
+    def test_the_dedup_ring_is_bounded(self):
+        b = StreamBuilder().start()
+        for _ in range(ride_watch.RECORD_DEDUP_RING + 500):
+            b.advance(1000).position()
+        watch = self.run_stream(b, finalize=False)
+        self.assertLessEqual(len(watch._seen_records),
+                             ride_watch.RECORD_DEDUP_RING)
+        self.assertEqual(len(watch._seen_record_keys),
+                         len(watch._seen_records))
+
+
+class TestStalledProgressContext(RuleTestCase):
+    """8/28: five stalled-progress findings read as a dead GPS receiver.
+
+    The finding reported `anchor[0]` — where the rider FIRST stopped, up to 15
+    minutes and 60 m ago — as `lat`/`lon`, and carried no fix time and no fix
+    count at all. The receiver was healthy throughout: 2,168 distinct fixes,
+    ~4.1 m apart.
+    """
+
+    def stall(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=2, prog=0.0)
+        b.advance(1000).position()
+        for i in range(20):
+            # Drifting slowly, well inside STALL_RADIUS_M: stationary, but
+            # emphatically still receiving.
+            b.advance(60 * 1000).position_metres_north(1 + i % 3)
+        watch = self.run_stream(b)
+        hits = self.find(watch, "stalled-progress")
+        self.assertTrue(hits)
+        return hits[0]
+
+    def test_the_finding_reports_where_the_rider_is_now(self):
+        ctx = self.stall()["context"]
+        self.assertEqual(ctx["lat"], StreamBuilder.LAT + 3 * 9.0e-6)
+        self.assertNotEqual(ctx["lat"], ctx["anchorLat"])
+
+    def test_the_anchor_is_still_reported_under_its_own_name(self):
+        ctx = self.stall()["context"]
+        self.assertEqual(ctx["anchorLat"], StreamBuilder.LAT)
+        self.assertIsNotNone(ctx["anchorSetMs"])
+        self.assertLess(ctx["movedFromAnchorM"], ride_watch.STALL_RADIUS_M)
+
+    def test_the_finding_says_the_gps_is_alive(self):
+        """The one fact that would have stopped the 8/28 misreading."""
+        hit = self.stall()
+        ctx = hit["context"]
+        self.assertGreater(ctx["fixesSinceAnchor"], 10)
+        self.assertLess(ctx["sinceLastFixMs"], ride_watch.GPS_GAP_MS)
+        self.assertIsNotNone(ctx["lastFixMs"])
+        self.assertIn("GPS live", hit["summary"])
+
+
+class TestReplanNotConverging(RuleTestCase):
+    """8/28 afternoon: 32 minutes re-planning into the State Fairgrounds.
+
+    The destination was inside the fence, where the street graph stops. The
+    distance never dropped below 427 m. reroute-storm counts reroute events
+    and never looks at whether they work, so it had nothing to say.
+    """
+
+    def circling(self, replans=4, dest=430.0, unreachable_at=None):
+        """A rider who keeps being re-planned at without getting closer."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, dest=1200.0)
+        b.advance(60 * 1000).progress(leg=2, dest=dest)
+        for i in range(replans):
+            b.advance(3 * 60 * 1000)
+            if unreachable_at is not None and i == unreachable_at:
+                b.notification(
+                    title="This is as close as routing gets",
+                    ntype="DESTINATION_UNREACHABLE",
+                    message="Still 430m away and re-planning isn't closing "
+                            "the gap.",
+                    nid="DESTINATION_UNREACHABLE_destination_%d" % b.t)
+                b.advance(1000)
+            b.start()                     # the applied re-plan
+            b.advance(30 * 1000).progress(leg=2, dest=dest + i)
+        return self.run_stream(b, finalize=False)
+
+    def test_re_planning_in_circles_pages(self):
+        watch = self.circling()
+        hits = self.find(watch, "replan-not-converging")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "page")
+        self.assertEqual(hits[0]["context"]["appSaidUnreachable"], False)
+        self.assertEqual(hits[0]["context"]["bestDistanceM"], 430.0)
+
+    def test_it_waits_for_the_client_to_speak_first(self):
+        """The client retires the mode on re-plan 3 and tells the rider on
+        re-plan 4. Firing at 3 would page about a defect the app was in the
+        middle of reporting itself."""
+        self.assertNotIn("replan-not-converging",
+                         self.rules(self.circling(replans=3)))
+
+    def test_the_app_saying_it_first_means_the_daemon_stays_quiet(self):
+        """DESTINATION_UNREACHABLE is the cheaper signal and the rider already
+        has it on their phone at high priority. Repeating it would spend one
+        of two interrupts saying nothing new."""
+        watch = self.circling(unreachable_at=1)
+        self.assertNotIn("replan-not-converging", self.rules(watch))
+        hits = self.find(watch, "destination-unreachable")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "info")
+
+    def test_re_planning_that_is_working_is_not_a_finding(self):
+        """A rider on a changing bus network gets re-planned at constantly.
+        Closing the distance is the whole difference."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, dest=4000.0)
+        for i in range(6):
+            b.advance(3 * 60 * 1000).start()
+            b.advance(30 * 1000).progress(leg=2, dest=4000.0 - 400 * (i + 1))
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("replan-not-converging", self.rules(watch))
+
+    def test_gps_scatter_is_not_a_gain(self):
+        """DEST_GAIN_MIN_M mirrors the client's 50 m for a reason: 8/28's
+        427 m floor wandered by tens of metres for half an hour."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, dest=430.0)
+        for i in range(5):
+            b.advance(3 * 60 * 1000).start()
+            b.advance(30 * 1000).progress(leg=2, dest=430.0 - 20 * (i % 2))
+        watch = self.run_stream(b, finalize=False)
+        self.assertIn("replan-not-converging", self.rules(watch))
+
+    def test_a_real_gain_clears_the_count(self):
+        """Whatever changed, the rider is moving again and gets the machinery
+        back — same as the client resetting stalledModes."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, dest=900.0)
+        for _ in range(3):
+            b.advance(3 * 60 * 1000).start()
+            b.advance(30 * 1000).progress(leg=2, dest=900.0)
+        b.advance(30 * 1000).progress(leg=2, dest=700.0)     # 200 m of real gain
+        b.advance(3 * 60 * 1000).start()
+        b.advance(30 * 1000).progress(leg=2, dest=700.0)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("replan-not-converging", self.rules(watch))
+
+    def test_one_replan_logged_twice_counts_once(self):
+        """8/28 16:44:06: a START_REROUTE and the START_GO_MODE that applied
+        its result, in the same second. Counting both retires a converging
+        trip on half the evidence the client used."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, dest=430.0)
+        for _ in range(3):
+            b.advance(3 * 60 * 1000)
+            b.action("START_REROUTE", {"autoApply": True,
+                                       "reason": "boarded-earlier"})
+            b.start()                     # same second, one re-plan
+            b.advance(30 * 1000).progress(leg=2, dest=430.0)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("replan-not-converging", self.rules(watch))
+
+    def test_a_trip_with_no_measured_distance_never_fires(self):
+        """"No net reduction" is not a fact you can hold about a distance
+        nobody has measured — the client's own null-state guard."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2)
+        for _ in range(8):
+            b.advance(3 * 60 * 1000).start()
+            b.advance(30 * 1000).progress(leg=2)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("replan-not-converging", self.rules(watch))
+
+    def test_the_page_copy_follows_the_rider_rules(self):
+        watch = self.circling()
+        body = [p for p in watch.push_log
+                if "Re-planning" in p["body"]][0]["body"]
+        self.assertLess(len(body), 120, body)
+        self.assertNotIn("!", body)
+        self.assertIn("Finish from here", body)
+
+
+class TestReportDeadline(RuleTestCase):
+    """8/28: a wrap-up that never appeared paged nobody, ever.
+
+    _report_fallback_push had one call site, guarded by _thread_missing, which
+    is true only when the tmux spawn failed or the pane is dead. That evening's
+    thread spawned fine, took the wrap-up line, and sat at a permission prompt
+    for about three hours.
+    """
+
+    def ended_ride(self, thread_ok=True):
+        thread = StubThread(ok=thread_ok)
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        return watch
+
+    def fallbacks(self, watch):
+        return [p for p in watch.push_log if p["kind"] == "fallback"]
+
+    def test_a_deadline_is_armed_when_a_wrap_up_is_asked_for(self):
+        watch = self.ended_ride()
+        self.assertEqual(len(watch.report_deadlines), 1)
+        # The exact path the thread was handed, not a second guess at it.
+        req = json.loads(read_text(report_requests(self.tmp)[0]))
+        self.assertEqual(watch.report_deadlines[0]["reportPath"],
+                         req["reportPath"])
+
+    def test_a_healthy_thread_that_never_writes_still_pages(self):
+        """The 8/28 hole. Nothing is wrong with the pane; the report simply
+        does not exist."""
+        watch = self.ended_ride()
+        self.assertEqual(self.fallbacks(watch), [])
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(len(self.fallbacks(watch)), 1)
+        self.assertIn("Report pending", self.fallbacks(watch)[0]["body"])
+
+    def test_the_deadline_survives_the_trip_being_deleted(self):
+        """_end_trip does `del self.trips[session]`, so check_timers' own loop
+        can never see an ended ride. The deadline is not on the trip."""
+        watch = self.ended_ride()
+        self.assertEqual(watch.trips, {})
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(len(self.fallbacks(watch)), 1)
+
+    def test_a_wrap_up_that_lands_in_time_pages_nobody(self):
+        watch = self.ended_ride()
+        path = watch.report_deadlines[0]["reportPath"]
+        with open(path, "w") as f:
+            f.write("# ride report\n")
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(self.fallbacks(watch), [])
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_the_rider_is_paged_once_not_every_tick(self):
+        watch = self.ended_ride()
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        for _ in range(5):
+            watch.clock_ms += 60 * 1000
+            watch.check_timers()
+        self.assertEqual(len(self.fallbacks(watch)), 1)
+
+    def test_a_clean_ride_arms_nothing(self):
+        """No findings, no request file, nothing to wait for."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False, thread=StubThread())
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_a_failed_spawn_pages_now_and_does_not_also_arm(self):
+        """The old path still fires immediately when there is provably no
+        thread; the deadline is for the case it cannot see."""
+        watch = self.ended_ride(thread_ok=False)
+        self.assertEqual(len(self.fallbacks(watch)), 1)
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_the_deadline_survives_a_daemon_restart(self):
+        """Restart-on-commit is now a thing that happens to this process
+        mid-evening, and the promise must outlive it."""
+        watch = self.ended_ride()
+        restarted = quiet_watch(self.tmp)
+        self.assertEqual(len(restarted.report_deadlines), 1)
+        restarted.clock_ms = watch.clock_ms + ride_watch.REPORT_DEADLINE_MS + 1
+        restarted.check_timers()
+        self.assertEqual(len(self.fallbacks(restarted)), 1)
+
+
+class TestDaemonProvenance(RuleTestCase):
+    """8/28: a five-day-stale daemon, and nothing it wrote said so.
+
+    It produced five false stalled-progress findings, missed the arrival event
+    (SET_ARRIVED handling did not exist in the loaded code), and nearly
+    overwrote a report. The ride thread was reading source on disk that the
+    process in memory had never loaded.
+    """
+
+    def moved_head(self, head="deadbee", behind="7"):
+        """Pretend the tree moved on after this process started."""
+        calls = []
+        original = ride_watch._git_out
+
+        def spy(args, **kw):
+            calls.append(args)
+            return behind if args[0] == "rev-list" else head
+
+        ride_watch._git_out = spy
+        self.addCleanup(setattr, ride_watch, "_git_out", original)
+        return calls
+
+    def test_a_head_that_moves_does_not_change_the_reported_running_sha(self):
+        """The correctness pin, and the regression a naive implementation
+        passes by accident.
+
+        `git rev-parse HEAD` read at digest-write time reports the tree as it
+        is NOW, so a five-day-stale daemon would stamp today's SHA and
+        confidently claim to be current — the mismatch this exists to expose
+        becomes invisible, and the header positively asserts something false.
+        """
+        stamped = ride_watch.DAEMON_GIT_SHA
+        self.moved_head()
+        lines = quiet_watch(self.tmp)._daemon_lines()
+        self.assertEqual(ride_watch.DAEMON_GIT_SHA, stamped)
+        self.assertIn(stamped, lines[0])
+        self.assertNotIn("deadbee", lines[0])
+
+    def test_a_head_that_moves_surfaces_the_stale_marker(self):
+        """The feature. Printing one SHA still relies on somebody noticing it
+        is old, and on 8/28 nobody did — for five days."""
+        calls = self.moved_head()
+        lines = quiet_watch(self.tmp)._daemon_lines()
+        stale = [ln for ln in lines[1:] if "STALE" in ln]
+        self.assertEqual(len(stale), 1, lines)
+        self.assertIn("deadbee", stale[0])
+        self.assertIn("7 commit(s) behind", stale[0])
+        # Read-only git only: no `status`, which can take the index lock other
+        # agents in this shared worktree are using.
+        self.assertTrue(all(a[0] in ("rev-parse", "rev-list") for a in calls),
+                        calls)
+
+    def test_a_head_that_has_not_moved_raises_nothing(self):
+        original = ride_watch._git_out
+        ride_watch._git_out = lambda args, **kw: (
+            ride_watch.DAEMON_GIT_SHA.split("-", 1)[0])
+        self.addCleanup(setattr, ride_watch, "_git_out", original)
+        watch = quiet_watch(self.tmp)
+        self.assertFalse([ln for ln in watch._daemon_lines() if "STALE" in ln])
+
+    def test_a_missing_head_never_claims_staleness(self):
+        """git unavailable at write time is not evidence of anything."""
+        original = ride_watch._git_out
+        ride_watch._git_out = lambda args, **kw: None
+        self.addCleanup(setattr, ride_watch, "_git_out", original)
+        lines = quiet_watch(self.tmp)._daemon_lines()
+        self.assertFalse([ln for ln in lines if "STALE" in ln], lines)
+        self.assertIn(ride_watch.DAEMON_GIT_SHA, lines[0])
+
+    def test_the_head_check_is_not_run_per_write(self):
+        """Shelling out to git on every status write is both needless work on
+        a hot path and the bug above waiting to happen."""
+        calls = self.moved_head()
+        watch = quiet_watch(self.tmp)
+        for _ in range(50):
+            watch._daemon_lines()
+        self.assertEqual(len(calls), 2)   # one rev-parse, one rev-list
+
+    def test_git_being_unavailable_stamps_unknown_and_never_raises(self):
+        """The daemon must not die, or go quiet, because it could not
+        introspect itself."""
+        original = ride_watch.subprocess.run
+
+        def boom(*a, **kw):
+            raise OSError("no git here")
+
+        ride_watch.subprocess.run = boom
+        try:
+            self.assertEqual(ride_watch._resolve_daemon_sha(), "unknown")
+            self.assertIsNone(ride_watch._git_out(["rev-parse", "HEAD"]))
+        finally:
+            ride_watch.subprocess.run = original
+
+    def test_the_status_file_names_the_running_daemon(self):
+        watch = quiet_watch(self.tmp)
+        watch.write_status(force=True)
+        status = read_text(os.path.join(self.tmp, "current-ride.md"))
+        self.assertIn("Daemon: ride_watch.py @ %s"
+                      % ride_watch.DAEMON_GIT_SHA, status)
+        self.assertIn("started", status)
+
+    def test_the_digest_names_the_running_daemon(self):
+        """The ride thread reads the digest before every reply; this is where
+        it can see that the source it is about to read is not what is running."""
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        self.run_stream(b, finalize=False, thread=thread)
+        self.assertIn("Daemon: ride_watch.py @ %s" % ride_watch.DAEMON_GIT_SHA,
+                      thread.pushes[-1]["digest"])
+
+    def test_a_riders_own_status_file_carries_the_header_too(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        watch = self.run_stream(b, finalize=False)
+        watch.write_status(force=True)
+        own = read_text(os.path.join(self.tmp, "%s.current-ride.md" % SESSION))
+        self.assertIn("Daemon: ride_watch.py @", own)
+        self.assertIn("## Active trip", own)
 
 
 if __name__ == "__main__":

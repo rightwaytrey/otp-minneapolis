@@ -67,6 +67,84 @@ REPORT_DIR = os.environ.get(
     os.path.join(HOME, "obsidian-vault", "Claude", "ride-watch"),
 )
 
+# ---------------------------------------------------------------------------
+# Provenance: which daemon is actually running
+# ---------------------------------------------------------------------------
+#
+# On 2026-08-28 the daemon watching the ride had been running for five days
+# from a five-day-old copy of this file. It produced five false
+# `stalled-progress` findings, missed the arrival event (the SET_ARRIVED
+# handler did not exist yet in the code that was loaded), and nearly
+# overwrote an earlier ride's report. Nothing anywhere said which version was
+# running: the digest header carried session / written-at / push count, the
+# status file carried "Updated:", and neither told the ride thread that the
+# source it was reading on disk was not the source in memory.
+#
+# Resolved ONCE, at import, into module constants. This is the whole point and
+# it is easy to get backwards: `git rev-parse HEAD` evaluated when the digest
+# is written reports what the working tree is NOW, not what this process was
+# loaded from — so a five-day-stale daemon would confidently stamp today's SHA
+# and the mismatch it exists to expose would become invisible. A header that
+# lies about provenance is worse than one that omits it, because nothing
+# contradicts it. Both repos here are shared worktrees that move under
+# long-running processes, so this is a live hazard, not a theoretical one.
+#
+# Untracked files are excluded from the dirty check on purpose: other agents
+# work in this same checkout and leave scratch files behind constantly, and a
+# stamp that reads "-dirty" every single time says nothing. A modified TRACKED
+# file is the case where the SHA genuinely does not describe the running code.
+#
+# Fail soft, always. The daemon must not die, or go quiet, because it could not
+# introspect itself; an unresolvable SHA stamps "unknown".
+
+
+def _git_out(args, timeout=10):
+    """Run a read-only git command, returning stripped stdout or None."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", REPO_DIR] + args,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, timeout=timeout,
+            universal_newlines=True)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or "").strip()
+
+
+def _resolve_daemon_sha():
+    rev = _git_out(["rev-parse", "--short", "HEAD"])
+    if not rev:
+        return "unknown"
+    # --untracked-files=no: see the note above. Also the only form of `status`
+    # this daemon ever runs, and it runs it exactly once.
+    dirty = _git_out(["status", "--porcelain", "--untracked-files=no"])
+    return rev + "-dirty" if dirty else rev
+
+
+def _source_mtime():
+    """When the file this process was loaded from was last written.
+
+    The cheap half of the same question, and the one the rider's own notes say
+    to check first: a service whose start time predates its source's mtime is
+    running code that no longer exists on disk.
+    """
+    try:
+        return os.path.getmtime(os.path.abspath(__file__))
+    except OSError:
+        return None
+
+
+DAEMON_GIT_SHA = _resolve_daemon_sha()
+DAEMON_STARTED_MS = int(time.time() * 1000)
+DAEMON_SOURCE_MTIME = _source_mtime()
+# How often the *running* SHA may be compared against the repo's HEAD for the
+# "you are stale" line. Only `rev-parse` is re-run (read-only, takes no index
+# lock, so it cannot collide with another agent's git in this shared worktree),
+# never `status`, and never on the per-event path.
+HEAD_RECHECK_MS = 5 * 60 * 1000
+
 # Rule thresholds (ms unless noted)
 STARTUP_LOOKBACK_MS = 5 * 60 * 1000        # scan back this far at startup
 LOOKBACK_TAIL_BYTES = 16 * 1024 * 1024     # ...reading at most this much tail
@@ -118,7 +196,23 @@ STALL_COOLDOWN_MS = 15 * 60 * 1000
 # alert inside five minutes is a phone misbehaving at the rider, which is
 # exactly the class of thing they should not have to notice and type by hand.
 NOTIFICATION_REPEAT_WINDOW_MS = 5 * 60 * 1000
-NOTIFICATION_REPEAT_COUNT = 3              # fires on the 3rd
+# Two, not three, since 2026-08-31. The rule was written for the 7/31 storm —
+# fourteen byte-identical buzzes — and then failed to see either of the two
+# deviation storms it was next asked about, twice over: the messages drifted
+# ("You are 121m…" / "124m" / "120m") so the byte key never accumulated, and
+# even the byte-identical pairs only ever reached two inside the window.
+# 8/28 evening is the case that settles it: five ROUTE_DEVIATION pushes, at
+# 17:12:57, 17:14:45, 17:36:33, 17:37:28, 17:39:28. The stable key alone gets
+# the last three to three-in-window and would have fired at 17:39:28 — five
+# seconds before the rider gave up and stopped Go Mode. At two it fires at
+# 17:14:45, twenty-five minutes earlier, while "ignore the buzzing" is still
+# an instruction the rider can act on. A rule that only reports storms after
+# they are over is not a safety layer.
+# What keeps two from being noisy: the key fires once per ride (the latch
+# below), a page costs one of two per-trip interrupts, and — the load-bearing
+# one — intake now drops re-POSTed duplicate records, so two-in-window can no
+# longer be one alert counted twice. See _is_duplicate_record.
+NOTIFICATION_REPEAT_COUNT = 2              # fires on the 2nd
 # progress-without-motion. Map-matching noise reported to the rider as travel.
 # On 7/31 the swing was a tenth of a point (0.31 -> 0.21 -> 0.31) inside a 7m
 # circle, which is below this threshold and should stay quiet; the same
@@ -126,8 +220,53 @@ NOTIFICATION_REPEAT_COUNT = 3              # fires on the 3rd
 MOTION_PROGRESS_PCT = 5.0                  # percentage points gained
 MOTION_DISPLACEMENT_M = 15.0               # ...while the fix stayed this close
 MOTION_COOLDOWN_MS = 5 * 60 * 1000
+# replan-not-converging (8/28 afternoon). The destination was inside the State
+# Fairgrounds, where the street graph stops at the fence. The app re-planned
+# into the venue interior for 32 minutes, never got inside 427 m, and told the
+# rider nothing — every plan real, every plan routing to the same unreachable
+# point, each one promising an arrival it could not deliver.
+#
+# The client now guards this itself (otprr 047ee0af / 94a69bba,
+# lib/util/go-mode/destination-progress.ts): it keeps the closest approach
+# across ticks, counts re-plans since that closest approach last improved by
+# 50 m, retires the access mode after three, and raises DESTINATION_UNREACHABLE.
+# So the daemon's job here is NOT to be the primary detector — it is to catch
+# the ride where the client's own guard fails or never fires. Which means the
+# thresholds must MATCH the client's rather than compete with them: a daemon
+# firing on different arithmetic would page about rides the app handled
+# correctly, and stay silent on the one it did not.
+DEST_GAIN_MIN_M = 50.0                     # == client DESTINATION_GAIN_MIN_M
+DEST_STALL_REPLANS = 3                     # == client DESTINATION_STALL_REPLANS
+# ...plus one. The client checks destinationStalled at the TOP of its re-plan
+# routine and increments the counter at the bottom, so the mode is retired on
+# re-plan 3 and the rider is told on re-plan 4. Firing at 3 would race the app
+# and page about a defect it was in the middle of reporting itself.
+DEST_CLIENT_GRACE_REPLANS = 1
+# One re-plan can reach the stream twice: on 8/28 at 16:44:06 a START_REROUTE
+# (reason "boarded-earlier") and the START_GO_MODE that applied its result were
+# logged in the same second. Counting both would retire a converging trip on
+# half the evidence the client used.
+DEST_REPLAN_COLLAPSE_MS = 10 * 1000
+
+# Nothing pages when the wrap-up never appears (8/28). The ride thread spawned
+# fine, took the wrap-up line, and then sat at a permission prompt for about
+# three hours; _thread_missing was false the whole time, so the one fallback
+# push never had a reason to fire. A wrap-up that has not been written this
+# long after the ride ended is not "still thinking".
+REPORT_DEADLINE_MS = 10 * 60 * 1000
+
 MAX_PAGES_PER_TRIP = 2
 PUSH_MIN_INTERVAL_MS = 120 * 1000
+# Intake dedup ring. The debug-log client re-POSTs a batch it is not sure
+# landed, so the same record arrives twice with the same `t` and the same
+# payload id, differing only in `recv` — 208 ms apart on 8/27 13:10:42. That
+# pair was read as an "exact same-second duplicate notification" in the ride
+# notes and chased as an app bug; it was telemetry. Across 8/27-8/29 the
+# streams carry ~1,000-1,700 such records a day (3.7% of 8/27), including
+# UPDATE_PROGRESS and ADD_NOTIFICATION, so every counting rule in this file
+# was exposed. The ring is small because a re-POST follows its original within
+# seconds; it is not a general history.
+RECORD_DEDUP_RING = 4096
 STATUS_DEBOUNCE_MS = 2000
 STOP_INCREASE_COOLDOWN_MS = 60 * 1000
 RIDER_NOTE_MAX_CHARS = 500                 # matches the sidecar's own cap
@@ -201,6 +340,11 @@ PAGE_RANK = {
     #                      is reading it right now to decide what to do
     "itinerary-backwards": 45,
     "missed-bus-while-riding": 40,
+    # replan-not-converging  the app cannot get them there and has not said
+    #                        so; "finish from here yourself" is the only
+    #                        instruction left, and every minute they keep
+    #                        waiting for the next plan is spent
+    "replan-not-converging": 38,
     "notification-repeat": 35,
     "aboard-swap": 30,
     "riding-flip": 20,
@@ -354,6 +498,45 @@ def meters_between(a, b):
     return 2 * 6371000.0 * math.asin(min(1.0, math.sqrt(h)))
 
 
+# The `Date.now()` every notification id ends in. Stripping it is what turns
+# "a fresh id per fire" back into "the same alert".
+_NOTIFICATION_STAMP_RE = re.compile(r"_\d{12,}$")
+
+
+def notification_key(payload):
+    """A stable identity for "the same alert", across the app's drifting text.
+
+    The rule this feeds was keyed on `(title, message)` until 2026-08-31,
+    which is byte-exact and therefore defeated by the one thing every repeated
+    alert does: drift. "You are 121m from the planned route" and "You are 124m
+    from the planned route" are the same alert about the same fault, 175 s
+    apart, and were two separate keys each accumulating its own count. Neither
+    8/28 deviation storm ever reached the threshold in any single key.
+
+    The fix the old docstring already named: the id minus its `Date.now()`
+    suffix. `ROUTE_DEVIATION_deviation_1787956593046` becomes
+    `ROUTE_DEVIATION_deviation`, which is stable across fires and survives the
+    message changing underneath it. `UPCOMING_TURN_<legStart>_<cue>_<stage>`
+    keeps the cue index and the stage, so `_1_prepare` and `_1_act` and
+    `_2_prepare` stay three different alerts, which is correct — they are.
+
+    The title rides along in the key because the id stem is not always
+    discriminating enough on its own (a synthetic stream, or an app build that
+    reuses a stem across turns), and because a changed title is by definition a
+    different thing being said to the rider. Payloads with no usable id fall
+    back to (type, title) — never the message, which is the part that drifts.
+    """
+    title = (payload.get("title") or "").strip()
+    ntype = (payload.get("type") or "").strip()
+    nid = (payload.get("id") or "").strip()
+    stem = _NOTIFICATION_STAMP_RE.sub("", nid) if nid else ""
+    if stem:
+        return (stem, title)
+    if not title and not ntype:
+        return None
+    return (ntype, title)
+
+
 def leg_is_transit(leg):
     if not isinstance(leg, dict):
         return False
@@ -453,6 +636,17 @@ class Trip:
         self.match_distance_fired = False          # re-arms when sane again
         self.stall_anchor = None                   # ((lat, lon), first_seen_ms)
         self.stall_fired_ms = 0
+        # How many position fixes have landed since the anchor was set. A
+        # stalled-progress finding that cannot say this reads as a dead GPS;
+        # on 8/28 the receiver was healthy throughout (2,168 distinct fixes,
+        # ~4.1 m apart) and five findings were triaged as a tracking failure.
+        self.fixes_since_anchor = 0
+        # -- destination convergence (mirrors the client's DestinationProgress)
+        self.dest_best_m = None                    # closest committed approach
+        self.dest_replans_since_gain = 0
+        self.dest_last_replan_ms = 0               # collapses one replan logged twice
+        self.dest_unreachable_ms = None            # the app said it itself
+        self.dest_stall_fired = False
         self.last_rider_action_ms = 0
         self.console_seen = set()
         self.notes = []                           # rider-typed notes, in order
@@ -468,6 +662,11 @@ class Trip:
         self.pending_until_ms = None              # when the window closes
         self.end_ms = None
         self.end_reason = None
+        # Chosen by _write_report_request, then watched by the report deadline
+        # after this Trip has been dropped from self.trips. Held here so the
+        # name the ride thread was given and the name the daemon watches for
+        # are the same string, not two independent guesses at it.
+        self.report_path = None
 
     def current_leg_transit(self):
         """Best-effort: is the leg the rider is currently on a transit leg?"""
@@ -507,6 +706,16 @@ class RideWatch:
         # a bus" flow runs entirely pre-START_GO_MODE, so its findings have no
         # trip to hang on yet; they are flushed when the trip opens.
         self.pending_onboard = {}     # session -> [(t, rule, summary, ctx, push)]
+        # Wrap-ups that have been asked for and not yet appeared. Deliberately
+        # NOT keyed off self.trips: _end_trip deletes the Trip, which is how
+        # the missing-report case escaped every timer in this file. Restored
+        # from state.json below so a restart in the ten minutes after a ride
+        # does not lose the deadline. See _check_report_deadlines.
+        self.report_deadlines = []
+        # Intake dedup ring (see RECORD_DEDUP_RING).
+        self._seen_records = collections.deque()
+        self._seen_record_keys = set()
+        self.duplicate_records = 0
         self.last_trip_summary = self._load_state()
         self.clock_ms = 0             # replay: max event t; live: wall clock
         self.last_push_ms = 0         # global rate limit (shared w/ fallback)
@@ -527,6 +736,8 @@ class RideWatch:
         self._thread_wake = threading.Event()
         self._thread_worker = None
         self._thread_status = {}       # tmux name -> True/False once known
+        self._head_cached = (None, None)   # (head, behind), TTL-cached; never the stamp
+        self._head_checked_ms = 0
 
     # -- clock ------------------------------------------------------------
 
@@ -543,14 +754,20 @@ class RideWatch:
     def _load_state(self):
         try:
             with open(self._state_path()) as f:
-                return json.load(f).get("lastTrip")
+                data = json.load(f)
         except (OSError, ValueError):
             return None
+        if not isinstance(data, dict):
+            return None
+        self.report_deadlines = [d for d in (data.get("reportDeadlines") or [])
+                                 if isinstance(d, dict) and d.get("reportPath")]
+        return data.get("lastTrip")
 
     def _save_state(self):
         try:
             with open(self._state_path(), "w") as f:
-                json.dump({"lastTrip": self.last_trip_summary}, f)
+                json.dump({"lastTrip": self.last_trip_summary,
+                           "reportDeadlines": self.report_deadlines}, f)
         except OSError:
             pass
 
@@ -571,6 +788,46 @@ class RideWatch:
             self.log.error("event processing failed: %r (line type=%s)" % (
                 exc, obj.get("type") or obj.get("event")))
 
+    def _is_duplicate_record(self, obj, t, session, kind, typ):
+        """The same record, delivered twice by a client that re-POSTed a batch.
+
+        The debug-log client retries a batch it is not sure landed, so an
+        identical record arrives again: same `t` (the app's own Date.now()),
+        same payload id, same everything — only the sidecar's `recv` differs,
+        by 208 ms on 2026-08-27 at 13:10:42. That pair went into the ride
+        notes as "an exact same-second duplicate notification", was chased as
+        an app defect, and was telemetry the whole time. The 8/27 note warns
+        about precisely this trap and the next plan repeated it anyway.
+
+        It is not rare and it is not confined to notifications: ~1,000-1,700
+        records a day across 8/27-8/29, 3.7% of 8/27's stream, including
+        UPDATE_PROGRESS, UPDATE_POSITION and ADD_NOTIFICATION. Every rule here
+        that counts events was reading a stream that lies about its counts,
+        which matters most for notification-repeat now that two-in-window is
+        reportable: without this, one alert counted twice IS the finding.
+
+        Deduped on identity, not arrival: `t` comes from the app, so the
+        retried copy carries the original's timestamp and cannot be confused
+        with a genuine second event. Two distinct events of one type in one
+        millisecond do not happen at ~1 Hz telemetry, and if they did the
+        daemon would treat them identically anyway.
+        """
+        payload = obj.get("payload")
+        pid = payload.get("id") if isinstance(payload, dict) else None
+        key = (session, kind, typ, t, pid if isinstance(pid, str) else None)
+        if key in self._seen_record_keys:
+            self.duplicate_records += 1
+            if self.duplicate_records % 100 == 1:
+                self.log.info(
+                    "dropped a re-POSTed duplicate record (%s at %s); %d so far"
+                    % (typ, fmt_hms(t), self.duplicate_records))
+            return True
+        self._seen_record_keys.add(key)
+        self._seen_records.append(key)
+        while len(self._seen_records) > RECORD_DEDUP_RING:
+            self._seen_record_keys.discard(self._seen_records.popleft())
+        return False
+
     def _process(self, obj):
         t = obj.get("t") or int((obj.get("recv") or 0) * 1000)
         if not isinstance(t, (int, float)) or t <= 0:
@@ -582,6 +839,9 @@ class RideWatch:
         typ = obj.get("type")
         if typ is None and kind != "session":
             typ = obj.get("event")
+
+        if self._is_duplicate_record(obj, t, session, kind, typ):
+            return
 
         trip = self.trips.get(session)
         if trip:
@@ -701,6 +961,12 @@ class RideWatch:
             self._thread_event(trip, t, "itinerary swap #%d -> %s" % (
                 trip.swap_seq, itinerary_one_liner(summary)))
             self._rule_aboard_swap(trip, t)
+            # An applied re-plan. This is the signal the client's own
+            # noteReplanAttempt fires on, one step downstream: the daemon
+            # cannot see an attempt, only the itinerary it produced — which
+            # is the better evidence anyway, since a swap that changed
+            # nothing is the fact the rule is about.
+            self._note_replan(trip, t, "itinerary-swap")
         self._flush_pending_onboard(trip)
         self._rule_itinerary_backwards(trip, t, summary)
         self._mark_dirty()
@@ -851,9 +1117,87 @@ class RideWatch:
         if n > 0 and self._thread_missing(trip):
             self.log.warn("no ride thread for %s; falling back to a page"
                           % trip.session)
-            self._report_fallback_push(trip)
+            self._report_fallback_push(n)
+        elif req_path:
+            # A thread that spawned fine and took the wrap-up line is not the
+            # same thing as a wrap-up. Arm a deadline. (8/28)
+            self._arm_report_deadline(trip, t, n)
         self._mark_dirty()
         self.write_status(force=True)
+
+    def _arm_report_deadline(self, trip, t, findings_n):
+        """Watch for the wrap-up that was asked for, and page if it never lands.
+
+        The 8/28 hole: _report_fallback_push had exactly one call site, guarded
+        by _thread_missing, which is true only when the tmux spawn failed or
+        the pane is dead. The evening's thread was neither — it spawned, took
+        the "trip ended … wrap-up now" line, and then sat at a permission
+        prompt for about three hours. No page was ever sent, because from the
+        daemon's side everything had gone right.
+
+        It survives `del self.trips[trip.session]` two ways, both necessary.
+        The entry is a plain dict on self.report_deadlines rather than a Trip,
+        so nothing about it depends on the trip still being live — check_timers
+        iterates self.trips and would never have seen an ended one. And it is
+        written into state.json, so a daemon restarted inside the deadline
+        window re-adopts the promise instead of quietly dropping it, which
+        matters because "restart the daemon on commit" is now a thing that
+        happens to this process mid-evening.
+        """
+        path = trip.report_path
+        if not path:
+            return
+        # No thread object at all means nobody was ever asked to write this:
+        # a replay, or the RIDE_THREAD_ENABLED=0 kill switch. A deadline there
+        # would later "discover" a report that was never promised — re-running
+        # the 7/29 log would page the rider about a ride from last month. The
+        # spawn-failed case does not reach here; _thread_missing pages it now.
+        if trip.thread is None:
+            return
+        self.report_deadlines.append({
+            "session": trip.session,
+            "reportPath": path,
+            "dueMs": int(t) + REPORT_DEADLINE_MS,
+            "findings": findings_n,
+        })
+        self.log.info("wrap-up expected at %s by %s"
+                      % (path, fmt_hms(int(t) + REPORT_DEADLINE_MS)))
+        self._save_state()
+
+    def _check_report_deadlines(self, now):
+        """Has each promised wrap-up appeared? Page for the ones that have not.
+
+        Deliberately checks the file rather than the thread: the question the
+        rider cares about is whether the report exists, and a pane that looks
+        alive has already been shown to prove nothing. reportPath is the exact
+        string handed to the thread in the request file, so this cannot drift
+        into watching for a name nobody was asked to write.
+        """
+        if not self.report_deadlines:
+            return
+        keep, changed = [], False
+        for entry in self.report_deadlines:
+            path = entry.get("reportPath")
+            try:
+                landed = bool(path) and os.path.exists(path)
+            except OSError:
+                landed = False
+            if landed:
+                self.log.info("wrap-up landed for %s: %s"
+                              % (entry.get("session"), path))
+                changed = True
+                continue
+            if now < entry.get("dueMs", 0):
+                keep.append(entry)
+                continue
+            changed = True
+            self.log.warn(
+                "no wrap-up for %s %d min after the ride ended (%s); paging"
+                % (entry.get("session"), REPORT_DEADLINE_MS // 60000, path))
+            self._report_fallback_push(entry.get("findings") or 0)
+        if changed:
+            self.report_deadlines = keep
+            self._save_state()
 
     def check_timers(self):
         """Silence-based rules + trip timeout. Called per event and on ticks.
@@ -887,6 +1231,12 @@ class RideWatch:
             self._check_deviated_streak(trip, now)
             self._check_stalled(trip, now)
             self._maybe_heartbeat(trip, now)
+        # Outside the loop on purpose: a promised wrap-up outlives its trip,
+        # which was deleted from self.trips the moment the ride ended. The
+        # live loop ticks every 5s whether or not telemetry is arriving, so a
+        # phone that has gone home and stopped talking still gets its deadline
+        # checked.
+        self._check_report_deadlines(now)
 
     # -- rules --------------------------------------------------------------
 
@@ -899,8 +1249,15 @@ class RideWatch:
             "stopsRemaining": p.get("stopsRemaining"),
             "stopsTrusted": p.get("stopsTrusted"),
             "nextStopName": p.get("nextStopName"),
+            # Straight-line metres left to the destination, recomputed by the
+            # client every tick (progress-calculator's distanceToFinalStop).
+            # It has been in the stream since 2026-08-28 and until now the
+            # daemon threw it away — which is why the afternoon's 32 minutes
+            # of non-convergent re-planning were invisible here.
+            "distanceToDestination": p.get("distanceToDestination"),
             "tMs": t,
         }
+        self._note_destination_distance(trip, p.get("distanceToDestination"))
         self._mark_dirty()
 
         # Leg transition: the one routine milestone worth a ping. It is where
@@ -989,6 +1346,9 @@ class RideWatch:
             anchor = trip.stall_anchor
             if anchor is None or meters_between(anchor[0], (lat, lon)) > STALL_RADIUS_M:
                 trip.stall_anchor = ((lat, lon), trip.last_pos_ms)
+                trip.fixes_since_anchor = 1
+            else:
+                trip.fixes_since_anchor += 1
 
     def _check_progress_without_motion(self, trip, t, p):
         """Leg progress advancing faster than the rider physically moved.
@@ -1091,12 +1451,32 @@ class RideWatch:
             return
         trip.stall_fired_ms = now
         leg = (trip.progress or {}).get("currentLegIndex")
+        # `lat`/`lon` are the rider's CURRENT fix as of 2026-08-31. They used
+        # to be the anchor's — where the rider FIRST stopped, up to STALL_MS
+        # (15 min) ago and up to STALL_RADIUS_M (60 m) away — while `last_fix`
+        # was loaded three lines up and used only as a null guard. Nothing in
+        # the finding said when the last fix arrived or how many had, so five
+        # 8/28 findings were triaged as a dead GPS receiver. It was not dead:
+        # 2,168 distinct fixes came in, ~4.1 m apart, the whole time. The
+        # anchor is still here under its own name, because "where they stopped"
+        # and "where they are" are different questions and the rule is about
+        # the gap between them.
+        drift = (meters_between(anchor[0], trip.last_fix)
+                 if trip.last_fix else None)
         self._finding(
             trip, now, "stalled-progress", "warn",
-            "stationary %dm inside leg %s with the trip still active" % (
-                held_ms // 60000, leg),
+            "stationary %dm inside leg %s with the trip still active"
+            " (GPS live: %d fixes, last %ds ago)" % (
+                held_ms // 60000, leg, trip.fixes_since_anchor,
+                (now - trip.last_pos_ms) // 1000),
             {"heldMs": held_ms, "legIndex": leg,
-             "lat": anchor[0][0], "lon": anchor[0][1],
+             "lat": trip.last_fix[0], "lon": trip.last_fix[1],
+             "anchorLat": anchor[0][0], "anchorLon": anchor[0][1],
+             "anchorSetMs": anchor[1],
+             "lastFixMs": trip.last_pos_ms,
+             "sinceLastFixMs": now - trip.last_pos_ms,
+             "fixesSinceAnchor": trip.fixes_since_anchor,
+             "movedFromAnchorM": round(drift, 1) if drift is not None else None,
              "legProgress": (trip.progress or {}).get("currentLegProgress")})
 
     def _on_route_match(self, trip, t, p):
@@ -1311,25 +1691,33 @@ class RideWatch:
                 {"notificationId": nid, "message": p.get("message"),
                  "riding": trip.riding.get("tripId")},
                 push_body="Missed-bus alert while aboard %s. Ignore it." % route)
+        if (nid.startswith("DESTINATION_UNREACHABLE")
+                or p.get("type") == "DESTINATION_UNREACHABLE"):
+            self._on_destination_unreachable(trip, t, p)
         self._rule_notification_repeat(trip, t, p)
 
     def _rule_notification_repeat(self, trip, t, p):
         """The same alert, over and over, at a rider who cannot make it stop.
 
-        Keyed on (title, message) rather than the notification id, because the
-        id carries a fresh `Date.now()` on every fire — the very defect that
-        let the 7/31 storm through. The id minus that suffix
-        (`UPCOMING_TURN_<legStart>_<cue>_<stage>`) would also work and survives
-        the message drifting "173 ft" -> "175 ft" on GPS jitter; the stricter
-        key is the conservative choice, since a page costs the rider one of
-        their two interrupts. On the 7/31 log this fires at 11:53:38 — the 3rd
-        of 14 buzzes, six minutes before the rider gave up and typed it out.
+        Keyed through notification_key() — the id minus its `Date.now()`
+        suffix, plus the title — since 2026-08-31. It was keyed on
+        `(title, message)` before that, which is byte-exact and so was beaten
+        by the message drifting: 8/28's five "Off Route" pushes said 121m,
+        121m, 124m, 120m, 124m and were counted as four separate alerts, none
+        of which ever reached the threshold. The rule written for exactly this
+        class of bug did not fire on either of the two deviation storms it was
+        next asked about. The id stem was named as the better key in this
+        docstring's previous version; it is now the key.
+
+        On the 7/31 log the storm fires at 11:53:07 — the 2nd of 14 buzzes,
+        seven minutes before the rider gave up and typed the complaint out on
+        a bike.
         """
-        title = (p.get("title") or p.get("type") or "").strip()
-        message = (p.get("message") or "").strip()
-        if not title and not message:
+        key = notification_key(p)
+        if key is None:
             return
-        key = (title, message)
+        title = key[1] or (p.get("type") or "").strip()
+        message = (p.get("message") or "").strip()
         window = trip.notification_times[key]
         window.append(t)
         while window and t - window[0] > NOTIFICATION_REPEAT_WINDOW_MS:
@@ -1349,7 +1737,9 @@ class RideWatch:
             "same notification %dx in %d min: %s" % (len(window), mins, title),
             {"title": title, "message": message, "count": len(window),
              "windowMs": t - window[0], "notificationId": p.get("id"),
-             "type": p.get("type")},
+             # The stable stem the count was actually accumulated under. The
+             # message is one sample of a drifting family; this is the family.
+             "key": key[0], "type": p.get("type")},
             push_body="Same alert %d times in %d min: %s. Ignore the buzzing."
                       % (len(window), mins, title[:50]))
 
@@ -1367,6 +1757,112 @@ class RideWatch:
                 "%d reroutes within 5 min" % len(trip.reroute_times),
                 {"count": len(trip.reroute_times),
                  "reason": p.get("reason")})
+        self._note_replan(trip, t, p.get("reason") or "reroute")
+
+    # -- destination convergence -------------------------------------------
+    #
+    # reroute-storm above counts reroute EVENTS and nothing else: it cannot
+    # tell "re-planning and converging" (a rider on a changing bus network)
+    # from "re-planning in circles" (a destination the graph cannot reach).
+    # These three methods add the missing half — the distance to the
+    # destination — and mirror the client's own guard so the daemon fires only
+    # where the client's failed to. See DEST_* above.
+
+    def _note_destination_distance(self, trip, d):
+        """Fold this tick's distance-to-destination in.
+
+        Deliberately identical arithmetic to noteDestinationDistance() in
+        lib/util/go-mode/destination-progress.ts, down to the fact that
+        `dest_best_m` is the last COMMITTED best rather than the running
+        minimum: a 20 m improvement does not move it, because 20 m is GPS
+        scatter. The 8/28 afternoon's 427 m floor wandered by tens of metres
+        for half an hour without the rider getting anywhere.
+        """
+        if not isinstance(d, (int, float)) or isinstance(d, bool):
+            return
+        if not math.isfinite(d):
+            return
+        if trip.dest_best_m is None or d <= trip.dest_best_m - DEST_GAIN_MIN_M:
+            trip.dest_best_m = float(d)
+            # A real gain clears everything, retirement included — whatever
+            # changed, the rider is moving again and gets the machinery back.
+            trip.dest_replans_since_gain = 0
+            trip.dest_stall_fired = False
+
+    def _note_replan(self, trip, t, why):
+        """One re-plan happened. Count it, then ask whether they add up."""
+        # No tick has produced a distance yet: "no net reduction" is not a fact
+        # you can hold about a distance nobody has measured. Same guard as the
+        # client's null-state check, and for the same reason — without it a
+        # trip whose destination has no coordinates retires its own re-planning
+        # after three attempts on no evidence at all.
+        if trip.dest_best_m is None:
+            return
+        if t - trip.dest_last_replan_ms < DEST_REPLAN_COLLAPSE_MS:
+            return
+        trip.dest_last_replan_ms = t
+        trip.dest_replans_since_gain += 1
+        self._rule_replan_not_converging(trip, t, why)
+
+    def _rule_replan_not_converging(self, trip, t, why):
+        """Re-planning that is not getting the rider any closer, unannounced.
+
+        8/28 afternoon: the destination sat inside the State Fairgrounds, where
+        the street graph stops at the fence. Thirty-two minutes of re-planning
+        into the venue interior, never inside 427 m, each plan promising an
+        arrival it could not deliver, and the rider told nothing. reroute-storm
+        watched the whole thing and had nothing to say, because it counts
+        reroutes and never looks at whether they are working.
+
+        The client now catches this itself and raises DESTINATION_UNREACHABLE.
+        So this rule is deliberately the SECOND line: if that notification has
+        reached the stream, the app is behaving correctly and the rider has
+        already been told — spending one of two interrupts repeating it would
+        make the daemon the noise. It fires only for the ride where the app's
+        own guard failed or never ran, which is exactly the ride nobody is
+        watching.
+        """
+        if trip.dest_stall_fired or trip.arrived_ms is not None:
+            return
+        if trip.dest_unreachable_ms is not None:
+            return
+        if trip.dest_replans_since_gain < DEST_STALL_REPLANS + DEST_CLIENT_GRACE_REPLANS:
+            return
+        trip.dest_stall_fired = True
+        far = int(round(trip.dest_best_m))
+        self._finding(
+            trip, t, "replan-not-converging", "page",
+            "%d re-plans with no %dm gain; still %dm from the destination"
+            % (trip.dest_replans_since_gain, int(DEST_GAIN_MIN_M), far),
+            {"replansSinceGain": trip.dest_replans_since_gain,
+             "bestDistanceM": trip.dest_best_m,
+             "gainMinM": DEST_GAIN_MIN_M,
+             "lastReplanReason": why,
+             # False is the whole reason this is a page: the app was supposed
+             # to say this itself and did not.
+             "appSaidUnreachable": False},
+            push_body="Re-planning is not getting you closer — still %dm out "
+                      "after %d tries. Finish from here your own way."
+                      % (far, trip.dest_replans_since_gain))
+
+    def _on_destination_unreachable(self, trip, t, p):
+        """The app worked out for itself that it cannot get there.
+
+        Recorded, not paged: the rider has a high-priority push about it on
+        their phone already. It goes in the ledger so the wrap-up can tell
+        "the graph could not reach the destination" apart from "the daemon's
+        convergence rule fired", and it latches the daemon's own rule off.
+        """
+        if trip.dest_unreachable_ms is not None:
+            return
+        trip.dest_unreachable_ms = t
+        self._finding(
+            trip, t, "destination-unreachable", "info",
+            "app gave up re-planning to the destination: %s"
+            % one_line(p.get("message") or "", 120),
+            {"notificationId": p.get("id"),
+             "replansSinceGain": trip.dest_replans_since_gain,
+             "bestDistanceM": trip.dest_best_m})
 
     def _rule_console(self, trip, t, obj):
         if obj.get("level") != "error":
@@ -1662,6 +2158,8 @@ class RideWatch:
                 trip.start_ms / 1000).strftime("%H%M")))
 
     def _write_report_request(self, trip):
+        report_path = self._report_path(trip)
+        trip.report_path = report_path
         req = {
             "session": trip.session,
             "date": fmt_date(trip.start_ms),
@@ -1670,7 +2168,9 @@ class RideWatch:
             "findingsPath": self._findings_path(trip),
             # Where to write the wrap-up. Use it verbatim: deriving a path from
             # `session` collides with an earlier ride on the same session id.
-            "reportPath": self._report_path(trip),
+            # Held on the trip as well so the report deadline watches for the
+            # same file the thread was asked to write, not a second guess at it.
+            "reportPath": report_path,
             # findingsPath is a per-DAY, per-session ledger and can hold an
             # earlier ride's findings too. Only records at or after this
             # timestamp belong to this ride; findingsCount counts only those.
@@ -1691,11 +2191,14 @@ class RideWatch:
         self.log.info("report request written: %s" % path)
         return path
 
-    def _report_fallback_push(self, trip):
+    def _report_fallback_push(self, findings_n):
+        # Takes a count, not a Trip: the report-deadline path fires long after
+        # _end_trip dropped the Trip object, and may fire in a process that
+        # never saw the ride at all (state.json survives a restart).
         self._send_push(
             "Ride watch",
             "Ride ended — %d findings. Report pending; open Claude and say 'ride report'."
-            % len(trip.findings),
+            % findings_n,
             kind="fallback")
 
     # -- the ride thread ----------------------------------------------------
@@ -1845,6 +2348,72 @@ class RideWatch:
 
     # -- the digest ---------------------------------------------------------
 
+    def _repo_head_now(self):
+        """(head, commits_behind) as of a few minutes ago. Never the stamp.
+
+        This is the OTHER half of the version question and must never be
+        confused with DAEMON_GIT_SHA: that constant says what is running, this
+        says what is on disk, and the whole value of the pair is that they can
+        disagree. Note that this is the exact opposite of what a build script
+        wants — a build proves the tree did not move under it and fails if it
+        did. A daemon fully expects the tree to move underneath it; the drift
+        IS the signal. So this never aborts, never re-execs, never restarts
+        anything. It reports.
+
+        Cached for HEAD_RECHECK_MS so neither the digest nor the status file
+        shells out to git on a hot path, and read-only (`rev-parse` and
+        `rev-list` take no index lock) because other agents commit in this same
+        worktree.
+        """
+        now = int(time.time() * 1000)
+        if (self._head_checked_ms
+                and now - self._head_checked_ms < HEAD_RECHECK_MS):
+            return self._head_cached
+        self._head_checked_ms = now
+        head = _git_out(["rev-parse", "--short", "HEAD"]) or None
+        behind = None
+        base = DAEMON_GIT_SHA.split("-", 1)[0]
+        if head and base != "unknown" and head != base:
+            # How far behind, in commits. "five days stale" was the thing
+            # nobody could see on 8/28; a number makes it unignorable.
+            count = _git_out(["rev-list", "--count", "%s..HEAD" % base])
+            if count and count.isdigit():
+                behind = int(count)
+        self._head_cached = (head, behind)
+        return self._head_cached
+
+    def _daemon_lines(self):
+        """Who is running, in two lines, at the top of everything a human reads.
+
+        On 2026-08-28 a daemon five days stale produced five false
+        stalled-progress findings, missed the arrival event, and nearly
+        overwrote a report — and no artifact it wrote said which version it
+        was. The ride thread sat reading source on disk that the process in
+        memory had never loaded.
+        """
+        started = datetime.datetime.fromtimestamp(
+            DAEMON_STARTED_MS / 1000).strftime("%Y-%m-%d %H:%M:%S")
+        line = "Daemon: %s @ %s (started %s" % (
+            os.path.basename(os.path.abspath(__file__)), DAEMON_GIT_SHA, started)
+        if DAEMON_SOURCE_MTIME:
+            line += ", source mtime %s" % datetime.datetime.fromtimestamp(
+                DAEMON_SOURCE_MTIME).strftime("%Y-%m-%d %H:%M:%S")
+        line += ")"
+        out = [line]
+        head, behind = self._repo_head_now()
+        base = DAEMON_GIT_SHA.split("-", 1)[0]
+        if head and base != "unknown" and head != base:
+            out.append(
+                "Tree now: %s  ** STALE — this daemon is running %s%s."
+                " Findings may come from code that no longer exists. Restart:"
+                " `systemctl --user restart ride-watch` **"
+                % (head, base,
+                   ", %d commit(s) behind" % behind if behind else ""))
+        if self.duplicate_records:
+            out.append("Duplicate (re-POSTed) records dropped: %d"
+                       % self.duplicate_records)
+        return out
+
     def _digest_path(self, trip):
         return os.path.join(self.watch_dir, "%s.digest.md" % trip.session)
 
@@ -1858,8 +2427,9 @@ class RideWatch:
         now = self.now_ms()
         L = ["# Ride digest — session %s" % trip.session, "",
              "Written: %s" % datetime.datetime.now().strftime(
-                 "%Y-%m-%d %H:%M:%S"),
-             "Pushes so far: %d" % trip.thread_pushes, ""]
+                 "%Y-%m-%d %H:%M:%S")]
+        L.extend(self._daemon_lines())
+        L.extend(["Pushes so far: %d" % trip.thread_pushes, ""])
         L.append("## Trip")
         L.append("")
         L.extend(self._trip_state_lines(trip, now))
@@ -2079,6 +2649,11 @@ class RideWatch:
         self._status_last_write = self.now_ms() if self.replay else int(time.time() * 1000)
         lines = ["# Ride watch — live status", ""]
         lines.append("Updated: %s" % datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        # Which daemon wrote this. Cheap here and load-bearing: a rider console
+        # or a Claude session reading a status file has no other way to know
+        # whether the process that produced it is running the source they are
+        # about to read. (8/28)
+        lines.extend(self._daemon_lines())
         lines.append("")
         if not self.trips:
             if self.last_trip_summary:
@@ -2092,8 +2667,11 @@ class RideWatch:
                         s.get("reason")))
             else:
                 lines.append("No active trip. Last: none recorded yet.")
-        # Every per-session file opens with the same header as the combined one.
-        header = lines[:3]
+        # Every per-session file opens with the same header as the combined
+        # one: title, blank, Updated:, then the daemon-provenance lines. Sliced
+        # by content rather than a fixed count because _daemon_lines() varies
+        # (the STALE warning and the duplicate-record count come and go).
+        header = lines[:3] + self._daemon_lines()
         # list(): the tailer may be starting or ending a trip while this runs.
         for trip in list(self.trips.values()):
             now = self.now_ms()
@@ -2324,8 +2902,8 @@ def run_replay(path, watch=None, watch_dir=None):
 def run_live(watch_dir=None):
     watch = RideWatch(dry_run=DRY_RUN, replay=False, watch_dir=watch_dir or WATCH_DIR)
     log = watch.log
-    log.info("ride-watch starting (dry_run=%s, log_dir=%s, watch_dir=%s)"
-             % (watch.dry_run, DEBUG_LOG_DIR, watch.watch_dir))
+    log.info("ride-watch starting (sha=%s, dry_run=%s, log_dir=%s, watch_dir=%s)"
+             % (DAEMON_GIT_SHA, watch.dry_run, DEBUG_LOG_DIR, watch.watch_dir))
     tailer = Tailer(log)
     stop = {"flag": False}
 

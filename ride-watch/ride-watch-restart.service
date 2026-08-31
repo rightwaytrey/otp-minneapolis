@@ -1,0 +1,20 @@
+[Unit]
+Description=Restart ride-watch (triggered by ride-watch-restart.path)
+Documentation=file:///home/rwt/projects/otp-minneapolis/ride-watch/README.md
+
+[Service]
+Type=oneshot
+# Never mid-ride. A restart is safe in the ways that matter — KillMode=process
+# leaves the rider's live tmux ride thread alone, the trip is re-adopted on the
+# next UPDATE_PROGRESS, and the report deadline survives in state.json — but it
+# is not free: per-trip rule state (stall anchors, notification windows,
+# destination convergence, the 2-page budget) resets, and the adopted trip
+# spawns a SECOND ride thread the rider then sees in their app. So the file
+# changing during a ride is not a reason to interrupt it; the digest's own
+# STALE line tells the ride thread what it is running, and the human decides.
+#
+# Reads the daemon's own idle marker. If the status file is missing or
+# unreadable the condition fails and nothing restarts, which is the right
+# default: do not act on a state you cannot observe.
+ExecCondition=/bin/sh -c 'grep -q "^No active trip" %h/otp-debug-logs/ride-watch/current-ride.md'
+ExecStart=/usr/bin/systemctl --user restart ride-watch.service
