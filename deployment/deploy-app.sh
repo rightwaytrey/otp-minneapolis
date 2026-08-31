@@ -160,11 +160,20 @@ WWW_PLAN="$(rsync -az --delete --dry-run --itemize-changes \
 WWW_DELETES="$(printf '%s\n' "$WWW_PLAN" | grep -c '^\*deleting' || true)"
 WWW_CHANGES="$(printf '%s\n' "$WWW_PLAN" | grep -cv '^\*deleting' || true)"
 echo "  frontend mirror: ${WWW_CHANGES} new/changed, ${WWW_DELETES} deleted"
-if [ "$WWW_DELETES" -gt 0 ] && [ "$YES_WWW" -ne 1 ]; then
-  echo "${RED}Refusing to publish the frontend: ${WWW_DELETES} file(s) would be DELETED from production.${NC}"
-  echo "${YELLOW}That means the desktop build differs from what is live. Check you are shipping"
-  echo "what you think you are, then re-run with --yes-www, or --skip web to leave it alone.${NC}"
-  printf '%s\n' "$WWW_PLAN" | grep '^\*deleting' | head -10
+# Gate on ANY difference, not just deletions. The first version of this guard
+# only refused when files would be removed, which left the case that actually
+# happened wide open: a desktop build with 215 new/changed files and nothing to
+# delete publishes an entire unreleased UI in silence. Deletions are the loud
+# symptom of divergence, not the definition of it -- writes publish just as
+# much. Zero and zero still proceeds without ceremony, because a mirror that
+# changes nothing IS nothing.
+if [ "$((WWW_DELETES + WWW_CHANGES))" -gt 0 ] && [ "$YES_WWW" -ne 1 ]; then
+  echo "${RED}Refusing to publish the frontend: ${WWW_CHANGES} file(s) would be written and ${WWW_DELETES} DELETED on production.${NC}"
+  echo "${YELLOW}The desktop build differs from what is live, so this would publish whatever"
+  echo "the last local build left in /var/www/transitnav. Check you are shipping what you"
+  echo "think you are, then re-run with --yes-www, or --skip web to leave it alone.${NC}"
+  printf '%s\n' "$WWW_PLAN" | grep '^\*deleting' | head -5
+  printf '%s\n' "$WWW_PLAN" | grep -v '^\*deleting' | head -5
   exit 1
 fi
 rsync -az --delete /var/www/transitnav/ "$RUSER:/tmp/transitnav-www/"
