@@ -2174,6 +2174,43 @@ class TestDuplicateRecords(RuleTestCase):
         watch = self.run_stream(b, finalize=False)
         self.assertEqual(watch.duplicate_records, 0)
 
+    def test_a_burst_inside_one_delivery_is_not_a_duplicate(self):
+        """The correction of 2026-08-31. Identity alone dropped genuine records.
+
+        8/27 13:35:02 carries 197 POSITION_RESPONSE actions inside 584 ms, one
+        per in-flight request settling, and many share a millisecond. Keyed on
+        identity alone the daemon discarded 492 real records that day, 461 of
+        them POSITION_RESPONSE, to catch 1,207 true re-POSTs. Records written
+        by one POST share a `recv`, so a repeat inside one delivery cannot be
+        a re-send.
+        """
+        b = StreamBuilder().start().advance(1000).position()
+        twin = dict(b.events[-1])          # same t, same payload, same delivery
+        b.events.append(twin)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.duplicate_records, 0)
+
+    def test_the_same_record_in_a_later_delivery_still_is(self):
+        """The other half: differing `recv` is what makes it a re-POST."""
+        b = StreamBuilder().start().advance(1000).position()
+        again = dict(b.events[-1])
+        again["recv"] = again["recv"] + 2.096   # the real 8/27 gap
+        b.events.append(again)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.duplicate_records, 1)
+
+    def test_a_client_minted_entry_id_is_preferred_over_the_heuristic(self):
+        """Once entries carry ids the inference is unnecessary: a re-send
+        carries the original's id, a burst member carries its own."""
+        b = StreamBuilder().start().advance(1000).position()
+        b.events[-1]["id"] = "sess-1a"
+        again = dict(b.events[-1])
+        again["recv"] = again["recv"] + 1.0
+        again["t"] = again["t"] + 5          # heuristic would MISS this
+        b.events.append(again)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.duplicate_records, 1)
+
     def test_the_dedup_ring_is_bounded(self):
         b = StreamBuilder().start()
         for _ in range(ride_watch.RECORD_DEDUP_RING + 500):

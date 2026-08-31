@@ -364,6 +364,10 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 # ---------------------------------------------------------------------------
 
 
+
+# `recv` may legitimately be None, so absence needs its own sentinel.
+_UNSEEN = object()
+
 class Log:
     def __init__(self, path, echo=True):
         self.path = path
@@ -714,7 +718,7 @@ class RideWatch:
         self.report_deadlines = []
         # Intake dedup ring (see RECORD_DEDUP_RING).
         self._seen_records = collections.deque()
-        self._seen_record_keys = set()
+        self._seen_record_keys = {}
         self.duplicate_records = 0
         self.last_trip_summary = self._load_state()
         self.clock_ms = 0             # replay: max event t; live: wall clock
@@ -806,26 +810,46 @@ class RideWatch:
         which matters most for notification-repeat now that two-in-window is
         reportable: without this, one alert counted twice IS the finding.
 
-        Deduped on identity, not arrival: `t` comes from the app, so the
-        retried copy carries the original's timestamp and cannot be confused
-        with a genuine second event. Two distinct events of one type in one
-        millisecond do not happen at ~1 Hz telemetry, and if they did the
-        daemon would treat them identically anyway.
+        Deduped on identity AND arrival, because identity alone was wrong.
+        The first version of this asserted that "two distinct events of one
+        type in one millisecond do not happen at ~1 Hz telemetry". They do:
+        2026-08-27 13:35:02 carries 197 POSITION_RESPONSE actions in 584 ms,
+        one per in-flight request settling. On identity alone this dropped 492
+        genuine records that day -- 461 of them POSITION_RESPONSE -- while
+        catching 1,207 real re-POSTs.
+
+        `recv` is what separates them. It is stamped by the sink per REQUEST,
+        so every record written by one POST shares it: a re-POST necessarily
+        carries a different `recv`, and a burst inside one batch necessarily
+        shares one. So a repeat is a duplicate only when it arrives in a
+        different delivery than the one that first carried it.
+
+        Prefers the client's own entry id when the record has one. That is
+        exact where this is inferential -- a re-send carries the original's
+        id, and each member of a same-millisecond burst carries its own -- so
+        once clients mint ids the heuristic below is only for historical logs.
         """
         payload = obj.get("payload")
         pid = payload.get("id") if isinstance(payload, dict) else None
-        key = (session, kind, typ, t, pid if isinstance(pid, str) else None)
-        if key in self._seen_record_keys:
+        entry_id = obj.get("id")
+        if isinstance(entry_id, str) and entry_id:
+            key = ("id", entry_id)
+        else:
+            key = (session, kind, typ, t, pid if isinstance(pid, str) else None)
+        recv = obj.get("recv")
+        seen_recv = self._seen_record_keys.get(key, _UNSEEN)
+        if seen_recv is not _UNSEEN and seen_recv != recv:
             self.duplicate_records += 1
             if self.duplicate_records % 100 == 1:
                 self.log.info(
                     "dropped a re-POSTed duplicate record (%s at %s); %d so far"
                     % (typ, fmt_hms(t), self.duplicate_records))
             return True
-        self._seen_record_keys.add(key)
-        self._seen_records.append(key)
-        while len(self._seen_records) > RECORD_DEDUP_RING:
-            self._seen_record_keys.discard(self._seen_records.popleft())
+        if seen_recv is _UNSEEN:
+            self._seen_record_keys[key] = recv
+            self._seen_records.append(key)
+            while len(self._seen_records) > RECORD_DEDUP_RING:
+                self._seen_record_keys.pop(self._seen_records.popleft(), None)
         return False
 
     def _process(self, obj):
