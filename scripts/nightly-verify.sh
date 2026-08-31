@@ -72,9 +72,16 @@ if ! curl -sf -o /dev/null --max-time 15 "$APP_URL"; then
   exit 1
 fi
 
-pass=0 fail=0
+# A script may exit 75 to say "the thing under test could not be exercised, and
+# that is not a defect" -- e.g. verify-onboard-options at 05:00, when no bus is
+# out of the garage to board. That is not a pass and it is not a failure; either
+# label is a lie, and a suite that cries wolf gets discounted.
+EXIT_SKIP=75
+
+pass=0 fail=0 skip=0
 results=""
 failures=""
+skips=""
 
 for script in "$WEB_REPO"/scripts/verify-*.js; do
   name=$(basename "$script" .js)
@@ -87,16 +94,26 @@ for script in "$WEB_REPO"/scripts/verify-*.js; do
     status=PASS; pass=$((pass + 1))
   else
     rc=$?
-    if [ "$rc" -eq 124 ]; then status="TIMEOUT (${limit}s cap)"; else status=FAIL; fi
-    fail=$((fail + 1))
-    failures+=$'\n'"## $name — $status"$'\n\n```\n'"$(tail -25 "$log")"$'\n```\n'
+    if [ "$rc" -eq "$EXIT_SKIP" ]; then
+      status=SKIP
+      skip=$((skip + 1))
+      skips+=$'\n'"## $name — SKIP"$'\n\n```\n'"$(tail -25 "$log")"$'\n```\n'
+    else
+      if [ "$rc" -eq 124 ]; then status="TIMEOUT (${limit}s cap)"; else status=FAIL; fi
+      fail=$((fail + 1))
+      failures+=$'\n'"## $name — $status"$'\n\n```\n'"$(tail -25 "$log")"$'\n```\n'
+    fi
   fi
   dur=$(( $(date +%s) - start ))
   results+="| $name | $status | ${dur}s |"$'\n'
 done
 
 {
-  echo "**${pass} passed, ${fail} failed.**"
+  if [ "$skip" -gt 0 ]; then
+    echo "**${pass} passed, ${fail} failed, ${skip} skipped.**"
+  else
+    echo "**${pass} passed, ${fail} failed.**"
+  fi
   echo
   echo "| script | result | duration |"
   echo "| --- | --- | --- |"
@@ -104,6 +121,12 @@ done
   if [ -n "$failures" ]; then
     echo
     echo "$failures"
+  fi
+  if [ -n "$skips" ]; then
+    echo
+    echo "$skips"
+  fi
+  if [ -n "$failures" ] || [ -n "$skips" ]; then
     echo
     echo "Raw logs: \`$RUN_DIR/\`"
   fi
