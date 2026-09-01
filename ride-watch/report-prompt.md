@@ -171,6 +171,37 @@ any rule that *should exist* because a note caught something no rule did>
 
 Keep it tight. Prose only where it carries evidence.
 
+**Those are the only sections.** Do not add a `## Fix backlog`, `## Next steps`,
+`## TODO` or any other list of things to fix later — the report is the *record of
+one ride*, and a fix list living in it is a fix list nobody will read again. The
+per-finding `**Fix:**` line stays; the ordered list of what to do next belongs in
+the backlog, below.
+
+## Promote the findings to the backlog
+
+After the report is written, add its actionable findings to the one ordered backlog,
+`~/.claude/plans/please-make-a-centralized-sharded-petal.md`. That file is the only
+place open TransitNav work is tracked, across all four repos.
+
+1. **Read the existing tiers first, and dedupe.** If a finding recurs, do **not** open
+   a new row — add the observation to that tier's dedupe list against the existing
+   item number and say it is now the Nth sighting. A recurrence outranks a novelty.
+2. Open one new tier for the ride:
+   `## Tier N — <what these findings share> *(opened <date>, all OPEN)*`, with a
+   two-or-three-line header naming the session, the report path, the fixture, and the
+   single defect chain if one explains most of the ride.
+3. One row per finding: `N.M`, a **bolded one-line finding**, and a Note carrying the
+   evidence you already gathered — action types, timestamps, real numbers, `file:line`.
+   Link the report rather than restating it.
+4. Add each row to the **Session index** table, naming the repo the fix lands in.
+   Add a **Sequencing constraints** line when one finding is downstream of another.
+   Add a bullet to **"OPEN, and this is the whole list"** for the new tier.
+5. Say what you **ruled out**. Never delete or rewrite an existing row that is not
+   yours; mark, do not remove.
+
+Rider notes that are feature requests go in the tier too, flagged as asks and
+cross-referenced to whichever defect blocks them.
+
 ## Finish
 
 Send one Pushover notification with the result. Read credentials from

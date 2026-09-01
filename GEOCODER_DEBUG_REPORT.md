@@ -1,5 +1,10 @@
 # Geocoder Debug Report
 
+> **SUPERSEDED — kept as history, not as an action list.** Written 2026-01 against the
+> Photon geocoder and the local Docker proxy, both replaced by the 2026-08-25 Linode
+> migration (Stadia geocoding). Nothing here is open work. Open work lives only in
+> `~/.claude/plans/please-make-a-centralized-sharded-petal.md`.
+
 **Date:** 2026-01-20
 **Status:** Root cause identified ✓
 
