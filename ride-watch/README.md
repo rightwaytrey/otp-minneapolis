@@ -24,12 +24,29 @@ line (`{kind:"console", level, args}`), or a session marker.
 **State machine**, per session:
 
 - `idle` → `active` on `START_GO_MODE` (the itinerary is captured then)
-- `active` → `ended` on `STOP_GO_MODE`, or after 15 minutes of silence
+- `active` → `ended` on `STOP_GO_MODE`, after 15 minutes of silence, or five
+  minutes after **arrival** (`SET_ARRIVED`, or `status: "completed"` on
+  `UPDATE_PROGRESS`, whichever the daemon sees first). The arrival end is not
+  a nicety: on 2026-08-31 the app went on emitting ~1 Hz telemetry for 1h44m
+  after the rider got off, so every silence-based end was unreachable and the
+  ride was still "active" — with no report request — two hours later. Arrival
+  is un-latched again by boarding a vehicle, advancing to a later leg, or an
+  itinerary swap, all things a finished trip does not do.
 - A *second* `START_GO_MODE` during an active trip is an **itinerary swap**,
   not a new trip. This distinction is what makes the `aboard-swap` rule
   possible.
 - If the daemon starts mid-ride it scans the last 5 minutes of the file and
-  **adopts** an in-progress trip rather than missing it.
+  **adopts** an in-progress trip rather than missing it — unless the app says
+  the trip is already `completed` (a finished ride is not a ride to watch;
+  8/31's two phantom rides were both adopted off post-arrival ticks), or the
+  daemon closed that session at arrival already (only a fresh `START_GO_MODE`
+  re-opens it).
+- A new session id that is plainly the **same ride re-mounted** — same
+  device, no `START_GO_MODE` of its own, within 2 minutes, same leg at the
+  same point in it — is adopted as an alias of the running trip rather than
+  as a second ride, and recorded as a `session-churn` finding so the split
+  stays visible. `trip.session` never moves, so one ride keeps one findings
+  ledger, one digest and one report.
 
 **Rules.** Each produces a finding
 `{tsMs, session, rule, severity, summary, context}` at `info`, `warn`, or
@@ -51,6 +68,7 @@ line (`{kind:"console", level, args}`), or a session marker.
 | `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
 | `console-error` | a `console.error` line (deduped by message) | info |
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
+| `session-churn` | the app re-mounted mid-ride and minted a new session id | warn |
 
 Two of those were written on 2026-07-31, after a ride where **every single
 finding was a rider note** — the engine had nothing to say while the app
@@ -318,6 +336,22 @@ so a daemon restarted inside the window re-adopts the promise instead of
 dropping it — which matters now that restarting on a commit is a thing that
 happens to this process mid-evening. A trip with no thread object at all (a
 replay, or `RIDE_THREAD_ENABLED=0`) arms nothing: nobody was asked.
+
+The deadline is measured **from when it is armed**, not from the trip's end
+timestamp: a timeout end is stamped with the ride's last event, fifteen
+minutes in the past, so a deadline armed from it was already expired. On
+2026-08-31 at 18:00:34 the daemon logged "wrap-up expected … by 17:55:33" and
+paged about the missing report in the same second, before the thread had even
+been handed the request.
+
+The deadline also records **which tmux pane** was asked, and
+`_kill_previous_threads` spares that pane. The next ride's thread used to kill
+it outright: 15:52:31 "wrap-up now" to `ride-1535`, 15:52:48 the next ride
+starts and kills it — seventeen seconds. The same pattern at 17:07:50 →
+17:08:43 destroyed `ride-1700` mid-write and that report was never written;
+the deadline duly paged about it ten minutes later, which is the safety net
+working and the report still gone. Protection lasts only as long as the
+deadline, so a pane that never writes cannot pin the namespace.
 
 `RIDE_THREAD_ENABLED=0` (set in the systemd unit) disables the whole thing: the
 daemon then behaves exactly as it did before threads existed.

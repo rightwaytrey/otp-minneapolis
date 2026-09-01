@@ -149,6 +149,29 @@ HEAD_RECHECK_MS = 5 * 60 * 1000
 STARTUP_LOOKBACK_MS = 5 * 60 * 1000        # scan back this far at startup
 LOOKBACK_TAIL_BYTES = 16 * 1024 * 1024     # ...reading at most this much tail
 SESSION_TIMEOUT_MS = 15 * 60 * 1000        # trip ends after this much silence
+# ...and this long after arrival, whether or not the app ever goes quiet.
+# Every trip-end this daemon had was a silence: STOP_GO_MODE, the timeout
+# above, or replay EOF. On 2026-08-31 the rider arrived at 18:52:14, the app
+# latched SET_ARRIVED and then went on emitting UPDATE_POSITION /
+# UPDATE_ROUTE_MATCH / UPDATE_PROGRESS at ~1 Hz with `status: "completed"` for
+# the next hour and three quarters (18,105 records, still going at 20:36).
+# The stream never fell silent, so no silence rule could reach it: no report
+# request was written, the ride thread was never asked to wrap up, and
+# current-ride.md still showed a live ride two hours after the rider got off.
+# Five minutes, not one: the rider typed their note at the destination three
+# minutes after arrival that evening, and it belongs to the ride.
+ARRIVED_END_MS = 5 * 60 * 1000
+# One ride, two session ids. The app re-mounted at 18:52:55 and minted
+# `mthw8o2w-i8z1i6` 41 s after `mthw7svy-s4msqc` — same phone, same itinerary,
+# same frozen leg, seconds apart. The daemon read them as two rides: two
+# adoptions, two "trip started" pings, findings split 18/19 across two ledgers,
+# two tmux threads (the second spawn failed: duplicate session ride-1852), and
+# every per-ride counter — stall anchor, notification windows, page budget —
+# back to zero. A resumed Go Mode emits no START_GO_MODE (the fixture builder
+# rejects those sessions for exactly this reason), so the only door a
+# continuation can come through is adoption, which is where these gates sit.
+CONTINUATION_GAP_MS = 120 * 1000           # since the older trip's last event
+CONTINUATION_PROGRESS_PCT = 2.0            # same leg, within this much of it
 STOP_COLLAPSE_MAX_PROGRESS = 60.0          # percent
 DEVIATED_STREAK_MS = 90 * 1000
 GPS_GAP_MS = 60 * 1000
@@ -607,6 +630,13 @@ def itinerary_one_liner(summary):
 class Trip:
     def __init__(self, session, start_ms, itinerary_summary, adopted=False):
         self.session = session
+        # Every session id this one ride has been seen under. The app mints a
+        # new one on every mount, so a ride the rider never interrupted can
+        # arrive under two (2026-08-31 18:52). The first stays `session` —
+        # findings ledger, digest and report path all hang off it — and the
+        # rest are aliases in RideWatch.trips. See _adopt_continuation.
+        self.sessions = [session]
+        self.device = None            # which phone; the anchor for a remount
         self.start_ms = start_ms
         self.itinerary = itinerary_summary        # latest itinerary summary
         self.adopted = adopted                    # trip inferred mid-stream
@@ -620,6 +650,7 @@ class Trip:
         self.gps_gap_open = False
         self.gps_gap_started_ms = None            # last_pos_ms when the gap opened
         self.arrived_ms = None                    # SET_ARRIVED; the trip is over
+        self.arrived_leg = None                   # leg index when it latched
         self.notification_times = collections.defaultdict(collections.deque)
         self.notification_repeat_last = {}        # key -> ms of last finding
         self.motion_anchor = None                 # where progress was last real
@@ -706,6 +737,10 @@ class RideWatch:
         self.all_findings = []        # every finding this process has emitted
         self.ended_trips = []         # Trip objects, for replay/test inspection
         self.recently_ended = {}      # session -> end_ms (blocks re-adoption)
+        self._declined_completed = set()   # sessions refused adoption, logged once
+        # Sessions whose ride this daemon closed at arrival. Re-adopting one
+        # is how a single 8/27 ride became nine (see _maybe_adopt).
+        self.ended_arrived = set()
         # Onboard-flow anomalies seen BEFORE a trip exists. The "I'm already on
         # a bus" flow runs entirely pre-START_GO_MODE, so its findings have no
         # trip to hang on yet; they are flushed when the trip opens.
@@ -765,13 +800,22 @@ class RideWatch:
             return None
         self.report_deadlines = [d for d in (data.get("reportDeadlines") or [])
                                  if isinstance(d, dict) and d.get("reportPath")]
+        # A ride closed at arrival whose app is STILL streaming outlives this
+        # process — that is the shape of the whole 8/31 fault — and
+        # restart-on-commit happens to this daemon mid-evening. Without this,
+        # a restart re-adopts the finished ride as a new one on the next tick.
+        self.ended_arrived = set(
+            x for x in (data.get("endedArrived") or []) if isinstance(x, str))
         return data.get("lastTrip")
 
     def _save_state(self):
         try:
             with open(self._state_path(), "w") as f:
                 json.dump({"lastTrip": self.last_trip_summary,
-                           "reportDeadlines": self.report_deadlines}, f)
+                           "reportDeadlines": self.report_deadlines,
+                           # Bounded: one session id per app load, so the tail
+                           # is every ride of the last few days.
+                           "endedArrived": sorted(self.ended_arrived)[-32:]}, f)
         except OSError:
             pass
 
@@ -870,6 +914,8 @@ class RideWatch:
         trip = self.trips.get(session)
         if trip:
             trip.last_event_ms = max(trip.last_event_ms, t)
+            if not trip.device:
+                trip.device = obj.get("device")
 
         if typ == "START_GO_MODE":
             self._on_start_go_mode(session, t, obj)
@@ -913,9 +959,7 @@ class RideWatch:
                 # a finished trip for four and a half hours and produced ~25 of
                 # that ride's 42 findings about a rider sitting at their desk
                 # and then driving home.
-                if trip.arrived_ms is None:
-                    trip.arrived_ms = t
-                    self._thread_event(trip, t, "arrived at destination")
+                self._note_arrival(trip, t, "SET_ARRIVED")
             elif typ == "UPDATE_PROGRESS":
                 self._on_progress(trip, t, obj.get("payload") or {})
             elif typ == "UPDATE_ROUTE_MATCH":
@@ -938,18 +982,9 @@ class RideWatch:
                 trip.last_rider_action_ms = t
         elif typ == "UPDATE_PROGRESS":
             # Go Mode is clearly active but we never saw START_GO_MODE
-            # (daemon started mid-trip): adopt the trip.
-            ended = self.recently_ended.get(session, 0)
-            if t - ended > 60 * 1000:
-                trip = Trip(session, t, None, adopted=True)
-                self.trips[session] = trip
-                self.log.info("adopted mid-stream trip for session %s" % session)
-                # An adopted trip is a ride in progress — usually the daemon was
-                # just restarted under a rider who is still on the bus — so it
-                # gets a thread too, marked as adopted in the digest.
-                self._begin_ride_thread(trip, t)
-                self._on_progress(trip, t, obj.get("payload") or {})
-                self._mark_dirty()
+            # (daemon started mid-trip, or the app resumed Go Mode from
+            # persisted state, which emits none): consider adopting.
+            self._maybe_adopt(session, t, obj)
 
         # Time-based rules ride on the advancing clock.
         self.check_timers()
@@ -962,12 +997,18 @@ class RideWatch:
         trip = self.trips.get(session)
         if trip is None:
             trip = Trip(session, t, summary)
+            # The rider asked for a ride under this id: whatever we decided
+            # about the last one is history.
+            self.ended_arrived.discard(session)
+            self._declined_completed.discard(session)
+            trip.device = obj.get("device")
             self.trips[session] = trip
             self.log.info("trip started: session=%s itinerary=%s" % (
                 session, itinerary_one_liner(summary)))
             self._begin_ride_thread(trip, t)
         else:
             # Itinerary replacement mid-trip.
+            self._clear_arrival(trip, t, "itinerary swap")
             trip.swap_seq += 1
             trip.swap_times.append(t)
             if summary is not None:
@@ -994,6 +1035,193 @@ class RideWatch:
         self._flush_pending_onboard(trip)
         self._rule_itinerary_backwards(trip, t, summary)
         self._mark_dirty()
+
+    def _maybe_adopt(self, session, t, obj):
+        """Open a trip for a session we never saw start — or decline to.
+
+        Two things must be true before adoption is the right answer, and
+        2026-08-31 evening got both wrong.
+
+        The ride must not already be over. Both of that evening's phantom
+        trips were adopted off post-arrival ticks of a trip the app itself
+        called `status: "completed"` — 76% of leg 3, 42 m from the door,
+        SET_ARRIVED already latched. Watching a finished ride produced 37
+        findings about a rider standing still, two threads, and two reports.
+        A completed trip is not a ride in progress under any reading.
+
+        And it must not be a ride this daemon is already watching under an
+        older session id. See _continuation_of.
+        """
+        p = obj.get("payload") or {}
+        ended = self.recently_ended.get(session, 0)
+        if t - ended <= 60 * 1000:
+            return
+        # A ride this daemon already closed at arrival does not come back
+        # sixty seconds later. Replaying 8/27 with the arrival rule and
+        # without this turned that afternoon's one 4.5-hour ride into NINE:
+        # close at arrival, re-adopt off the next tick, arrive again five
+        # minutes on, forever, because post-arrival ticks do not all say
+        # "completed" — the app went on map-matching a stationary rider and
+        # calling it `deviated`. Only an explicit START_GO_MODE re-opens this
+        # session, which is the rider asking for a ride in so many words.
+        if session in self.ended_arrived:
+            return
+        if p.get("status") == "completed":
+            if session not in self._declined_completed:
+                self._declined_completed.add(session)
+                self.log.info(
+                    "not adopting session %s: the app says the trip is already"
+                    " completed (leg %s at %s)"
+                    % (session, p.get("currentLegIndex"),
+                       fmt_pct(p.get("currentLegProgress"))))
+            return
+        prior = self._continuation_of(session, t, obj, p)
+        if prior is not None:
+            self._adopt_continuation(prior, session, t, p)
+            return
+        trip = Trip(session, t, None, adopted=True)
+        trip.device = obj.get("device")
+        self.trips[session] = trip
+        self.log.info("adopted mid-stream trip for session %s" % session)
+        # An adopted trip is a ride in progress — usually the daemon was
+        # just restarted under a rider who is still on the bus — so it
+        # gets a thread too, marked as adopted in the digest.
+        self._begin_ride_thread(trip, t)
+        self._on_progress(trip, t, p)
+        self._mark_dirty()
+
+    def _continuation_of(self, session, t, obj, p):
+        """The live ride this brand-new session id is plainly a resumption of.
+
+        The app re-mounts and the debug-log client mints a fresh session id;
+        nothing in the stream says the two belong together, so the daemon read
+        one continuous situation as two rides. The rider's half of that is an
+        app fix (keep the id across a mount). The daemon's half is to notice.
+
+        Four gates, and they must all hold, because merging two genuinely
+        separate rides is the worse error: one report would describe two trips
+        and the second ride's findings would land in the first ride's ledger.
+
+          * the same phone (`device`), which is stable across a mount;
+          * within CONTINUATION_GAP_MS of the older trip's last event — the
+            8/31 remount was 41 s wide, and a rider who finishes a ride and
+            starts another does not do it inside two minutes;
+          * the same leg index; and
+          * the same position within that leg (CONTINUATION_PROGRESS_PCT). A
+            genuinely new ride starts at leg 0 at ~0%, which is what makes
+            this gate the load-bearing one: it is not "the same phone
+            recently", it is "the same phone, still exactly where the ride we
+            are already watching left off".
+
+        Only reachable from the adoption path, i.e. only when the new session
+        arrived with no START_GO_MODE of its own. An explicit start is the
+        rider asking for a ride and is always taken at its word.
+        """
+        device = obj.get("device")
+        leg = p.get("currentLegIndex")
+        prog = p.get("currentLegProgress")
+        if not device or leg is None or not isinstance(prog, (int, float)):
+            return None
+        best = None
+        for trip in self._active_trips():
+            if session in trip.sessions or trip.device != device:
+                continue
+            gap = t - trip.last_event_ms
+            if gap < 0 or gap > CONTINUATION_GAP_MS:
+                continue
+            last = trip.progress or {}
+            if last.get("currentLegIndex") != leg:
+                continue
+            was = last.get("currentLegProgress")
+            if (not isinstance(was, (int, float))
+                    or abs(was - prog) > CONTINUATION_PROGRESS_PCT):
+                continue
+            if best is None or trip.last_event_ms > best.last_event_ms:
+                best = trip
+        return best
+
+    def _adopt_continuation(self, trip, session, t, p):
+        """Carry the ride forward under its new session id.
+
+        The new id becomes an alias in self.trips; `trip.session` does not
+        move, so the findings ledger, the digest, the report request and the
+        vault report all stay one file about one ride, and the thread the
+        rider is already talking to keeps talking about it.
+
+        Recorded as a finding rather than done quietly. The split is the app's
+        bug and someone has to fix it there; a daemon that silently papered
+        over it would leave the evidence nowhere. It is a warn, not a page:
+        the rider can do nothing about it while riding.
+        """
+        gap_ms = t - trip.last_event_ms
+        trip.sessions.append(session)
+        self.trips[session] = trip
+        self.log.info(
+            "session %s continues %s (same device, leg %s at %s, %ds later)"
+            % (session, trip.session, p.get("currentLegIndex"),
+               fmt_pct(p.get("currentLegProgress")), gap_ms // 1000))
+        self._finding(
+            trip, t, "session-churn", "warn",
+            "the app re-mounted mid-ride and minted session %s %ds after the"
+            " last event on %s; counted as one ride"
+            % (session, gap_ms // 1000, trip.session),
+            {"newSession": session, "priorSession": trip.session,
+             "gapMs": gap_ms, "device": trip.device,
+             "legIndex": p.get("currentLegIndex"),
+             "legProgress": p.get("currentLegProgress")})
+        trip.last_event_ms = max(trip.last_event_ms, t)
+        self._on_progress(trip, t, p)
+        self._mark_dirty()
+
+    def _note_arrival(self, trip, t, source):
+        """Latch arrival once, from whichever evidence reaches us first.
+
+        SET_ARRIVED is the client's own latch and fires once per mount, which
+        makes it unreachable for a trip this daemon adopted afterwards: on
+        2026-08-31 it fired at 18:52:14.782, before the trip it belonged to
+        existed here. `status: "completed"` on UPDATE_PROGRESS is the same
+        fact restated every tick, so it is the belt to that brace.
+        """
+        if trip.arrived_ms is not None:
+            return
+        trip.arrived_ms = t
+        trip.arrived_leg = (trip.progress or {}).get("currentLegIndex")
+        self.log.info("arrived (%s): session=%s" % (source, trip.session))
+        self._thread_event(trip, t, "arrived at destination")
+        self._mark_dirty()
+
+    def _clear_arrival(self, trip, t, why):
+        """The ride demonstrably resumed after we decided it had finished.
+
+        Arrival is an inference and ARRIVED_END_MS acts on it, so a wrong one
+        would close a live ride five minutes later and stop watching it —
+        strictly worse than the hole it fixes. Boarding a vehicle, advancing
+        to a later leg, and re-planning are all things a finished trip does
+        not do; any of them puts the ride back in progress.
+        """
+        if trip.arrived_ms is None:
+            return
+        self.log.info("arrival cleared (%s): session=%s" % (why, trip.session))
+        trip.arrived_ms = None
+        trip.arrived_leg = None
+        self._thread_event(trip, t, "ride resumed after arrival (%s)" % why)
+        self._mark_dirty()
+
+    def _active_trips(self):
+        """The live trips, each exactly once.
+
+        self.trips is keyed by session id and one ride can hold more than one
+        of those (_adopt_continuation), so iterating .values() would tick the
+        same trip twice per pass — two heartbeats, two timeout checks, and a
+        KeyError on the second _end_trip.
+        """
+        out, seen = [], set()
+        for trip in list(self.trips.values()):
+            if id(trip) in seen:
+                continue
+            seen.add(id(trip))
+            out.append(trip)
+        return out
 
     def _flush_pending_onboard(self, trip):
         """Emit onboard-flow findings that had no trip to hang on yet."""
@@ -1106,9 +1334,16 @@ class RideWatch:
         self._flush_pages(trip, t, force=True)
         trip.end_ms = t
         trip.end_reason = reason
-        del self.trips[trip.session]
+        # Every session id this ride was seen under, not just the first: an
+        # alias left behind in self.trips would be re-adopted as a new ride on
+        # the next tick, and _active_trips would still hand the ended trip to
+        # the timers.
+        for key in [s for s, tr in self.trips.items() if tr is trip]:
+            del self.trips[key]
+            self.recently_ended[key] = t
+            if reason == "arrived":
+                self.ended_arrived.add(key)
         self.ended_trips.append(trip)
-        self.recently_ended[trip.session] = t
         n = len(trip.findings)
         self.log.info("trip ended: session=%s reason=%s findings=%d" % (
             trip.session, reason, n))
@@ -1178,14 +1413,24 @@ class RideWatch:
         # spawn-failed case does not reach here; _thread_missing pages it now.
         if trip.thread is None:
             return
+        # From now, not from `t`. A timeout end is stamped with the ride's
+        # LAST EVENT, fifteen minutes in the past, so the deadline was already
+        # expired the moment it was armed: on 8/31 at 18:00:34 the daemon
+        # logged "wrap-up expected ... by 17:55:33" and paged the rider about
+        # the missing report in the same second, before the thread had been
+        # handed the request. Ten minutes has to be ten minutes of the
+        # thread's time.
+        due = max(int(t), self.now_ms()) + REPORT_DEADLINE_MS
         self.report_deadlines.append({
             "session": trip.session,
             "reportPath": path,
-            "dueMs": int(t) + REPORT_DEADLINE_MS,
+            "dueMs": due,
             "findings": findings_n,
+            # Which pane was asked. _kill_previous_threads reads this: the
+            # next ride's thread must not kill the one still writing.
+            "tmux": (trip.thread or {}).get("tmux"),
         })
-        self.log.info("wrap-up expected at %s by %s"
-                      % (path, fmt_hms(int(t) + REPORT_DEADLINE_MS)))
+        self.log.info("wrap-up expected at %s by %s" % (path, fmt_hms(due)))
         self._save_state()
 
     def _check_report_deadlines(self, now):
@@ -1231,9 +1476,18 @@ class RideWatch:
         window is never waiting on the next telemetry line.
         """
         now = self.now_ms()
-        for trip in list(self.trips.values()):
+        for trip in self._active_trips():
             if now - trip.last_event_ms > SESSION_TIMEOUT_MS:
                 self._end_trip(trip, trip.last_event_ms, "timeout")
+                continue
+            # The ride is over and the app is still talking. Every other
+            # trip-end in this file waits for the stream to stop; on 8/31 it
+            # never did, and the ride got no report at all. Ended at `now`
+            # rather than at the arrival five minutes back so a note typed at
+            # the destination is still inside the ride it belongs to.
+            if (trip.arrived_ms is not None
+                    and now - trip.arrived_ms > ARRIVED_END_MS):
+                self._end_trip(trip, now, "arrived")
                 continue
             self._flush_pages(trip, now)
             # gps-gap: no position fix for >60s mid-trip.
@@ -1283,6 +1537,17 @@ class RideWatch:
         }
         self._note_destination_distance(trip, p.get("distanceToDestination"))
         self._mark_dirty()
+
+        # The app's own verdict on its own trip, restated every tick. It is
+        # the only arrival evidence an adopted trip can ever see.
+        if p.get("status") == "completed":
+            self._note_arrival(trip, t, "status=completed")
+        elif (trip.arrived_ms is not None
+                and isinstance(trip.arrived_leg, int)
+                and isinstance(p.get("currentLegIndex"), int)
+                and p.get("currentLegIndex") > trip.arrived_leg):
+            self._clear_arrival(trip, t, "leg %s -> %s"
+                                % (trip.arrived_leg, p.get("currentLegIndex")))
 
         # Leg transition: the one routine milestone worth a ping. It is where
         # the rider's next decision lives (get off, walk, board) and it is the
@@ -1612,6 +1877,7 @@ class RideWatch:
         trip.prev_dist = d
 
     def _on_set_riding(self, trip, t, p):
+        self._clear_arrival(trip, t, "boarded a vehicle")
         new = {
             "tripId": p.get("tripId"),
             "vehicleId": p.get("vehicleId"),
@@ -1953,7 +2219,10 @@ class RideWatch:
             # The sidecar guesses the session from the log tail and can miss.
             # If exactly one trip is running, the note is plainly about it —
             # that is the timestamp correlation the note stream exists for.
-            active = list(self.trips.values())
+            # _active_trips(), not .values(): a ride the app re-mounted holds
+            # two session keys, and counting those as two rides would drop the
+            # note the rider just typed.
+            active = self._active_trips()
             if len(active) == 1:
                 trip = active[0]
         if trip is None:
@@ -2186,6 +2455,9 @@ class RideWatch:
         trip.report_path = report_path
         req = {
             "session": trip.session,
+            # Usually [session]. More than one means the app re-mounted
+            # mid-ride and the later ids are the same ride (_adopt_continuation).
+            "sessions": list(trip.sessions),
             "date": fmt_date(trip.start_ms),
             "startMs": trip.start_ms,
             "endMs": trip.end_ms,
@@ -2602,20 +2874,46 @@ class RideWatch:
                            % (name, one_line(res.stdout)))
             self._thread_status[name] = False
 
+    def _panes_awaiting_wrap_up(self):
+        """tmux panes that were asked for a wrap-up and have not delivered.
+
+        Emptied by _check_report_deadlines the moment the report lands or the
+        deadline expires, so a pane is protected for at most REPORT_DEADLINE_MS
+        and a dead one cannot pin the namespace forever.
+        """
+        return set(e.get("tmux") for e in self.report_deadlines
+                   if e.get("tmux"))
+
     def _kill_previous_threads(self, keep=None):
-        """The new ride's thread is the rider's thread; retire the old ones."""
+        """The new ride's thread is the rider's thread; retire the old ones.
+
+        Except one that is still writing a wrap-up. 8/31 15:52:31: the daemon
+        asked ride-1535 for the report and 17 s later the next ride started
+        and killed that pane. Again at 17:07:50 -> 17:08:43 with ride-1700,
+        and that report was never written — the deadline paged about it at
+        17:17:50, which is the safety net working and the report still gone.
+        A ride the rider takes seventeen seconds later does not make the last
+        one's write-up expendable.
+        """
         res = self._tmux(["list-sessions", "-F", "#{session_name}"])
         if res.returncode != 0:
             return []          # no tmux server yet: nothing to clean up
-        killed = []
+        owed = self._panes_awaiting_wrap_up()
+        killed, spared = [], []
         for name in ride_thread_sessions((res.stdout or "").split()):
             if name == keep:
+                continue
+            if name in owed:
+                spared.append(name)
                 continue
             if self._tmux(["kill-session", "-t", name]).returncode == 0:
                 killed.append(name)
         if killed:
             self.log.info("previous ride thread(s) killed: %s"
                           % ", ".join(killed))
+        if spared:
+            self.log.info("ride thread(s) spared, wrap-up outstanding: %s"
+                          % ", ".join(spared))
         return killed
 
     # -- live status file ---------------------------------------------------
@@ -2696,8 +2994,9 @@ class RideWatch:
         # by content rather than a fixed count because _daemon_lines() varies
         # (the STALE warning and the duplicate-record count come and go).
         header = lines[:3] + self._daemon_lines()
-        # list(): the tailer may be starting or ending a trip while this runs.
-        for trip in list(self.trips.values()):
+        # _active_trips(): a snapshot (the tailer may be starting or ending a
+        # trip while this runs), and one entry per ride, not per session id.
+        for trip in self._active_trips():
             now = self.now_ms()
             section = []
             section.append("## Active trip — session %s%s" % (
@@ -2769,12 +3068,12 @@ class RideWatch:
         them, but a page still inside its window has nowhere to be re-adopted
         from — send it before going away.
         """
-        for trip in list(self.trips.values()):
+        for trip in self._active_trips():
             self._flush_pages(trip, self.now_ms(), force=True)
 
     def finalize_replay(self):
         """End any still-active trips at replay EOF."""
-        for trip in list(self.trips.values()):
+        for trip in self._active_trips():
             self._end_trip(trip, trip.last_event_ms, "replay-eof")
         self.write_status(force=True)
 
@@ -2956,7 +3255,7 @@ def run_live(watch_dir=None):
     watch.flush_pending_pages()
     watch.write_status(force=True)
     log.info("ride-watch stopped cleanly (active trips preserved: %d)"
-             % len(watch.trips))
+             % len(watch._active_trips()))
     return 0
 
 
