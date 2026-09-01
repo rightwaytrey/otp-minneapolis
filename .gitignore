@@ -76,3 +76,12 @@ deployment/server-info.txt
 
 # Nightly verify output: cron artifacts from scripts/nightly-verify.sh (~1.4 MB/night).
 data/nightly-verify/
+
+# Deploy manifests: a record of what is on a particular box, written at deploy
+# time by scripts/deploy-manifest.py. Per-host state, never source.
+deployment/deploy-manifest.json
+deployment/rendered/
+
+# Python bytecode caches
+__pycache__/
+*.pyc

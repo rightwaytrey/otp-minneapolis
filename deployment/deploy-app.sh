@@ -73,6 +73,10 @@ JAR="$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name 'otp-shaded-*.j
 if want repo; then
 echo "${GREEN}=== 1/7  Repo skeleton ===${NC}"
 ssh "${SSH_OPTS[@]}" "$RUSER" "mkdir -p '$RREPO'/{data,config,docker,deployment/nginx,scripts} '$RTNAV'"
+# The manifest is written ON the target (see scripts/deploy-manifest.py for why
+# a git checkout there cannot answer "what is deployed?"), so the recorder has
+# to live there too.
+rsync -az "$REPO_ROOT/scripts/deploy-manifest.py" "$RUSER:$RREPO/scripts/"
 fi
 
 if want graph; then
@@ -227,16 +231,21 @@ fi
 
 if want nginx; then
 echo "${GREEN}=== 7/7  nginx ===${NC}"
-# Substitute the deploy-time placeholders. The Stadia key lives only in .env and
-# on the server; it must never be committed into config/nginx.
+# RENDER, NEVER COPY. There is one template per file and one value set per
+# environment (deployment/nginx/*.tmpl + deployment/env/prod.env); render-nginx.py
+# substitutes the secrets out of .env and fails closed on any leftover `__`
+# placeholder. This script is the ONE owner of nginx on the server: nothing else
+# may put a file under /etc/nginx, in either direction. The repo copies hold
+# placeholders and the live files hold real secrets, so a `cp` either way is a
+# breakage -- and one direction is how the unlock secret reached a public repo.
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-for f in otp-common.conf otp.conf; do
-  sed -e "s#__STADIA_API_KEY__#$STADIA_API_KEY#g" \
-      -e "s#__HOME_TAILSCALE_IP__#$HOME_TAILSCALE_IP#g" \
-      -e "s#__UNLOCK_SECRET__#$UNLOCK_SECRET#g" \
-      "$SCRIPT_DIR/nginx/$f" > "$TMP/$f"
-  grep -q '__' "$TMP/$f" && { echo "${RED}Error: unsubstituted placeholder remains in $f${NC}"; exit 1; }
-done
+# Parity between the two environments before anything is installed: shared
+# locations must be byte-identical (this replaced scripts/check-nginx-parity.py).
+python3 "$SCRIPT_DIR/render-nginx.py" --check >/dev/null \
+  || { echo "${RED}Error: rendered house/prod configs are not in parity; run deployment/render-nginx.py --check${NC}"; exit 1; }
+RIDE_UPSTREAM="$HOME_TAILSCALE_IP" STADIA_API_KEY="$STADIA_API_KEY" UNLOCK_SECRET="$UNLOCK_SECRET" \
+  python3 "$SCRIPT_DIR/render-nginx.py" --env prod --out "$TMP" >/dev/null \
+  || { echo "${RED}Error: rendering the prod nginx config failed${NC}"; exit 1; }
 
 rsync -az "$TMP/otp.conf" "$TMP/otp-common.conf" "$RROOT:/tmp/"
 ssh "${SSH_OPTS[@]}" "$RROOT" bash -s <<'REMOTE'
@@ -275,3 +284,39 @@ echo "  curl --resolve $DOMAIN:$APP_PORT:$SERVER_IP https://$DOMAIN:$APP_PORT/pe
 echo "  curl -o /dev/null -w '%{http_code}\\n' -X POST -H 'content-type: application/json' -d '{\"text\":\"\"}' \\"
 echo "       --resolve $DOMAIN:$APP_PORT:$SERVER_IP https://$DOMAIN:$APP_PORT/api/preferences   # expect 400, NOT 401"
 fi
+
+# --- What did this actually put on the box? --------------------------------
+# Deploy here is file copying, not a checkout: `git rev-parse` fails in both
+# ~/projects/transitnav and ~/projects/otp-minneapolis on the server, the nginx
+# config that runs is RENDERED (it holds substituted secrets and can never be a
+# tracked file), only five files of the transitnav repo ship at all, and
+# router-config.json is rewritten in flight by SERVER_MAX_STOP_COUNT. So the
+# only honest answer to "what runs?" is the bytes on the box plus the shas they
+# were built from. Record both, on the target, every time.
+#
+# Read it back later with:
+#   scripts/deploy-manifest.py show   --ssh $APP_USER@<tailnet-ip>
+#   scripts/deploy-manifest.py verify --ssh $APP_USER@<tailnet-ip>
+# `verify` is the one that earns its keep: it catches a file hand-edited on the
+# box after the deploy that recorded it.
+echo
+echo "${GREEN}=== Deploy manifest ===${NC}"
+PROVENANCE="$(python3 "$REPO_ROOT/scripts/deploy-manifest.py" provenance \
+  --repo "otp-minneapolis=$REPO_ROOT" \
+  --repo "transitnav=$TRANSITNAV" \
+  --repo "otprr=$HOME/projects/otprr/otp-react-redux")"
+# --only nginx skips the repo step, so make sure the recorder is present.
+rsync -az "$REPO_ROOT/scripts/deploy-manifest.py" "$RUSER:$RREPO/scripts/"
+ssh "${SSH_OPTS[@]}" "$RUSER" \
+  python3 "$RREPO/scripts/deploy-manifest.py" record \
+    --target prod \
+    --steps "$(echo "${ONLY:-$ALL_STEPS}" | tr ' ' ',')" \
+    --provenance "$PROVENANCE" \
+    --file /etc/nginx/snippets/otp-common.conf \
+    --file /etc/nginx/sites-available/otp \
+    --file /etc/nginx/conf.d/00-map-hash.conf \
+    --file "$RTNAV/preferences_api.py" \
+    --file "$RTNAV/onboard_api.py" \
+    --file "$RREPO/data/router-config.json" \
+    --file "$RREPO/data/graph.obj"
+ssh "${SSH_OPTS[@]}" "$RUSER" "cat '$RREPO/deployment/deploy-manifest.json'" | sed 's/^/  /'

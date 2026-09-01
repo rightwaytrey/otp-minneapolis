@@ -1,3 +1,12 @@
+# otp.conf.tmpl — the ONE source for the :9966 site file (the server blocks).
+#
+# Rendered per environment by deployment/render-nginx.py. The location blocks
+# all live in otp-common.conf.tmpl, which every server block below `include`s
+# from /etc/nginx/snippets/otp-common.conf. See that file's header for the
+# template syntax and for why there is no longer a second copy of either file.
+#
+# Do not `cp` this, or a render of it, onto a live nginx path. deploy-app.sh is
+# the only installer.
 # --- Cookie-based access gate ---------------------------------------------
 # If the visitor presents the long-lived "otp_access" cookie with the correct
 # secret, auth_basic is set to "off" (the literal string disables it) and the
@@ -9,8 +18,9 @@
 # site already defines one).
 #
 # Tailnet bypass: the phone reaches this box over Tailscale (split DNS sends
-# tre.hopto.org -> 100.72.153.99 whenever Tailscale is on — required anyway
-# because the home WiFi isolates clients). Requests sourced from the tailnet
+# tre.hopto.org -> the desktop's tailnet IP whenever Tailscale is on -- which is
+# required anyway, because the home WiFi isolates clients). Requests sourced
+# from the tailnet
 # (100.64.0.0/10, only this user's devices) are already authenticated by
 # Tailscale itself, so the gate is waived for them. This is the safety net
 # that keeps the native app working even if iOS ever clears the WebView's
@@ -67,6 +77,8 @@ limit_req_zone $binary_remote_addr zone=otp_log:1m  rate=2r/s;    # /api/debug-l
 #                                even when the public path is down.
 #                                Refreshed by scripts/renew-tailscale-cert.sh.
 
+
+#@if prod
 #
 # --- SERVER VARIANT (Linode) ------------------------------------------------
 # Only api.transit-nav.com is served here. The other two names stay on the
@@ -95,3 +107,40 @@ server {
     server_name api.transit-nav.com;
     return 301 https://$host:9966$request_uri;
 }
+#@else
+# --- HOUSE VARIANT (rwtpc4) -------------------------------------------------
+# All three names are served here; the desktop is where tre.hopto.org also
+# fronts Guacamole, taskchampion, Frigate and the dashboards.
+
+server {
+    listen 9966 ssl http2;
+    server_name api.transit-nav.com;
+
+    ssl_certificate /etc/letsencrypt/live/api.transit-nav.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.transit-nav.com/privkey.pem;
+
+    include /etc/nginx/snippets/otp-common.conf;
+}
+
+server {
+    listen 9966 ssl http2;
+    server_name tre.hopto.org;
+
+    # SSL certificate paths
+    ssl_certificate /etc/letsencrypt/live/tre.hopto.org/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/tre.hopto.org/privkey.pem;
+
+    include /etc/nginx/snippets/otp-common.conf;
+}
+
+server {
+    listen 9966 ssl http2;
+    server_name rwtpc4.tail9d6464.ts.net;
+
+    # Written by scripts/renew-tailscale-cert.sh (tailscale cert ...).
+    ssl_certificate /etc/nginx/certs/rwtpc4.tail9d6464.ts.net.crt;
+    ssl_certificate_key /etc/nginx/certs/rwtpc4.tail9d6464.ts.net.key;
+
+    include /etc/nginx/snippets/otp-common.conf;
+}
+#@endif

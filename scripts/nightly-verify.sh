@@ -77,19 +77,36 @@ failures=""
 skips=""
 
 # --- Static config checks --------------------------------------------------
-# These need no dev server and no network, so they run BEFORE the :9967 gate --
-# a config that has drifted is worth reporting on a night the dev server is
-# down, which is exactly when nobody is looking.
+# These need no dev server, so they run BEFORE the :9967 gate -- a config that
+# has drifted is worth reporting on a night the dev server is down, which is
+# exactly when nobody is looking. Two of them DO reach the network (--deployed
+# reads the Linode over ssh, and the payload probe POSTs ~900 KB through its
+# nginx); both exit 75 SKIP rather than FAIL when the host is unreachable.
 #
-# Both guard invariants that span files no single repo's test suite can see, and
-# both are here because the same failure shape has now bitten three times: a
+# They guard invariants that span files no single repo's test suite can see, and
+# they are here because the same failure shape has now bitten three times: a
 # change lands in one of several places that must agree, every health check
 # stays green, and the symptom shows up days later in a ride nobody can replay.
-for check in check-config-ladder.py check-nginx-parity.py; do
-  name="${check%.py}"
+#
+# check-nginx-parity.py is GONE (2026-09-01): the two nginx copies it compared
+# were collapsed into one template, so parity is a property of the source rather
+# than something to notice afterwards. render-nginx.py --check proves it, and
+# check-config-ladder.py --deployed is the one that reads production instead of
+# the repo -- the repo-only form printed OK on 2026-09-01 while the box was two
+# rungs behind.
+# Each entry is "<display name>|<command>". The command runs from scripts/.
+STATIC_CHECKS=(
+  "config-ladder-repo|python3 $(dirname "$0")/check-config-ladder.py"
+  "config-ladder-deployed|python3 $(dirname "$0")/check-config-ladder.py --deployed"
+  "nginx-render-parity|python3 $(dirname "$0")/../deployment/render-nginx.py --check"
+  "debug-log-payload|python3 $(dirname "$0")/check-debug-log-payload.py"
+)
+for entry in "${STATIC_CHECKS[@]}"; do
+  name="${entry%%|*}"
+  cmd="${entry#*|}"
   log="$RUN_DIR/$name.log"
   start=$(date +%s)
-  if python3 "$(dirname "$0")/$check" > "$log" 2>&1; then
+  if $cmd > "$log" 2>&1; then
     status=PASS; pass=$((pass + 1))
   else
     rc=$?

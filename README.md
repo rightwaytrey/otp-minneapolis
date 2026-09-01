@@ -130,20 +130,40 @@ The Docker deployment includes:
 
 ### Nginx Reverse Proxy (Recommended for Production)
 
-For production deployments, use nginx as a reverse proxy with SSL:
+**Never `cp` a repo file onto a live nginx path.** The repo holds a TEMPLATE with
+`__PLACEHOLDER__` tokens (the Stadia key, the unlock cookie secret, the tailnet
+upstream); the live file holds the substituted values. Copying the repo file over
+the live one strips the secrets while still passing `nginx -t`, so production
+rolls back silently; copying the live file back into the repo is how the unlock
+secret reached this PUBLIC repo and sat there from 2026-06-01 to 2026-09-01.
 
-1. Copy nginx configuration:
-```bash
-sudo cp config/nginx/otp.conf /etc/nginx/sites-available/otp
-sudo ln -s /etc/nginx/sites-available/otp /etc/nginx/sites-enabled/
+There is one template and one value set per environment:
+
+```
+deployment/nginx/otp.conf.tmpl          the :9966 server blocks
+deployment/nginx/otp-common.conf.tmpl   every location block
+deployment/env/house.env                rwtpc4 (the desktop)
+deployment/env/prod.env                 the Linode
 ```
 
-2. Update server name and SSL certificate paths in the config
+Render and install with the owner for that host — nothing else may write under
+`/etc/nginx`:
 
-3. Test and reload:
 ```bash
-sudo nginx -t
-sudo systemctl reload nginx
+# this desktop
+deployment/install-house-nginx.sh            # dry run: render + show the diff
+deployment/install-house-nginx.sh --install
+
+# the Linode
+deployment/deploy-app.sh <SERVER_IP> --only nginx
+```
+
+Then check what is actually live, not what is in git:
+
+```bash
+scripts/check-config-ladder.py --deployed    # the four size rungs, on the box
+scripts/check-debug-log-payload.py           # POST 900 KB and read it back
+scripts/deploy-manifest.py verify --ssh rwt@<tailnet-ip>
 ```
 
 The nginx config includes:
@@ -153,7 +173,8 @@ The nginx config includes:
 - **Geocoder CORS proxy** at `/photon/api` - proxies to photon.komoot.io with CORS headers to avoid browser blocking
 - WebSocket support for frontend hot reload
 
-See `config/nginx/otp.conf` for the complete configuration.
+See `deployment/nginx/otp.conf.tmpl` and `config/nginx/README.md` for the
+complete configuration and how it is rendered.
 
 ## Data Sources
 
