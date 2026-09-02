@@ -72,6 +72,13 @@ pelias/.env
 # in deployment/nginx/ are safe: they carry __PLACEHOLDER__ tokens that
 # deploy-app.sh substitutes at install time.
 deployment/.env
+# ... and every backup of it. `cp .env .env.bak.$(date +%Y%m%d-%H%M%S)` before a
+# secret rotation is the sane move, and it produced an UNTRACKED file holding
+# the pre-rotation unlock secret sitting next to a gitignored one -- one
+# `git add -A` from the exact accident backlog 2.10 was about (a live credential
+# in a PUBLIC repo for three months).
+deployment/.env.bak*
+deployment/.env.*.bak
 deployment/server-info.txt
 
 # Nightly verify output: cron artifacts from scripts/nightly-verify.sh (~1.4 MB/night).

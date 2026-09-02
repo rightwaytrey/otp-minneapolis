@@ -56,7 +56,13 @@ want() {
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
 
-for v in APP_USER DOMAIN APP_PORT STADIA_API_KEY HOME_TAILSCALE_IP UNLOCK_SECRET; do
+# RIDE_UPSTREAM is in this list because the nginx render consumes it below.
+# deployment/.env defines it by reference to HOME_TAILSCALE_IP -- /api/ride-note
+# and /api/ride-status proxy to the DESKTOP, where ride-watch actually runs --
+# but it is a separate knob, because the house render points it at 127.0.0.1 and
+# a future staging box may point it somewhere else again. Empty here means the
+# renderer fails closed on a leftover placeholder, so catch it before the ssh.
+for v in APP_USER DOMAIN APP_PORT STADIA_API_KEY HOME_TAILSCALE_IP UNLOCK_SECRET RIDE_UPSTREAM; do
   [ -n "${!v:-}" ] || { echo "${RED}Error: $v is empty in .env${NC}"; exit 1; }
 done
 
@@ -176,8 +182,11 @@ if [ "$((WWW_DELETES + WWW_CHANGES))" -gt 0 ] && [ "$YES_WWW" -ne 1 ]; then
   echo "${YELLOW}The desktop build differs from what is live, so this would publish whatever"
   echo "the last local build left in /var/www/transitnav. Check you are shipping what you"
   echo "think you are, then re-run with --yes-www, or --skip web to leave it alone.${NC}"
-  printf '%s\n' "$WWW_PLAN" | grep '^\*deleting' | head -5
-  printf '%s\n' "$WWW_PLAN" | grep -v '^\*deleting' | head -5
+  # awk, not `| head -5`: under `set -euo pipefail` head closes the pipe, the
+  # upstream grep takes SIGPIPE, and the script dies at 141 having printed one
+  # list instead of two. Same defect as backlog 2.15 in install-house-nginx.sh.
+  printf '%s\n' "$WWW_PLAN" | grep '^\*deleting' | awk 'NR<=5' || true
+  printf '%s\n' "$WWW_PLAN" | grep -v '^\*deleting' | awk 'NR<=5' || true
   exit 1
 fi
 rsync -az --delete /var/www/transitnav/ "$RUSER:/tmp/transitnav-www/"
@@ -243,7 +252,7 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # locations must be byte-identical (this replaced scripts/check-nginx-parity.py).
 python3 "$SCRIPT_DIR/render-nginx.py" --check >/dev/null \
   || { echo "${RED}Error: rendered house/prod configs are not in parity; run deployment/render-nginx.py --check${NC}"; exit 1; }
-RIDE_UPSTREAM="$HOME_TAILSCALE_IP" STADIA_API_KEY="$STADIA_API_KEY" UNLOCK_SECRET="$UNLOCK_SECRET" \
+RIDE_UPSTREAM="$RIDE_UPSTREAM" STADIA_API_KEY="$STADIA_API_KEY" UNLOCK_SECRET="$UNLOCK_SECRET" \
   python3 "$SCRIPT_DIR/render-nginx.py" --env prod --out "$TMP" >/dev/null \
   || { echo "${RED}Error: rendering the prod nginx config failed${NC}"; exit 1; }
 
@@ -262,6 +271,25 @@ systemctl reload nginx
 REMOTE
 
 echo
+echo "${YELLOW}Not yet live.${NC} $DOMAIN still resolves to the house."
+echo "Verify through nginx on this box first:"
+echo "  curl --resolve $DOMAIN:$APP_PORT:$SERVER_IP https://$DOMAIN:$APP_PORT/pelias/v1/autocomplete?text=target%20field"
+echo "  curl -o /dev/null -w '%{http_code}\\n' -X POST -H 'content-type: application/json' -d '{\"text\":\"\"}' \\"
+echo "       --resolve $DOMAIN:$APP_PORT:$SERVER_IP https://$DOMAIN:$APP_PORT/api/preferences   # expect 400, NOT 401"
+fi
+
+# --- Health ---------------------------------------------------------------
+# OUTSIDE `if want nginx`, deliberately. This block used to sit inside it, so
+# `--only prefs`, `--only web` and `--skip nginx` deployed and then printed
+# nothing at all -- including the prefs-api and GTFS-RT-updater probes, which
+# have nothing to do with nginx. A step that reports must not be welded to an
+# unrelated step (backlog 2.14; same shape as 2.9).
+#
+# It probes what is on the box, not what this run shipped, so it is honest
+# after a partial deploy: `--only prefs` still tells you whether OTP is up and
+# whether its updaters attached, which is exactly what you want to know after
+# restarting a sidecar next to them.
+echo
 echo "${GREEN}=== Health ===${NC}"
 ssh "${SSH_OPTS[@]}" "$RUSER" bash -s <<'REMOTE'
 echo -n "  OTP        : "; curl -s -o /dev/null -w '%{http_code}\n' --max-time 20 http://127.0.0.1:8090/otp/ || echo unreachable
@@ -276,14 +304,6 @@ echo -n "  prefs-api  : "; curl -s --max-time 10 http://127.0.0.1:8092/api/healt
 echo
 free -h | sed 's/^/  /'
 REMOTE
-
-echo
-echo "${YELLOW}Not yet live.${NC} $DOMAIN still resolves to the house."
-echo "Verify through nginx on this box first:"
-echo "  curl --resolve $DOMAIN:$APP_PORT:$SERVER_IP https://$DOMAIN:$APP_PORT/pelias/v1/autocomplete?text=target%20field"
-echo "  curl -o /dev/null -w '%{http_code}\\n' -X POST -H 'content-type: application/json' -d '{\"text\":\"\"}' \\"
-echo "       --resolve $DOMAIN:$APP_PORT:$SERVER_IP https://$DOMAIN:$APP_PORT/api/preferences   # expect 400, NOT 401"
-fi
 
 # --- What did this actually put on the box? --------------------------------
 # Deploy here is file copying, not a checkout: `git rev-parse` fails in both

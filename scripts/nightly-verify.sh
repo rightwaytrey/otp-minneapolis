@@ -79,9 +79,10 @@ skips=""
 # --- Static config checks --------------------------------------------------
 # These need no dev server, so they run BEFORE the :9967 gate -- a config that
 # has drifted is worth reporting on a night the dev server is down, which is
-# exactly when nobody is looking. Two of them DO reach the network (--deployed
-# reads the Linode over ssh, and the payload probe POSTs ~900 KB through its
-# nginx); both exit 75 SKIP rather than FAIL when the host is unreachable.
+# exactly when nobody is looking. Most of them DO reach the network (--deployed
+# reads a box over ssh, and each payload probe POSTs ~900 KB through that box's
+# nginx); all of those exit 75 SKIP rather than FAIL when the host is
+# unreachable, so an off Linode is not a red night.
 #
 # They guard invariants that span files no single repo's test suite can see, and
 # they are here because the same failure shape has now bitten three times: a
@@ -94,12 +95,29 @@ skips=""
 # check-config-ladder.py --deployed is the one that reads production instead of
 # the repo -- the repo-only form printed OK on 2026-09-01 while the box was two
 # rungs behind.
+# ONE ENTRY PER HOST, not one per check. There are two deployments of this
+# stack -- the Linode and rwtpc4 (the house) -- and they answer to the same
+# name: /etc/hosts here maps api.transit-nav.com to the Linode's tailnet
+# address, so a probe sent by name from this box grades the Linode no matter
+# which machine you meant. That is not hypothetical: on 2026-09-01 the payload
+# probe printed OK while the house was two rungs behind and 413ing every real
+# ride's telemetry (backlog 2.16). A check that can silently grade the wrong
+# machine has to be told which machine, so `--target house|prod` names the box
+# and the result line repeats the address it actually reached.
+#
+# The house probe writes a ~900 KB `config-probe` line into ~/otp-debug-logs,
+# which ride-watch tails. It is inert there: ride_watch.py only opens a trip on
+# START_GO_MODE, so a LADDER_PROBE on session `config-probe` matches no trip and
+# falls through _process without touching any rule.
+#
 # Each entry is "<display name>|<command>". The command runs from scripts/.
 STATIC_CHECKS=(
   "config-ladder-repo|python3 $(dirname "$0")/check-config-ladder.py"
-  "config-ladder-deployed|python3 $(dirname "$0")/check-config-ladder.py --deployed"
+  "config-ladder-deployed-prod|python3 $(dirname "$0")/check-config-ladder.py --deployed"
+  "config-ladder-deployed-house|python3 $(dirname "$0")/check-config-ladder.py --deployed --ssh local"
   "nginx-render-parity|python3 $(dirname "$0")/../deployment/render-nginx.py --check"
-  "debug-log-payload|python3 $(dirname "$0")/check-debug-log-payload.py"
+  "debug-log-payload-prod|python3 $(dirname "$0")/check-debug-log-payload.py --target prod"
+  "debug-log-payload-house|python3 $(dirname "$0")/check-debug-log-payload.py --target house"
 )
 for entry in "${STATIC_CHECKS[@]}"; do
   name="${entry%%|*}"

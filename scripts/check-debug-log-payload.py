@@ -24,6 +24,23 @@ This writes ~900 KB into the day's debug log, tagged session `config-probe`, so
 it is trivially greppable and prune-debug-logs.sh ages it out like everything
 else. Do not run it in a loop.
 
+WHICH BOX DID IT GRADE?
+    There are two deployments of this stack and they answer to the SAME name.
+    `/etc/hosts` on rwtpc4 maps api.transit-nav.com to the Linode's tailnet
+    address (the split-DNS entry that lets the phone reach /ride), so a probe
+    sent by name FROM the house lands on the Linode and the house can never be
+    reached by name from itself. On 2026-09-01 this check did exactly that and
+    printed "OK: a 900,000-char payload reached disk intact" while the house was
+    two rungs behind (backlog 2.16).
+
+    So the box is named, never inferred. `--target house|prod` sets the whole
+    coherent set at once -- the IP the name is pinned to (curl --resolve, so TLS
+    still validates against the real certificate) AND the host the written line
+    is read back from -- and both appear in the OK line. A run whose --resolve
+    and --ssh point at different machines is refused: the HTTP result would come
+    from one box and the disk result from another, and the pass would describe
+    neither.
+
 Exit: 0 the payload survived, 1 it did not, 75 SKIP (could not run the probe).
 """
 
@@ -37,10 +54,26 @@ import uuid
 
 SKIP = 75
 
-DEFAULT_SSH = os.environ.get("LADDER_SSH", "rwt@100.126.171.72")
 DEFAULT_HOST = "api.transit-nav.com"
 DEFAULT_PORT = 9966
-DEFAULT_RESOLVE = os.environ.get("LADDER_RESOLVE", "100.126.171.72")
+
+# One coherent set per deployment: where to send the bytes, and where to read
+# them back. These belong together -- picking them separately is how 2.16
+# happened -- so they are named once, here, and selected as a unit.
+TARGETS = {
+    # The Linode. Reached over the tailnet; `rwt@` is the app user there.
+    "prod": {"resolve": "100.126.171.72", "ssh": "rwt@100.126.171.72"},
+    # rwtpc4 itself. `local` runs the read-back with no ssh at all, because this
+    # box's sshd rejects a loopback connection -- and the probe MUST be pinned to
+    # 127.0.0.1, since resolving the name here sends it to the Linode.
+    "house": {"resolve": "127.0.0.1", "ssh": "local"},
+}
+DEFAULT_TARGET = os.environ.get("LADDER_TARGET", "prod")
+
+# Kept for compatibility with anything that set these; an explicit --target or
+# --resolve/--ssh wins.
+DEFAULT_SSH = os.environ.get("LADDER_SSH", "")
+DEFAULT_RESOLVE = os.environ.get("LADDER_RESOLVE", "")
 
 # Bigger than the largest payload any real ride has produced, smaller than the
 # client's own MAX_FULL_PAYLOAD_CHARS (1,000,000). If those move, move this.
@@ -137,28 +170,71 @@ done
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--target", choices=sorted(TARGETS), default=DEFAULT_TARGET,
+                    help="which deployment to grade (default: %(default)s). Sets "
+                         "--resolve and --ssh together; both are still overridable.")
+    ap.add_argument("--host", default=DEFAULT_HOST,
+                    help="name in the URL and on the certificate (default: %(default)s)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
-    ap.add_argument("--resolve", default=DEFAULT_RESOLVE,
-                    help="IP to pin --host to (default: the Linode over the tailnet); "
-                         "empty string uses normal DNS")
-    ap.add_argument("--ssh", default=DEFAULT_SSH,
+    # None, not "": an explicit `--resolve ''` must stay reachable (it means
+    # "use normal DNS"), so "not given" and "given as empty" cannot share a value.
+    ap.add_argument("--resolve", default=None,
+                    help="IP to pin --host to, curl --resolve style, so TLS still "
+                         "validates the real certificate. Defaults from --target; "
+                         "`--resolve ''` uses normal DNS, which on rwtpc4 means the "
+                         "Linode (see the module docstring).")
+    ap.add_argument("--ssh", default=None,
                     help="host to read the written line back from; `local` reads "
-                         "this machine directly")
+                         "this machine directly. Defaults from --target.")
     ap.add_argument("--no-disk-check", action="store_true",
                     help="only assert the HTTP result; skip reading the line back")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="build the payload and print exactly which box would be "
+                         "probed and read back, then stop. Sends nothing and writes "
+                         "nothing.")
     ap.add_argument("--chars", type=int, default=PROBE_CHARS,
                     help="payload size to send (default: %d). Lower it to find "
                          "where a broken ladder actually cuts off." % PROBE_CHARS)
     ap.add_argument("--timeout", type=int, default=60)
     args = ap.parse_args()
 
+    preset = TARGETS[args.target]
+    if args.resolve is None:
+        args.resolve = DEFAULT_RESOLVE or preset["resolve"]
+    if args.ssh is None:
+        args.ssh = DEFAULT_SSH or preset["ssh"]
+
+    # The HTTP result and the disk result must come from the SAME machine or the
+    # verdict describes neither. This is the check that would have caught 2.16:
+    # `--resolve` pointing at the Linode while `--ssh local` read rwtpc4 would
+    # have printed OK for a payload that never touched this box.
+    if not args.no_disk_check:
+        reading_here = args.ssh in ("local", "-")
+        probing_here = args.resolve in ("127.0.0.1", "::1", "localhost")
+        if reading_here != probing_here:
+            die_skip(
+                f"--resolve {args.resolve} and --ssh {args.ssh} name different "
+                "machines: the POST would go to one box and the read-back to "
+                "another, so a pass would grade neither. Use --target house or "
+                "--target prod, or set both explicitly."
+            )
+
     probe_id = "ladder-probe-" + uuid.uuid4().hex[:16]
     body = build_body(probe_id, args.chars)
     wire = len(json.dumps(body))
+    where = args.resolve if args.resolve else "whatever DNS says"
+    read_back = "this machine" if args.ssh in ("local", "-") else args.ssh
     print(f"probe id   : {probe_id}")
+    print(f"target     : {args.target}  (POST -> {where}, read back on {read_back})")
     print(f"body       : {wire:,} bytes to https://{args.host}:{args.port}/api/debug-log"
           + (f" (resolved to {args.resolve})" if args.resolve else ""))
+
+    if args.dry_run:
+        print(f"\nDRY RUN: nothing was sent. A real run would POST {wire:,} bytes to "
+              f"{args.host}:{args.port} pinned to {where}"
+              + ("" if args.no_disk_check else f" and read the line back on {read_back}")
+              + ".")
+        return 0
 
     code, text = post(args, body)
     print(f"http       : {code}  {text.strip()[:200]}")
@@ -218,7 +294,10 @@ def main():
               file=sys.stderr)
         return 1
 
-    print(f"\nOK: a {args.chars:,}-char payload reached disk intact.")
+    # Name the box. "OK" with no address is what let a green line describe the
+    # wrong machine for four days (backlog 2.16).
+    print(f"\nOK: a {args.chars:,}-char payload reached disk intact on "
+          f"{args.target} ({args.host}:{args.port} -> {where}, read back on {read_back}).")
     return 0
 
 

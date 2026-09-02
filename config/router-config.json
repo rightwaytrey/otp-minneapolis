@@ -19,7 +19,7 @@
       "transitGeneralizedCostLimit": "180m + 5.0 x",
       "filterItinerariesWithSameFirstOrLastTrip": false,
       "groupSimilarityKeepOne": 0.85,
-      "groupSimilarityKeepThree": 0.85,
+      "groupSimilarityKeepThree": 0.68,
       "groupedOtherThanSameLegsMaxCostMultiplier": 100.0
     },
     "streetRoutingTimeout": "10s"

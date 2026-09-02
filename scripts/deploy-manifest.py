@@ -31,6 +31,11 @@ USAGE
     deploy-manifest.py show   [--ssh rwt@100.126.171.72]
     deploy-manifest.py verify [--ssh rwt@100.126.171.72]
 
+    # this machine (the house), no ssh -- rwtpc4's sshd rejects a loopback
+    # connection, and `local` is what check-config-ladder.py and
+    # check-debug-log-payload.py already spell it. Omitting --ssh does the same.
+    deploy-manifest.py verify --ssh local
+
 `verify` re-checksums every recorded file where it now lives and reports drift —
 which is the case this whole thing exists for: a file hand-edited on the box
 after the deploy that wrote the manifest. Exit 0 clean, 1 drifted, 75 SKIP.
@@ -167,7 +172,23 @@ def cmd_record(args):
     return 0
 
 
+# `local` and `-` mean THIS machine with no ssh -- the same two spellings
+# check-config-ladder.py and check-debug-log-payload.py accept, deliberately, so
+# one word grades the house in all three. Without this, `--ssh local` tried to
+# resolve a host called "local", failed, and reported SKIP: a check that graded
+# nothing while looking like it had run. (`localhost` is NOT in this list; it is
+# a real host to ssh to, and rwtpc4's sshd rejects the loopback connection.)
+LOCAL_SSH = ("local", "-")
+
+
+def _normalise_ssh(args):
+    if args.ssh in LOCAL_SSH:
+        args.ssh = ""
+    return args
+
+
 def _load(args):
+    _normalise_ssh(args)
     if args.ssh:
         path = args.path or str(DEFAULT_PATH).replace(str(Path.home()), "~")
         try:
@@ -299,7 +320,8 @@ def main():
     ):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("--ssh", default=os.environ.get("DEPLOY_MANIFEST_SSH", ""),
-                       help="user@host to read/verify remotely")
+                       help="user@host to read/verify remotely; `local` (or "
+                            "omitting it) reads this machine directly")
         s.add_argument("--path", default="", help="manifest path (default: %s)" % DEFAULT_PATH)
         s.set_defaults(func=fn)
 

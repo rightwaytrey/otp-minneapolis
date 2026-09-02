@@ -158,13 +158,25 @@ deployment/install-house-nginx.sh --install
 deployment/deploy-app.sh <SERVER_IP> --only nginx
 ```
 
-Then check what is actually live, not what is in git:
+Then check what is actually live, not what is in git — **naming the box**. Both
+deployments answer to `api.transit-nav.com`, and `/etc/hosts` on the desktop
+points that name at the Linode, so a check run here without a target grades the
+Linode however you meant it:
 
 ```bash
-scripts/check-config-ladder.py --deployed    # the four size rungs, on the box
-scripts/check-debug-log-payload.py           # POST 900 KB and read it back
+# the Linode
+scripts/check-config-ladder.py --deployed              # the four size rungs, on the box
+scripts/check-debug-log-payload.py --target prod       # POST 900 KB and read it back
 scripts/deploy-manifest.py verify --ssh rwt@<tailnet-ip>
+
+# this desktop  (`local` reads it directly — its sshd rejects a loopback connection)
+scripts/check-config-ladder.py --deployed --ssh local
+scripts/check-debug-log-payload.py --target house
 ```
+
+`--target` sets the probe's pinned IP and the host the written line is read back
+from together, and the OK line repeats the address it reached. Add `--dry-run` to
+see which box a command would grade without sending anything.
 
 The nginx config includes:
 - SSL/TLS termination with HTTP/2
