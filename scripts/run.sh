@@ -76,7 +76,11 @@ if [ "$START_FRONTEND" = true ]; then
         echo "Starting otp-react-redux frontend on port 9967..."
 
         cd "$OTPRR_DIR"
-        YAML_CONFIG="$OTPRR_DIR/port-config.yml" yarn start &
+        # This repo's frontend/port-config.yml is the config the dev server and
+        # the otp-frontend-dev container both run from. Any port-config.yml in
+        # the otprr checkout is an untracked local copy that drifts (it named
+        # the retired tre.hopto.org host for three weeks after the cutover).
+        YAML_CONFIG="$REPO_ROOT/frontend/port-config.yml" yarn start &
         FRONTEND_PID=$!
         cd "$REPO_ROOT"
 

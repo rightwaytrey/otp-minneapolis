@@ -28,7 +28,9 @@ sudo systemctl status nginx
 ### 3. Start Frontend Dev Server
 ```bash
 cd /home/rwt/projects/otprr/otp-react-redux
-YAML_CONFIG=/home/rwt/projects/otprr/otp-react-redux/port-config.yml yarn start
+# The config lives HERE, not in otprr: any copy left in the otprr checkout is
+# untracked, unread by the dev container, and has gone stale before.
+YAML_CONFIG=/home/rwt/projects/otp-minneapolis/frontend/port-config.yml yarn start
 ```
 
 ## Quick Start (All Components)
@@ -41,11 +43,13 @@ cd /home/rwt/projects/otp-minneapolis && ./scripts/run.sh
 sudo systemctl start nginx
 
 # Terminal 3 - Frontend
-cd /home/rwt/projects/otprr/otp-react-redux && YAML_CONFIG=port-config.yml yarn start
+cd /home/rwt/projects/otprr/otp-react-redux && YAML_CONFIG=/home/rwt/projects/otp-minneapolis/frontend/port-config.yml yarn start
 ```
 
 ## Verification
-Access the full stack at: **https://tre.hopto.org:9966**
+Access the full stack at: **https://api.transit-nav.com:9966**
+(`tre.hopto.org`'s certificate expired 2026-08-09 and cannot be renewed — see
+`frontend/port-config.yml`.)
 
 Nginx routes:
 - `/otp/*` → OTP backend (localhost:8090)
