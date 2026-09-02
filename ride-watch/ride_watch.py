@@ -300,8 +300,30 @@ THREAD_REAP_GRACE_MS = 2 * 60 * 1000
 # then it is one of six findings the wrap-up has to triage every single ride.
 # This suppresses the FINDING, not the record: the line stays in the raw
 # telemetry, so a report can always go and look.
+#
+# "An image named ...": the map sprite re-registration burst. Every map mount
+# throws EIGHTEEN of these — one per numbered route-marker image 1..17 plus
+# "rect" — and because the image name is inside the message each one is a
+# DISTINCT string, so trip.console_seen does not collapse them and the wrap-up
+# gets eighteen findings out of one mount. Recorded 2026-08-31 in
+# ~/otp-debug-logs/debug-2026-08-31.jsonl: sessions mthw7svy-s4msqc and
+# mthw8o2w-i8z1i6, 18 distinct messages each, 36 records, all with the same
+# `addImage@...` stack.
+#
+# NOT OURS and not a Go Mode bug (backlog 4.20): upstream
+# @opentripplanner/transitive-overlay's loadImages checks map.hasImage(id)
+# synchronously and calls map.addImage inside an async .then, so concurrent
+# effect runs all pass the guard and the later ones throw. It fires on any map
+# mount, Go Mode or not. The real fix is a patch-package entry in otprr; until
+# that lands this stops one upstream race from consuming a ride's entire
+# findings budget.
+#
+# The substring is the stable PREFIX, deliberately: the varying image name sits
+# in the middle, so no single substring can span it, and matching on
+# "already exists" alone would swallow unrelated errors.
 CONSOLE_ERROR_IGNORE = (
     "CapgoUpdater : Error no url or wrong format",
+    'An image named ',
 )
 
 # vehicle-match-never. On 2026-09-01 ride 2 the app polled the vehicle matcher

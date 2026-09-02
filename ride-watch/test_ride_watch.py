@@ -3484,10 +3484,19 @@ class TestBikeEgressMissing(RuleTestCase):
 
 
 class TestKnownInertConsoleErrors(RuleTestCase):
-    """6.9. Three sightings, confirmed inert, and one findings slot every ride
-    — six findings is a whole ride's budget for the wrap-up to triage."""
+    """6.9 and 4.20. Confirmed inert, and between them they can consume a whole
+    ride's findings budget before the wrap-up has looked at anything real."""
 
     CAPGO = "\U0001f534 \u2728  CapgoUpdater : Error no url or wrong format"
+    # As recorded: args[0] is an Error object, so _rule_console reads its
+    # `message`. 17 numbered route-marker images plus "rect" = 18 per mount.
+    SPRITE_NAMES = [str(n) for n in range(1, 18)] + ["rect"]
+
+    @staticmethod
+    def sprite_arg(name):
+        return {"message": 'An image named "%s" already exists.' % name,
+                "name": "Error",
+                "stack": "addImage@capacitor://localhost/index-h_pVk0A_.js:1233:88484"}
 
     def test_the_capgo_error_is_not_a_finding(self):
         b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
@@ -3516,6 +3525,51 @@ class TestKnownInertConsoleErrors(RuleTestCase):
                 lines.append(str(args[0]))
         self.assertTrue(lines, "no CapgoUpdater console record on 9/1")
         for msg in lines:
+            self.assertTrue(
+                any(ig in msg for ig in ride_watch.CONSOLE_ERROR_IGNORE), msg)
+
+    def test_the_sprite_burst_costs_no_findings(self):
+        """4.20. One map mount, 18 DISTINCT messages — console_seen cannot
+        collapse them, so before the ignore entry this was 18 findings."""
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        for name in self.SPRITE_NAMES:
+            b.advance(1).console("error", [self.sprite_arg(name)])
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "console-error"), [])
+
+    def test_the_sprite_entry_did_not_widen_to_other_already_exists_errors(self):
+        """The varying image name sits mid-message, so the entry matches on the
+        prefix. Prove that did not turn into "anything that already exists"."""
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).console(
+            "error", [{"message": 'A source named "otp2-tiles" already exists.',
+                       "name": "Error"}])
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "console-error")), 1)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0831),
+                         "%s not present" % REAL_LOG_0831)
+    def test_the_recorded_sprite_lines_are_the_ones_being_suppressed(self):
+        """Matched against the burst as it actually appears in the stream —
+        2026-08-31, sessions mthw7svy-s4msqc and mthw8o2w-i8z1i6 — not against
+        a retyped string."""
+        msgs = set()
+        for line in open(REAL_LOG_0831):
+            if "already exists" not in line:
+                continue
+            obj = json.loads(line)
+            args = obj.get("args") or []
+            if obj.get("kind") != "console" or obj.get("level") != "error":
+                continue
+            if not args:
+                continue
+            arg = args[0]
+            msgs.add(arg.get("message") if isinstance(arg, dict) else str(arg))
+        self.assertTrue(msgs, "no sprite console record on 8/31")
+        # Distinct strings are the whole problem: console_seen dedups by
+        # message, so N distinct messages is N findings.
+        self.assertEqual(len(msgs), 18, sorted(msgs))
+        for msg in msgs:
             self.assertTrue(
                 any(ig in msg for ig in ride_watch.CONSOLE_ERROR_IGNORE), msg)
 

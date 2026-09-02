@@ -53,7 +53,11 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 log "===== OTP GTFS refresh starting (run id $TS) ====="
 
-JAR="$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name 'otp-shaded-*.jar' -type f ! -name '*-sources.jar' 2>/dev/null | head -n1)"
+# awk, not `| head -n1`: under `set -euo pipefail` head closes the pipe on the
+# second match, find takes SIGPIPE, and the whole `$(...)` assignment aborts the
+# script at 141. One shaded JAR hides it; a version bump leaves two. `sort` also
+# makes the pick deterministic instead of directory order. (backlog 2.21/2.15)
+JAR="$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name 'otp-shaded-*.jar' -type f ! -name '*-sources.jar' 2>/dev/null | sort | awk 'NR==1')"
 if [ -z "$JAR" ]; then
   log "ERROR: OTP shaded JAR not found under OpentripPlanner/otp-shaded/target. Run scripts/build.sh first."
   exit 1

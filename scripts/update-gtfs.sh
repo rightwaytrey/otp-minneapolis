@@ -19,7 +19,7 @@ GTFS_URL="https://svc.metrotransit.org/mtgtfs/gtfs.zip"
 MVTA_GTFS_URL="https://srv.mvta.com/InfoPoint/gtfs-zip.ashx"
 
 # Find the JAR
-JAR=$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name "otp-shaded-*.jar" -type f ! -name "*-sources.jar" 2>/dev/null | head -n 1)
+JAR=$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name "otp-shaded-*.jar" -type f ! -name "*-sources.jar" 2>/dev/null | sort | awk 'NR==1')
 
 if [ -z "$JAR" ]; then
     echo "Error: OTP JAR not found. Please run ./scripts/build.sh first."

@@ -24,6 +24,28 @@
     },
     "streetRoutingTimeout": "10s"
   },
+  "vectorTiles": {
+    "layers": [
+      {
+        "name": "stops",
+        "type": "Stop",
+        "mapper": "Digitransit",
+        "minZoom": 14,
+        "maxZoom": 20,
+        "cacheMaxSeconds": 600,
+        "expansionFactor": 0.25
+      },
+      {
+        "name": "stations",
+        "type": "Station",
+        "mapper": "Digitransit",
+        "minZoom": 12,
+        "maxZoom": 20,
+        "cacheMaxSeconds": 600,
+        "expansionFactor": 0.25
+      }
+    ]
+  },
   "updaters": [
     {
       "type": "stop-time-updater",

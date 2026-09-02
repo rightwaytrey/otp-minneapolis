@@ -88,12 +88,12 @@ echo "Step 3/3: Building OTP graph"
 echo "======================================"
 
 # Check if JAR exists
-JAR=$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name "otp-shaded-*.jar" -type f ! -name "*-sources.jar" 2>/dev/null | head -n 1)
+JAR=$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name "otp-shaded-*.jar" -type f ! -name "*-sources.jar" 2>/dev/null | sort | awk 'NR==1')
 
 if [ -z "$JAR" ]; then
     echo "OTP JAR not found. Building OTP first..."
     "$REPO_ROOT/scripts/build.sh"
-    JAR=$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name "otp-shaded-*.jar" -type f ! -name "*-sources.jar" 2>/dev/null | head -n 1)
+    JAR=$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name "otp-shaded-*.jar" -type f ! -name "*-sources.jar" 2>/dev/null | sort | awk 'NR==1')
 fi
 
 echo "Building graph (this may take 5-10 minutes)..."

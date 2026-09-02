@@ -8,7 +8,8 @@
 #
 # What deliberately does NOT go up:
 #   - the OSM extract and GTFS zips  (build inputs; the graph is built on the
-#     desktop, and router-config.json is the only config OTP needs to --load)
+#     desktop, and router-config.json + otp-config.json are the only configs
+#     OTP needs to --load)
 #   - the OpentripPlanner source tree (Dockerfile.runtime uses the prebuilt JAR)
 #   - anything Pelias                 (geocoding is proxied to Stadia)
 #   - graph.obj.backup-*, metro_transit_schedule.db, archive/
@@ -72,7 +73,11 @@ RROOT="root@$SERVER_IP"
 RREPO="/home/$APP_USER/projects/otp-minneapolis"
 RTNAV="/home/$APP_USER/projects/transitnav"
 
-JAR="$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name 'otp-shaded-*.jar' -type f ! -name '*-sources.jar' 2>/dev/null | head -n1)"
+# awk, not `| head -n1`: under `set -euo pipefail` head closes the pipe on the
+# second match, find takes SIGPIPE, and the whole `$(...)` assignment aborts the
+# script at 141. One shaded JAR hides it; a version bump leaves two. `sort` also
+# makes the pick deterministic instead of directory order. (backlog 2.21/2.15)
+JAR="$(find "$REPO_ROOT/OpentripPlanner/otp-shaded/target" -name 'otp-shaded-*.jar' -type f ! -name '*-sources.jar' 2>/dev/null | sort | awk 'NR==1')"
 [ -n "$JAR" ] || { echo "${RED}Error: OTP shaded JAR not found. Run scripts/build.sh${NC}"; exit 1; }
 [ -f "$REPO_ROOT/data/graph.obj" ] || { echo "${RED}Error: data/graph.obj not found${NC}"; exit 1; }
 
@@ -87,9 +92,11 @@ fi
 
 if want graph; then
 echo "${GREEN}=== 2/7  OTP graph + runtime config ===${NC}"
-# router-config.json is the ONLY config OTP needs at runtime — it holds just the
-# external Metro Transit and MVTA GTFS-RT updater URLs. build-config.json points
-# at gtfs.zip and the OSM extract and is build-only, which is why neither ships.
+# router-config.json and otp-config.json are the configs OTP needs at runtime —
+# the first holds the external Metro Transit and MVTA GTFS-RT updater URLs plus
+# the vector-tile layers, the second turns the sandbox APIs on.
+# build-config.json points at gtfs.zip and the OSM extract and is build-only,
+# which is why neither of those ships.
 rsync -az --info=progress2 "$REPO_ROOT/data/graph.obj" "$RUSER:$RREPO/data/graph.obj"
 rsync -az "$REPO_ROOT/config/router-config.json" "$RUSER:$RREPO/config/"
 rsync -az "$REPO_ROOT/config/build-config.json"  "$RUSER:$RREPO/config/"
@@ -118,6 +125,17 @@ fi
 rsync -az "$RC_SRC" "$RUSER:$RREPO/data/router-config.json"
 rsync -az "$RC_SRC" "$RUSER:$RREPO/config/router-config.json"
 rsync -az "$REPO_ROOT/config/build-config.json"  "$RUSER:$RREPO/data/"
+# otp-config.json turns SANDBOX features on. It is a second runtime config, and
+# it goes to the same DATA dir for the same reason router-config.json does:
+# `--load /var/opentripplanner` is where OTP looks. Without it OTP logs
+# "'/var/opentripplanner/otp-config.json' is not present. Using default
+# configuration." and every sandbox feature stays off -- including the vector
+# tile API that serves the stop layer, whose endpoint then 404s while
+# router-config.json's `vectorTiles` block sits there parsed and unused.
+# The desktop gets this free: run.sh/start-all.sh/build-graph.sh already
+# `cp config/*.json data/`.
+rsync -az "$REPO_ROOT/config/otp-config.json"    "$RUSER:$RREPO/data/"
+rsync -az "$REPO_ROOT/config/otp-config.json"    "$RUSER:$RREPO/config/"
 fi
 
 if want jar; then
@@ -135,11 +153,15 @@ rsync -az \
   "$TRANSITNAV/build_gtfs_shapes.py" "$TRANSITNAV/gtfs_shapes.db" \
   "$TRANSITNAV/requirements-prefs-api.txt" \
   "$RUSER:$RTNAV/"
-# The bundled app calls cross-origin from capacitor://localhost; the web UI on
-# this host is same-origin. Both are covered, and the old tre.hopto.org entries
-# are kept so nothing that still points there breaks during the cutover week.
-sed -e "s#^PREFS_ALLOWED_ORIGIN=.*#PREFS_ALLOWED_ORIGIN=https://$DOMAIN:$APP_PORT,https://$DOMAIN,capacitor://localhost,https://tre.hopto.org,https://tre.hopto.org:$APP_PORT#" \
-    "$TRANSITNAV/.env" | ssh "${SSH_OPTS[@]}" "$RUSER" "cat > '$RTNAV/.env' && chmod 600 '$RTNAV/.env'"
+# The desktop's transitnav/.env is the source for the server's, but it is no
+# longer a straight copy with one CORS line rewritten: since the house grew a
+# staging lane of its own it also carries keys that say WHICH BOX YOU ARE, and
+# those must not travel. render_server_env owns that transform and prints what
+# it removed; deployment/test-server-env.sh tests it without needing an ssh.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/server-env.sh"
+render_server_env "$TRANSITNAV/.env" "$DOMAIN" "$APP_PORT" \
+  | ssh "${SSH_OPTS[@]}" "$RUSER" "cat > '$RTNAV/.env' && chmod 600 '$RTNAV/.env'"
 # The site file sets auth_basic for the web UI and names /etc/nginx/.htpasswd.
 # If that file is absent nginx does not fall back to open -- it returns 403 for
 # every gated request, which reads like a permissions bug rather than a missing
@@ -250,8 +272,25 @@ echo "${GREEN}=== 7/7  nginx ===${NC}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # Parity between the two environments before anything is installed: shared
 # locations must be byte-identical (this replaced scripts/check-nginx-parity.py).
-python3 "$SCRIPT_DIR/render-nginx.py" --check >/dev/null \
-  || { echo "${RED}Error: rendered house/prod configs are not in parity; run deployment/render-nginx.py --check${NC}"; exit 1; }
+# --check has two halves: shared-location parity, and the guard that refuses to
+# let a real credential live in a committed file. The second half needs
+# deployment/.env, and when that is absent it exits 75 SKIP rather than 0 --
+# because "no secret leaked" and "nothing to compare against" are not the same
+# green line (backlog 2.20). A deploy host always has .env, so a SKIP *here*
+# means the file has gone missing, and that must stop the deploy, not pass it.
+NGINX_CHECK_RC=0
+NGINX_CHECK_OUT="$(python3 "$SCRIPT_DIR/render-nginx.py" --check 2>&1)" || NGINX_CHECK_RC=$?
+if [ "$NGINX_CHECK_RC" -eq 75 ]; then
+  printf '%s\n' "$NGINX_CHECK_OUT"
+  echo "${RED}Error: render-nginx.py --check skipped its committed-secret guard (exit 75).${NC}"
+  echo "${YELLOW}deployment/.env is missing on this machine, so the guard had no values to"
+  echo "compare. Restore it and re-run; do not deploy nginx unverified.${NC}"
+  exit 1
+elif [ "$NGINX_CHECK_RC" -ne 0 ]; then
+  printf '%s\n' "$NGINX_CHECK_OUT"
+  echo "${RED}Error: rendered house/prod configs are not in parity; run deployment/render-nginx.py --check${NC}"
+  exit 1
+fi
 RIDE_UPSTREAM="$RIDE_UPSTREAM" STADIA_API_KEY="$STADIA_API_KEY" UNLOCK_SECRET="$UNLOCK_SECRET" \
   python3 "$SCRIPT_DIR/render-nginx.py" --env prod --out "$TMP" >/dev/null \
   || { echo "${RED}Error: rendering the prod nginx config failed${NC}"; exit 1; }
@@ -338,5 +377,6 @@ ssh "${SSH_OPTS[@]}" "$RUSER" \
     --file "$RTNAV/preferences_api.py" \
     --file "$RTNAV/onboard_api.py" \
     --file "$RREPO/data/router-config.json" \
+    --file "$RREPO/data/otp-config.json" \
     --file "$RREPO/data/graph.obj"
 ssh "${SSH_OPTS[@]}" "$RUSER" "cat '$RREPO/deployment/deploy-manifest.json'" | sed 's/^/  /'

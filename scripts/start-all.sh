@@ -40,7 +40,7 @@ RED='\033[0;31m'
 NC='\033[0m' # No Color
 
 # Find the shaded JAR (exclude sources JAR)
-JAR=$(find OpentripPlanner/otp-shaded/target -name "otp-shaded-*.jar" -type f ! -name "*-sources.jar" 2>/dev/null | head -n 1)
+JAR=$(find OpentripPlanner/otp-shaded/target -name "otp-shaded-*.jar" -type f ! -name "*-sources.jar" 2>/dev/null | sort | awk 'NR==1')
 
 if [ -z "$JAR" ]; then
     echo -e "${RED}Error: OTP JAR not found. Please run ./scripts/build.sh first.${NC}"

@@ -44,11 +44,14 @@ FAIL CLOSED
 USAGE
     render-nginx.py --env prod  --out DIR    # secrets required in the environ
     render-nginx.py --env house --out DIR
-    render-nginx.py --check                  # renders both, asserts parity
+    render-nginx.py --check                  # renders both, asserts parity,
+                                             # and scans for committed secrets
     render-nginx.py --env prod --out DIR --placeholder-secrets
                                              # dummy secrets; NEVER install this
 
-Exit: 0 ok, 1 failed, 75 SKIP (inputs unresolvable — loudly).
+Exit: 0 ok, 1 failed, 75 SKIP (inputs unresolvable — loudly). `--check`
+returns 75 when deployment/.env is absent: parity still held, but the
+committed-secret guard had no values to compare and must not read as green.
 """
 
 import argparse
@@ -292,6 +295,51 @@ def parse_locations(text):
     return out
 
 
+class ValueScan:
+    """What guard (2) of check_no_secret_is_committed actually compared.
+
+    A green line has to distinguish "no secret leaked" from "there was nothing
+    to compare against" — see the class docstring there.
+    """
+
+    def __init__(self, dotenv, ran):
+        self.dotenv = dotenv
+        self.ran = ran
+        self.declared = set()  # SECRET names + their .env source aliases
+        self.names = set()  # names whose value was actually compared
+        self.too_short = set()  # in .env but < 8 chars, so not credential-like
+        self.files = set()  # committed files searched
+
+    def report(self):
+        rel = self.dotenv.name
+        if not self.ran:
+            return [
+                f"committed-secret scan: NOT RUN — deployment/{rel} is absent, "
+                "so no value set was compared.",
+                "  (correct in a git worktree, where .env is gitignored; on a "
+                "deploy host it means the file is missing.)",
+            ]
+        lines = [
+            "committed-secret scan: "
+            f"{len(self.names)} value(s) compared against {len(self.files)} "
+            "committed file(s).",
+            "  values : " + (", ".join(sorted(self.names)) or "none"),
+            "  files  : " + (", ".join(sorted(self.files)) or "none"),
+        ]
+        skipped = sorted(self.declared - self.names - self.too_short)
+        if self.too_short:
+            lines.append(
+                "  short  : "
+                + ", ".join(sorted(self.too_short))
+                + " (< 8 chars, not credential-like)"
+            )
+        if skipped:
+            lines.append(
+                "  absent : " + ", ".join(skipped) + f" (not set in deployment/{rel})"
+            )
+        return lines
+
+
 def check_no_secret_is_committed():
     """Refuse to let a real credential live in a committed file.
 
@@ -309,6 +357,13 @@ def check_no_secret_is_committed():
          SECRET-declared names are scanned: DOMAIN is a public hostname and
          belongs in `server_name`, and scanning every .env key just trains
          people to ignore the check.
+
+    Guard (2) needs deployment/.env, which is gitignored and therefore absent
+    from every git worktree. It used to be silently skipped there, so `--check`
+    printed the same `OK` whether it had compared every secret or none of them.
+    Returns (failures, scan) instead, where `scan` says exactly which value
+    names and which files guard (2) compared — and whether it ran at all. The
+    caller turns "did not run" into exit 75 SKIP, not 0.
     """
     failures = []
     tmpl_text = {
@@ -335,6 +390,7 @@ def check_no_secret_is_committed():
         scan_names.update(SECRET_SOURCE_ALIASES.get(key, []))
 
     dotenv = DEPLOYMENT / ".env"
+    scan = ValueScan(dotenv=dotenv, ran=dotenv.is_file())
     if dotenv.is_file():
         haystack = {**tmpl_text}
         for env in ENVIRONMENTS:
@@ -358,7 +414,9 @@ def check_no_secret_is_committed():
             # Short values are not credentials and would false-positive against
             # ordinary words (APP_PORT=9966, APP_USER=rwt).
             if len(val) < 8:
+                scan.too_short.add(key)
                 continue
+            scan.names.add(key)
             for where, text in haystack.items():
                 if val in text:
                     failures.append(
@@ -366,7 +424,9 @@ def check_no_secret_is_committed():
                         f"verbatim in {where}. That file is COMMITTED to a public "
                         "repo. Put the placeholder back."
                     )
-    return failures
+        scan.files.update(haystack)
+        scan.declared = set(scan_names)
+    return failures, scan
 
 
 def check():
@@ -380,7 +440,7 @@ def check():
     template bytes. (2) is the drift shape: a location that exists on one host
     and quietly does not on the other.
     """
-    failures = check_no_secret_is_committed()
+    failures, scan = check_no_secret_is_committed()
     rendered = {}
     with tempfile.TemporaryDirectory() as tmp:
         for env in ENVIRONMENTS:
@@ -436,11 +496,26 @@ def check():
                 f"{len(one_sided)} one-sided ({', '.join(one_sided) or 'none'})"
             )
 
+    print()
+    for line in scan.report():
+        print(line)
+
     if failures:
         print("\nFAIL: the templates did not pass.", file=sys.stderr)
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
+    # Parity held, but half the check did not run. Exit 75 so the caller can
+    # tell the two apart: nightly-verify.sh files it as SKIP, and deploy-app.sh
+    # aborts (a deploy host always has deployment/.env, so a SKIP there means
+    # the file is gone, not that the check is inapplicable).
+    if not scan.ran:
+        print(
+            "\nSKIP: shared locations are identical, but the committed-secret "
+            "guard had nothing to compare against.",
+            file=sys.stderr,
+        )
+        return SKIP
     print("\nOK: every shared location is identical by construction.")
     return 0
 

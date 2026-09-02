@@ -42,6 +42,15 @@ n=$("${SSH[@]}" "rwt@$IP" "docker logs otp-minneapolis 2>&1 | grep -ciE 'stop-ti
 "${SSH[@]}" "rwt@$IP" "test -f /home/rwt/projects/otp-minneapolis/data/router-config.json" 2>/dev/null \
   && ok "data/router-config.json present (the file OTP --load actually reads)" \
   || bad "data/router-config.json MISSING — OTP is running on defaults"
+# The map's stop layer is served by a SANDBOX API, which is off unless
+# data/otp-config.json turns it on -- a second file in the same directory, with
+# the same silent failure mode as router-config.json: OTP comes up 200 and the
+# tiles simply 404. Probe the endpoint, not the file, because the config being
+# present and the feature being on are two different things.
+vt=$("${SSH[@]}" "rwt@$IP" "curl -s -o /dev/null -w '%{http_code}' --max-time 20 http://127.0.0.1:8090/otp/routers/default/vectorTiles/stops/tilejson.json" 2>/dev/null)
+[ "$vt" = "200" ] \
+  && ok "vector tiles: stops/tilejson.json -> 200 (stop layer will draw)" \
+  || bad "vector tiles: stops/tilejson.json -> ${vt:-unreachable} — check data/otp-config.json enables SandboxAPIMapboxVectorTilesApi and router-config.json has a vectorTiles.layers entry named 'stops'"
 
 echo
 echo "=== 3. Graph covers today ==="
