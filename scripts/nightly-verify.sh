@@ -128,6 +128,12 @@ STATIC_CHECKS=(
   "server-env-transform|bash $(dirname "$0")/../deployment/test-server-env.sh"
   "debug-log-payload-prod|python3 $(dirname "$0")/check-debug-log-payload.py --target prod"
   "debug-log-payload-house|python3 $(dirname "$0")/check-debug-log-payload.py --target house"
+  # Asks the running OTP a real routing question, because the answer depends on
+  # two artefacts that ship by different steps: router-config.json (--only
+  # graph) and the jar built from the patched fork (--only jar otp). Either one
+  # arriving alone puts the Southdale search back to a lone walk card, and
+  # nothing else in this suite would notice.
+  "transit-not-hidden-prod|python3 $(dirname "$0")/check-transit-not-hidden.py --target prod"
 )
 for entry in "${STATIC_CHECKS[@]}"; do
   name="${entry%%|*}"

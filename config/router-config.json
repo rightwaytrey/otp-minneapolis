@@ -17,6 +17,8 @@
     "itineraryFilters": {
       "debug": "off",
       "transitGeneralizedCostLimit": "180m + 5.0 x",
+      "removeTransitWithHigherCostThanBestOnStreetOnly": "30m + 3.0 x",
+      "removeTransitIfWalkingIsBetter": false,
       "filterItinerariesWithSameFirstOrLastTrip": false,
       "groupSimilarityKeepOne": 0.85,
       "groupSimilarityKeepThree": 0.68,
