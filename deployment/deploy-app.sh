@@ -67,6 +67,18 @@ for v in APP_USER DOMAIN APP_PORT STADIA_API_KEY HOME_TAILSCALE_IP UNLOCK_SECRET
   [ -n "${!v:-}" ] || { echo "${RED}Error: $v is empty in .env${NC}"; exit 1; }
 done
 
+# One EXIT trap for the whole script, over a list of paths. bash keeps only the
+# LAST `trap ... EXIT` that is installed, so the two handlers this script used to
+# set -- the tuned router-config.json in the graph step and the nginx render dir
+# in the nginx step -- clobbered each other: the nginx trap replaced the graph
+# trap, and the tuned config leaked in /tmp on every full deploy with
+# SERVER_MAX_STOP_COUNT set. Steps now register their temp paths instead of
+# installing traps of their own. (backlog 2.23)
+CLEANUP_PATHS=()
+cleanup() { [ "${#CLEANUP_PATHS[@]}" -eq 0 ] || rm -rf "${CLEANUP_PATHS[@]}"; }
+cleanup_add() { CLEANUP_PATHS+=("$@"); }
+trap cleanup EXIT
+
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
 RUSER="$APP_USER@$SERVER_IP"
 RROOT="root@$SERVER_IP"
@@ -112,7 +124,7 @@ rsync -az "$REPO_ROOT/config/build-config.json"  "$RUSER:$RREPO/config/"
 # box would get ~3x slower with nothing in any log to say why.
 RC_SRC="$REPO_ROOT/config/router-config.json"
 if [ -n "${SERVER_MAX_STOP_COUNT:-}" ]; then
-  RC_TUNED="$(mktemp)"; trap 'rm -f "$RC_TUNED"' EXIT
+  RC_TUNED="$(mktemp)"; cleanup_add "$RC_TUNED"
   python3 -c "
 import json,sys
 d=json.load(open(sys.argv[1]))
@@ -269,7 +281,7 @@ echo "${GREEN}=== 7/7  nginx ===${NC}"
 # may put a file under /etc/nginx, in either direction. The repo copies hold
 # placeholders and the live files hold real secrets, so a `cp` either way is a
 # breakage -- and one direction is how the unlock secret reached a public repo.
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"; cleanup_add "$TMP"
 # Parity between the two environments before anything is installed: shared
 # locations must be byte-identical (this replaced scripts/check-nginx-parity.py).
 # --check has two halves: shared-location parity, and the guard that refuses to
@@ -366,17 +378,28 @@ PROVENANCE="$(python3 "$REPO_ROOT/scripts/deploy-manifest.py" provenance \
   --repo "otprr=$HOME/projects/otprr/otp-react-redux")"
 # --only nginx skips the repo step, so make sure the recorder is present.
 rsync -az "$REPO_ROOT/scripts/deploy-manifest.py" "$RUSER:$RREPO/scripts/"
-ssh "${SSH_OPTS[@]}" "$RUSER" \
-  python3 "$RREPO/scripts/deploy-manifest.py" record \
-    --target prod \
-    --steps "$(echo "${ONLY:-$ALL_STEPS}" | tr ' ' ',')" \
-    --provenance "$PROVENANCE" \
-    --file /etc/nginx/snippets/otp-common.conf \
-    --file /etc/nginx/sites-available/otp \
-    --file /etc/nginx/conf.d/00-map-hash.conf \
-    --file "$RTNAV/preferences_api.py" \
-    --file "$RTNAV/onboard_api.py" \
-    --file "$RREPO/data/router-config.json" \
-    --file "$RREPO/data/otp-config.json" \
-    --file "$RREPO/data/graph.obj"
+# ssh does NOT pass argv through: it joins its arguments with single spaces and
+# hands one string to the REMOTE shell, which re-parses it. $PROVENANCE is JSON
+# -- spaces, double quotes, braces -- so the local quoting was stripped here and
+# the remote shell word-split it, argparse died with "unrecognized arguments",
+# and `set -e` killed the deploy at the very last step. That is why NEITHER box
+# had a manifest after real deploys on 2026-09-02 (11:58 and 12:39 both reached
+# the rsync one line above and died on the line below). Quote the command for
+# the remote shell explicitly. (backlog 2.19)
+RECORD_ARGV=(
+  python3 "$RREPO/scripts/deploy-manifest.py" record
+  --target prod
+  --steps "$(echo "${ONLY:-$ALL_STEPS}" | tr ' ' ',')"
+  --provenance "$PROVENANCE"
+  --file /etc/nginx/snippets/otp-common.conf
+  --file /etc/nginx/sites-available/otp
+  --file /etc/nginx/conf.d/00-map-hash.conf
+  --file "$RTNAV/preferences_api.py"
+  --file "$RTNAV/onboard_api.py"
+  --file "$RREPO/data/router-config.json"
+  --file "$RREPO/data/otp-config.json"
+  --file "$RREPO/data/graph.obj"
+)
+printf -v RECORD_CMD '%q ' "${RECORD_ARGV[@]}"
+ssh "${SSH_OPTS[@]}" "$RUSER" "$RECORD_CMD"
 ssh "${SSH_OPTS[@]}" "$RUSER" "cat '$RREPO/deployment/deploy-manifest.json'" | sed 's/^/  /'

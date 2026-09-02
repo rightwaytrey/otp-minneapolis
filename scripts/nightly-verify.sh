@@ -110,10 +110,16 @@ skips=""
 # START_GO_MODE, so a LADDER_PROBE on session `config-probe` matches no trip and
 # falls through _process without touching any rule.
 #
-# Each entry is "<display name>|<command>". The command runs from scripts/.
+# Each entry is "<display name>|<command>". The command inherits cron's cwd
+# ($HOME), NOT scripts/ -- every entry must name its paths off $(dirname "$0")
+# and every check it calls must resolve its own repo paths, or the 05:00 run
+# grades something other than what a hand-run in scripts/ grades.
 STATIC_CHECKS=(
   "config-ladder-repo|python3 $(dirname "$0")/check-config-ladder.py"
-  "config-ladder-deployed-prod|python3 $(dirname "$0")/check-config-ladder.py --deployed"
+  # The host is spelled out rather than left to check-config-ladder.py's
+  # default: the entry NAME claims which box it graded, and a name that is
+  # only true while a default holds is the failure this block warns about.
+  "config-ladder-deployed-prod|python3 $(dirname "$0")/check-config-ladder.py --deployed --ssh rwt@100.126.171.72"
   "config-ladder-deployed-house|python3 $(dirname "$0")/check-config-ladder.py --deployed --ssh local"
   "nginx-render-parity|python3 $(dirname "$0")/../deployment/render-nginx.py --check"
   # The desktop's transitnav/.env is the source for the Linode's, and two of its
@@ -160,7 +166,9 @@ if ! curl -sf -o /dev/null --max-time 15 "$APP_URL"; then
     [ -n "$failures" ] && { echo; echo "$failures"; }
     [ -n "$skips" ] && { echo; echo "$skips"; }
   } >> "$REPORT"
-  [ "$fail" -eq 0 ] || exit 1
+  # Always non-zero: a night with no dev server is a night the suite did not
+  # run, whatever the static checks said. (The guarded `exit 1` that stood
+  # here first was unreachable and read as if a clean static pass could exit 0.)
   exit 1
 fi
 
