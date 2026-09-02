@@ -75,6 +75,29 @@ code=$(curl -s "${RES[@]}" -o /dev/null -w '%{http_code}' --max-time 25 -H 'cont
   -d '{"query":"{serviceTimeRange{start end}}"}' "$BASE/otp/gtfs/v1")
 [ "$code" = "200" ] && ok "/otp/gtfs/v1 -> 200" || bad "/otp/gtfs/v1 -> $code"
 
+# The map's stop layer loads in two hops: the app fetches tilejson.json, then
+# MapLibre fetches whatever tile URLs that document names. OTP composes those
+# URLs from X-Forwarded-Host falling back to Host, so a proxy that forwards
+# $host (hostname, no port) makes tilejson answer 200 while pointing MapLibre at
+# port 443, where nothing listens. That failure is invisible from a status code,
+# so follow the URL the server actually handed out.
+tj=$(curl -s "${RES[@]}" --max-time 25 "$BASE/otp/routers/default/vectorTiles/stops,stations/tilejson.json")
+turl=$(printf '%s' "$tj" | python3 -c "import sys,json;print(json.load(sys.stdin)['tiles'][0])" 2>/dev/null)
+case "$turl" in
+  "$BASE"/*)
+    ok "vector tiles: tilejson names $turl"
+    tile=${turl//\{z\}\/\{x\}\/\{y\}/14\/3947\/5895}
+    code=$(curl -s "${RES[@]}" -o /dev/null -w '%{http_code}' --max-time 25 "$tile")
+    [ "$code" = "200" ] \
+      && ok "vector tiles: a downtown Minneapolis tile -> 200" \
+      || bad "vector tiles: downtown tile -> $code — tilejson is right but tiles do not serve; the map will show no stops"
+    ;;
+  "")
+    bad "vector tiles: tilejson.json through nginx named no tiles URL (body: ${tj:0:120}) — check data/otp-config.json enables SandboxAPIMapboxVectorTilesApi" ;;
+  *)
+    bad "vector tiles: tilejson names $turl, not $BASE/... — nginx is stripping the port; location /otp needs 'proxy_set_header X-Forwarded-Host \$http_host'" ;;
+esac
+
 lbl=$(curl -s "${RES[@]}" --max-time 25 "$BASE/pelias/v1/autocomplete?text=target%20field&focus.point.lat=44.98&focus.point.lon=-93.27" \
   | python3 -c "import sys,json;f=json.load(sys.stdin).get('features');print(f[0]['properties']['label'] if f else '')" 2>/dev/null)
 [ -n "$lbl" ] && ok "/pelias/v1/autocomplete -> $lbl" || bad "/pelias/v1/autocomplete returned nothing"

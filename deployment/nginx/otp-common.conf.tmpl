@@ -105,6 +105,19 @@
         proxy_pass http://127.0.0.1:8090;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
+        # $host is the hostname with the port stripped, and OTP builds its
+        # self-referential URLs from X-Forwarded-Host falling back to Host
+        # (framework/io/HttpUtils.java getBaseAddress). The API is served ONLY
+        # on $APP_PORT -- nothing listens on 443 for this name -- so with $host
+        # alone the vector-tile tilejson answers 200 while naming tile URLs on
+        # port 443 that refuse the connection, and the map's stop layer comes up
+        # empty with nothing in any log. Measured 2026-09-02: tilejson through
+        # this proxy returned tiles at "https://api.transit-nav.com/otp/..." and
+        # that URL is connection-refused, while the same tile on :9966 is 21 kB
+        # of protobuf. $http_host is the client's Host header verbatim, port
+        # included. Setting it here also overrides any X-Forwarded-Host a client
+        # sends, which nginx would otherwise pass through untouched.
+        proxy_set_header X-Forwarded-Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
