@@ -66,9 +66,12 @@ line (`{kind:"console", level, args}`), or a session marker.
 | `reroute-storm` | more than 3 `START_REROUTE` in 5 minutes | warn |
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
 | `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
-| `console-error` | a `console.error` line (deduped by message) | info |
+| `console-error` | a `console.error` line (deduped by message, minus `CONSOLE_ERROR_IGNORE`) | info |
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
 | `session-churn` | the app re-mounted mid-ride and minted a new session id | warn |
+| `resumed-trip` | a ride that began with no `START_GO_MODE`, so it has no replay fixture | warn (info when it is the daemon that restarted) |
+| `vehicle-match-never` | a transit leg polled >=30 times and the live matcher never named a vehicle | warn |
+| `bike-egress-missing` | a bike+transit search whose transit results all end on foot | warn |
 
 Two of those were written on 2026-07-31, after a ride where **every single
 finding was a rider note** — the engine had nothing to say while the app
@@ -230,6 +233,15 @@ the trip they are taking. Only sessions matching `^<prefix>-\d{4}$` are killed,
 which is why a hand-spawned `ride-test-smoke` survives; the filter is
 `ride_thread_sessions()` and it has its own tests.
 
+The pane name is the clock minute, and two rides can land in the same one. On
+2026-08-31 the app re-mounted 41 s after 18:52:14 and both trips resolved to
+`ride-1852`; the second `tmux new-session` failed with *duplicate session* and
+set `_thread_status["ride-1852"] = False` — an entry keyed by **pane**, so it
+condemned the first ride's live, ready console too. Both trips then read as
+having no thread, and both trip-ends sent the fallback page instead of asking
+the console that was sitting right there. `_thread_name` now takes the next
+free suffix (`ride-1852b`) when the minute is already spoken for.
+
 ### How data reaches it
 
 The daemon **types one line per milestone** and nothing else:
@@ -352,6 +364,39 @@ starts and kills it — seventeen seconds. The same pattern at 17:07:50 →
 the deadline duly paged about it ten minutes later, which is the safety net
 working and the report still gone. Protection lasts only as long as the
 deadline, so a pane that never writes cannot pin the namespace.
+
+### When the console closes
+
+Sparing a pane was only half a lifecycle. `_kill_previous_threads` ran from the
+**spawn** path and nowhere else, so a finished ride's console lived until the
+next ride started — and a pane spared there was never revisited at all. On
+2026-09-01 `ride-1029`'s trip ended at 10:48:47 and its wrap-up landed at
+10:51:22; `tmux ls` still showed it at 11:15, next to `ride-1048`. The rider
+caught it mid-ride: *"Ok makes sure all ride consoles wrap up upon complete."*
+
+The two halves are now one state machine:
+
+* at trip end, a pane that owes a wrap-up is held by its deadline; a pane that
+  owes nothing — no findings, so no request — is scheduled for retirement
+  straight away;
+* when the deadline settles, either way (the report landed, or the window
+  expired), the pane is scheduled for retirement too. That is the second sweep
+  a spared pane never had;
+* `_reap_due_threads` runs on the same 5 s tick as the deadlines and closes
+  each pane `THREAD_REAP_GRACE_MS` (2 min) later — long enough for the thread
+  to finish printing and for the rider to read it — unless a live ride has
+  taken that name back, or a wrap-up is outstanding on it again;
+* pending retirements go into `state.json`, so a restart-on-commit inside the
+  grace window still closes the console.
+
+And the daemon **never pages about a wrap-up it prevented itself**. Every pane
+it kills goes into `_panes_killed` with a timestamp; if a deadline expires on a
+pane killed after that deadline was armed, the fallback push is suppressed and
+the daemon logs an error against itself instead. That page costs one of two
+ride interrupts and used to arrive while the rider was on the next bus. Before
+it comes to that, an orphaned wrap-up — one whose pane is known to be gone — is
+handed **once** to whichever ride thread is alive, with its deadline restarted:
+same session, same rider, and that thread is running anyway.
 
 `RIDE_THREAD_ENABLED=0` (set in the systemd unit) disables the whole thing: the
 daemon then behaves exactly as it did before threads existed.

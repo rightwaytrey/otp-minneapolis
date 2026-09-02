@@ -32,7 +32,7 @@ from ride_watch import (  # noqa: E402
 
 
 def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
-                thread_enabled=None):
+                thread_enabled=None, kill_thread=None):
     """A watcher whose daemon log does not spam the test runner.
 
     report_dir is pinned under the temp dir: _report_path stats the vault to
@@ -44,7 +44,8 @@ def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
     os.makedirs(reports, exist_ok=True)
     return RideWatch(dry_run=True, replay=replay, watch_dir=watch_dir, log=log,
                      spawn_thread=spawn_thread, push_line=push_line,
-                     thread_enabled=thread_enabled, report_dir=reports)
+                     thread_enabled=thread_enabled, report_dir=reports,
+                     kill_thread=kill_thread)
 
 
 def read_text(path):
@@ -245,6 +246,7 @@ class StubThread:
         self.ok = ok
         self.spawns = []               # [(tmux_name, display_name)]
         self.pushes = []               # [{name, line, digest}]
+        self.kills = []                # panes the daemon retired, in order
 
     def spawn(self, name, display):
         self.spawns.append((name, display))
@@ -255,6 +257,10 @@ class StubThread:
         with open(path) as f:
             digest = f.read()
         self.pushes.append({"name": name, "line": line, "digest": digest})
+        return True
+
+    def kill(self, name):
+        self.kills.append(name)
         return True
 
     def lines(self):
@@ -271,6 +277,28 @@ class StubThread:
 
     def of_kind(self, kind):
         return [p for p, k in zip(self.pushes, self.kinds()) if k == kind]
+
+
+class TmuxLikeStubThread(StubThread):
+    """A stub that refuses a duplicate session name, the way tmux does.
+
+    The 8/31 fault needs both halves of the real spawner's failure path:
+    `tmux new-session` returns non-zero with "duplicate session: ride-1852",
+    and `_tmux_spawn_blocking` then writes `_thread_status[name] = False` —
+    keyed by PANE, so the entry it poisons is shared with whichever trip
+    already owns that name. A stub that only returns False reproduces the
+    failed spawn but not the collateral damage, which is the whole bug.
+    """
+
+    watch = None
+
+    def spawn(self, name, display):
+        if any(name == prior for prior, _ in self.spawns):
+            self.spawns.append((name, display))
+            if self.watch is not None:
+                self.watch._thread_status[name] = False
+            return False
+        return StubThread.spawn(self, name, display)
 
 
 class NoProcesses:
@@ -308,7 +336,8 @@ class RuleTestCase(unittest.TestCase):
         watch = quiet_watch(
             self.tmp,
             spawn_thread=thread.spawn if thread else None,
-            push_line=thread.push if thread else None)
+            push_line=thread.push if thread else None,
+            kill_thread=thread.kill if thread else None)
         for ev in builder.events:
             watch.process(ev)
         if finalize:
@@ -2968,6 +2997,527 @@ class TestDaemonProvenance(RuleTestCase):
         own = read_text(os.path.join(self.tmp, "%s.current-ride.md" % SESSION))
         self.assertIn("Daemon: ride_watch.py @", own)
         self.assertIn("## Active trip", own)
+
+
+# --- the ride console lifecycle ---------------------------------------------
+# 6.13 and 2.6 are one state machine, and before this the daemon only had half
+# of it: _kill_previous_threads ran from the SPAWN path and nowhere else, so a
+# finished ride's pane waited for the NEXT ride to be killed, and a pane spared
+# there because its wrap-up was outstanding was never revisited at all.
+
+class TestRideConsoleWrapsUpOnComplete(RuleTestCase):
+    """2026-09-01, rider in-ride at 11:00:15: "Ok makes sure all ride consoles
+    wrap up upon complete." At 11:15 `tmux ls` still showed ride-1029, whose
+    trip ended 10:48:47 and whose wrap-up landed 10:51:22 — 26 minutes.
+    """
+
+    def ended_ride(self, findings=True):
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        if findings:
+            # stop-count-collapse: gives the ride something to write up, so a
+            # report request is written and a deadline armed.
+            b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        return watch, thread
+
+    def land_report(self, watch):
+        with open(watch.report_deadlines[0]["reportPath"], "w") as f:
+            f.write("# ride report\n")
+
+    def test_a_pane_is_retired_once_its_wrap_up_lands(self):
+        """The 6.13 case exactly: report in, console still running."""
+        watch, thread = self.ended_ride()
+        pane = thread.spawns[0][0]
+        self.land_report(watch)
+        watch.check_timers()
+        self.assertEqual(thread.kills, [], "reaped before the grace period")
+        watch.clock_ms += ride_watch.THREAD_REAP_GRACE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(thread.kills, [pane])
+
+    def test_a_pane_whose_deadline_expired_is_retired_too(self):
+        watch, thread = self.ended_ride()
+        pane = thread.spawns[0][0]
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        watch.clock_ms += ride_watch.THREAD_REAP_GRACE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(thread.kills, [pane])
+
+    def test_a_ride_with_nothing_to_write_up_retires_its_pane(self):
+        """No findings means no request and no deadline, so nothing was ever
+        holding this pane open. It used to live until the next ride anyway."""
+        watch, thread = self.ended_ride(findings=False)
+        pane = thread.spawns[0][0]
+        self.assertEqual(watch.report_deadlines, [])
+        watch.clock_ms += ride_watch.THREAD_REAP_GRACE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(thread.kills, [pane])
+
+    def test_a_live_ride_keeps_its_console(self):
+        """The reap must never take the console of a ride still in progress."""
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        watch.clock_ms += ride_watch.THREAD_REAP_GRACE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(thread.kills, [])
+
+    def test_a_spared_pane_is_swept_a_second_time(self):
+        """The hole 6.13 names. ride-1029 was spared at ride-1048's spawn
+        because its wrap-up was outstanding, and nothing ever looked at it
+        again — `spared` had no follow-up of any kind."""
+        watch, thread = self.ended_ride()
+        pane = thread.spawns[0][0]
+        fake = FakeTmux([pane, "ride-9999"])
+        watch._tmux = fake
+        # The next ride starts and spares it, as it should.
+        watch._kill_previous_threads(keep="ride-9999")
+        self.assertEqual(fake.killed(), [])
+        # ...and then the wrap-up lands, and the second sweep closes it.
+        self.land_report(watch)
+        watch.check_timers()
+        watch.clock_ms += ride_watch.THREAD_REAP_GRACE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(thread.kills, [pane])
+
+    def test_the_daemon_never_pages_about_a_report_it_prevented(self):
+        """2.6. On 8/31 15:52 the daemon asked ride-1535 for the wrap-up and
+        killed it 17 s later; _check_report_deadlines then paged the rider
+        about the missing report — one of two ride interrupts, spent on the
+        daemon's own bug, while he was on the next bus."""
+        watch, thread = self.ended_ride()
+        pane = thread.spawns[0][0]
+        watch._retire_thread(pane, "simulating the 8/31 15:52 kill")
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual([p for p in watch.push_log if p["kind"] == "fallback"],
+                         [])
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_a_thread_that_simply_never_writes_is_still_paged_about(self):
+        """The suppression above must not swallow the 8/28 case it was built
+        for: a healthy pane that sat at a permission prompt for three hours."""
+        watch, thread = self.ended_ride()
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(
+            len([p for p in watch.push_log if p["kind"] == "fallback"]), 1)
+
+    def test_an_orphaned_wrap_up_is_handed_to_the_thread_that_is_alive(self):
+        """2.6's preferred fix (a): same session, same rider, and the new
+        thread is running anyway."""
+        watch, thread = self.ended_ride()
+        pane = thread.spawns[0][0]
+        watch._retire_thread(pane, "pane gone")
+        # The next ride starts, on the same session id, as on 8/31.
+        b2 = StreamBuilder(t=watch.clock_ms + 120000)
+        b2.t = watch.clock_ms + 120000
+        b2.start().advance(1000).progress(stops=6, prog=5.0)
+        for ev in b2.events:
+            watch.process(ev)
+        watch.check_timers()
+        entry = watch.report_deadlines[0]
+        self.assertTrue(entry.get("reassigned"))
+        self.assertEqual(entry["tmux"], thread.spawns[1][0])
+        self.assertTrue(any("you also owe the previous ride's wrap-up"
+                            in line for line in thread.lines()),
+                        thread.lines())
+
+    def test_a_pending_reap_survives_a_restart(self):
+        """"Restart the daemon on commit" happens mid-evening; a console two
+        minutes from closing must not be left for the next ride to kill."""
+        watch, thread = self.ended_ride(findings=False)
+        pane = thread.spawns[0][0]
+        self.assertEqual([r["tmux"] for r in watch.thread_reaps], [pane])
+        with open(os.path.join(self.tmp, "state.json")) as f:
+            self.assertIn(pane, json.dumps(json.load(f)["threadReaps"]))
+        after = quiet_watch(self.tmp)
+        self.assertEqual([r["tmux"] for r in after.thread_reaps], [pane])
+
+
+class TestTwoRidesInOneMinute(RuleTestCase):
+    """4.17, and the row had the mechanism wrong.
+
+    The claim was that the 18:52 session never got a report-request written.
+    It did — `daemon.log` 19:07:48, "report request written:
+    report-request-mthw7svy-s4msqc-1852.json", by the ordinary timeout path,
+    and again at 20:51:56 for the second id. What went missing was the
+    *wrap-up*, and the reason is the pane name.
+
+    The name is the clock minute. Two adoptions 41 s apart both resolved to
+    `ride-1852`; the second `tmux new-session` failed ("duplicate session:
+    ride-1852", 18:53:01) and set `_thread_status["ride-1852"] = False`, which
+    is keyed by pane and therefore condemned the FIRST ride's live, ready pane
+    too. `_thread_missing` was then true for both trips, so each trip end sent
+    the "report pending" fallback page instead of asking the console — sitting
+    there, ready since 18:52:21 — to write anything.
+    """
+
+    def two_rides_one_minute(self):
+        thread = TmuxLikeStubThread()
+        watch = quiet_watch(self.tmp, spawn_thread=thread.spawn,
+                            push_line=thread.push, kill_thread=thread.kill)
+        thread.watch = watch
+        a = StreamBuilder(session="sess-a", device="phone-1")
+        a.start().advance(1000).progress(stops=6, prog=20.0)
+        # Something for each ride to write up, so a report request is written
+        # and the wrap-up is asked for rather than skipped.
+        a.advance(1000).progress(stops=1, prog=21.0)
+        for ev in a.events:
+            watch.process(ev)
+        b = StreamBuilder(session="sess-b", device="phone-1")
+        b.t = a.t + 41000            # the 8/31 gap, to the second
+        b.start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        for ev in b.events:
+            watch.process(ev)
+        return watch, thread
+
+    def test_the_second_ride_gets_a_pane_of_its_own(self):
+        watch, thread = self.two_rides_one_minute()
+        names = [name for name, _ in thread.spawns]
+        self.assertEqual(len(names), 2)
+        self.assertEqual(len(set(names)), 2, names)
+        self.assertTrue(names[1].startswith(names[0]), names)
+
+    def test_the_second_spawn_does_not_condemn_the_first_rides_console(self):
+        watch, thread = self.two_rides_one_minute()
+        first = watch.trips["sess-a"]
+        self.assertFalse(watch._thread_missing(first))
+
+    def test_a_silent_stream_asks_the_console_for_a_wrap_up(self):
+        """Both 8/31 rides ended by timeout and both fell back to a page. With
+        one pane per ride the timeout end reaches the console instead."""
+        watch, thread = self.two_rides_one_minute()
+        watch.clock_ms += ride_watch.SESSION_TIMEOUT_MS + 60000
+        watch.check_timers()
+        self.assertEqual(sorted(t.end_reason for t in watch.ended_trips),
+                         ["timeout", "timeout"])
+        self.assertEqual([p for p in watch.push_log if p["kind"] == "fallback"],
+                         [])
+        asked = [p["name"] for p in thread.pushes if "wrap-up now" in p["line"]]
+        self.assertEqual(sorted(asked),
+                         sorted(name for name, _ in thread.spawns))
+
+
+class TestVehicleMatchNever(RuleTestCase):
+    """4.8. The app behaved correctly and that is precisely why nothing said
+    anything: it never claimed a match it did not have."""
+
+    def ride(self, polls, confidence="none", vehicle=None):
+        b = StreamBuilder().start().advance(1000)
+        b.progress(leg=1, prog=10.0, stops=6)
+        for _ in range(polls):
+            b.advance(1000).vehicle_match(
+                vehicle=vehicle, confidence=confidence, distance=None,
+                consecutive=0)
+        b.advance(1000).stop()
+        return self.run_stream(b, finalize=False)
+
+    def test_an_empty_transit_leg_is_reported(self):
+        watch = self.ride(ride_watch.VEHICLE_MATCH_NEVER_MIN_POLLS + 5)
+        found = self.find(watch, "vehicle-match-never")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertEqual(found[0]["context"]["legIndex"], 1)
+
+    def test_a_leg_that_matched_is_not_reported(self):
+        watch = self.ride(ride_watch.VEHICLE_MATCH_NEVER_MIN_POLLS + 5,
+                          confidence="confirmed", vehicle="1:900")
+        self.assertEqual(self.find(watch, "vehicle-match-never"), [])
+
+    def test_a_handful_of_polls_is_not_a_verdict(self):
+        watch = self.ride(ride_watch.VEHICLE_MATCH_NEVER_MIN_POLLS - 1)
+        self.assertEqual(self.find(watch, "vehicle-match-never"), [])
+
+    def test_it_never_pages(self):
+        watch = self.ride(ride_watch.VEHICLE_MATCH_NEVER_MIN_POLLS + 5)
+        self.assertEqual([p for p in watch.push_log if p["kind"] == "page"], [])
+
+
+# --- recorded slices ---------------------------------------------------------
+# The rides these rules were written from, replayed out of the raw telemetry
+# rather than restated as a fixture. Skipped when the log is not on the box.
+
+REAL_LOG_0901 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-01.jsonl")
+REAL_LOG_0831 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-08-31.jsonl")
+
+
+def log_slice(path, start_ms, end_ms, types):
+    """Records of the given types inside a window, in file order."""
+    out = []
+    for line in open(path):
+        if '"type":' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get("type") not in types:
+            continue
+        t = obj.get("t") or 0
+        if start_ms <= t <= end_ms:
+            out.append(obj)
+    return out
+
+
+class TestVehicleMatchNeverOnTheRecordedRide(unittest.TestCase):
+    """2026-09-01 ride 2, 10:29:35-10:48:47, session mtin0l9c-yieexg.
+
+    699 UPDATE_VEHICLE_MATCH records across the Orange Line leg, every one of
+    them `confidence: "none"`, `vehicleId: null`, `distanceMeters: null`. Ride
+    3 on the same session an hour later is the control: it matched, and must
+    stay quiet.
+    """
+
+    RIDE2 = (1788276570000, 1788277740000)
+    RIDE3 = (1788277730000, 1788279320000)
+    TYPES = {"START_GO_MODE", "STOP_GO_MODE", "UPDATE_PROGRESS",
+             "UPDATE_VEHICLE_MATCH", "TRANSITION_LEG", "SET_RIDING",
+             "SET_ARRIVED"}
+
+    def replay_window(self, window):
+        tmp = tempfile.mkdtemp(prefix="ride-watch-slice-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        for obj in log_slice(REAL_LOG_0901, window[0], window[1], self.TYPES):
+            watch.process(obj)
+        watch.finalize_replay()
+        return watch
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0901),
+                         "%s not present" % REAL_LOG_0901)
+    def test_ride_2_reports_the_empty_orange_line_leg(self):
+        watch = self.replay_window(self.RIDE2)
+        found = [f for f in watch.all_findings
+                 if f["rule"] == "vehicle-match-never"]
+        self.assertEqual(len(found), 1, [f["rule"] for f in watch.all_findings])
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["legIndex"], 1)
+        self.assertGreater(ctx["polls"], 600)
+        self.assertIn("Orange Line", found[0]["summary"])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0901),
+                         "%s not present" % REAL_LOG_0901)
+    def test_ride_3_matched_a_bus_and_says_nothing(self):
+        watch = self.replay_window(self.RIDE3)
+        self.assertEqual([f for f in watch.all_findings
+                          if f["rule"] == "vehicle-match-never"], [])
+
+
+class TestResumedTrip(RuleTestCase):
+    """4.18. A ride that begins without a START_GO_MODE has no fixture, and
+    build-fixture.js rejects the session outright."""
+
+    def test_an_app_remount_after_the_last_ride_is_a_warning(self):
+        thread = StubThread()
+        watch = quiet_watch(self.tmp, spawn_thread=thread.spawn,
+                            push_line=thread.push, kill_thread=thread.kill)
+        first = StreamBuilder(session="sess-1", device="phone-1")
+        first.start().advance(1000).progress(stops=6, prog=20.0)
+        first.advance(1000).stop()
+        for ev in first.events:
+            watch.process(ev)
+        # A new id on the same phone, far enough out that it is not a
+        # continuation of anything still running.
+        again = StreamBuilder(session="sess-2", device="phone-1")
+        again.t = first.t + ride_watch.CONTINUATION_GAP_MS + 60000
+        again.progress(leg=1, prog=42.0, stops=3)
+        for ev in again.events:
+            watch.process(ev)
+        found = [f for f in watch.all_findings if f["rule"] == "resumed-trip"]
+        self.assertEqual(len(found), 1, [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertEqual(found[0]["context"]["cause"], "app-remount")
+        self.assertEqual(found[0]["context"]["priorSessions"], ["sess-1"])
+        self.assertFalse(found[0]["context"]["replayable"])
+
+    def test_a_daemon_that_started_mid_ride_is_only_a_note(self):
+        b = StreamBuilder(device="phone-1").progress(leg=1, prog=42.0, stops=3)
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "resumed-trip")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["severity"], "info")
+        self.assertEqual(found[0]["context"]["cause"],
+                         "daemon-started-mid-ride")
+
+    def test_a_remount_onto_a_live_ride_is_still_one_ride(self):
+        """Not this rule's job: _continuation_of already merges those, which
+        is what keeps the page budget and the findings ledger single."""
+        b = StreamBuilder(device="phone-1").start().advance(1000)
+        b.progress(leg=1, prog=20.0, stops=6)
+        b.advance(41000)
+        b.session = "sess-remount"
+        b.progress(leg=1, prog=20.5, stops=6)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "resumed-trip"), [])
+        self.assertEqual(len(self.find(watch, "session-churn")), 1)
+        self.assertIs(watch.trips["sess-remount"], watch.trips[SESSION])
+
+
+class TestResumedTripOnTheRecordedSession(unittest.TestCase):
+    """2026-08-31 18:52, and the recorded answer is "there was no ride".
+
+    The daemon had restarted at 18:50:07 and adopted `mthw7svy-s4msqc` off a
+    post-arrival tick at 18:52:20; the app re-mounted 41 s later and minted
+    `mthw8o2w-i8z1i6`. Two threads, 37 findings and two reports came out of a
+    rider standing still.
+
+    Replaying the window against current source: all 356 UPDATE_PROGRESS
+    records in it carry `status: "completed"`, so `_maybe_adopt` declines both
+    ids and opens nothing. That is the shipped fix (9a26a10) and this pins it
+    — a resumed-trip finding here would mean the decline had regressed.
+    """
+
+    WINDOW = (1788220300000, 1788220800000)   # 18:51:40 - 19:00:00 local
+    TYPES = {"START_GO_MODE", "STOP_GO_MODE", "UPDATE_PROGRESS",
+             "TRANSITION_LEG", "SET_ARRIVED"}
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0831),
+                         "%s not present" % REAL_LOG_0831)
+    def test_the_completed_trip_is_declined_rather_than_resumed(self):
+        tmp = tempfile.mkdtemp(prefix="ride-watch-slice-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        records = log_slice(REAL_LOG_0831, self.WINDOW[0], self.WINDOW[1],
+                            self.TYPES)
+        self.assertGreater(len(records), 300, "the 8/31 18:52 window is empty")
+        self.assertEqual(
+            len(set(r.get("session") for r in records)), 2,
+            "the window should hold both ids of the re-mount")
+        for obj in records:
+            watch.process(obj)
+        self.assertEqual(watch._active_trips(), [])
+        self.assertEqual(watch.all_findings, [])
+
+
+class TestBikeEgressMissing(RuleTestCase):
+    """4.1, rider-caught on the bus: "search from here never shows bike egress
+    and ride to destination".
+
+    Every ROUTING_RESPONSE payload recorded between 2026-08-27 and 2026-09-01
+    is stubbed by the recorder's size cap (`{"__summary": true, "chars":
+    461450}`), so there is no recorded slice this rule can run against and it
+    stays inert until the payload-ladder deploy (backlog 2.1). The request
+    half IS recorded, and the fixtures below use its real shape: a
+    REMEMBER_SEARCH carrying `{"id", "query": {"mode": ...}}`.
+    """
+
+    SEARCH_ID = "tzk0ngv1z"
+
+    def search(self, b, mode):
+        return b.action("REMEMBER_SEARCH", {
+            "id": self.SEARCH_ID,
+            "query": {"mode": mode, "numItineraries": 40,
+                      "routingType": "ITINERARY"}})
+
+    def response(self, b, itineraries):
+        return b.action("ROUTING_RESPONSE", {
+            "index": 0, "searchId": self.SEARCH_ID,
+            "response": {"plan": {"itineraries": itineraries}}})
+
+    @staticmethod
+    def itinerary(*modes):
+        return {"legs": [{"mode": m, "transitLeg": m in ("BUS", "RAIL")}
+                         for m in modes]}
+
+    def ride(self, mode, itineraries):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        self.search(b.advance(1000), mode)
+        self.response(b.advance(1000), itineraries)
+        b.advance(1000).stop()
+        return self.run_stream(b, finalize=False)
+
+    def test_a_bike_search_with_no_bike_egress_is_reported(self):
+        watch = self.ride("BICYCLE,TRANSIT", [
+            self.itinerary("WALK", "BUS", "WALK"),
+            self.itinerary("BICYCLE", "BUS", "WALK"),
+        ])
+        found = self.find(watch, "bike-egress-missing")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertEqual(found[0]["context"]["transitItineraries"], 2)
+        self.assertEqual(found[0]["context"]["lastLegModes"], ["WALK"])
+
+    def test_one_bike_egress_is_enough(self):
+        watch = self.ride("BICYCLE,TRANSIT", [
+            self.itinerary("WALK", "BUS", "WALK"),
+            self.itinerary("BICYCLE", "BUS", "BICYCLE"),
+        ])
+        self.assertEqual(self.find(watch, "bike-egress-missing"), [])
+
+    def test_a_walk_search_is_none_of_this_rules_business(self):
+        watch = self.ride("WALK,TRANSIT", [
+            self.itinerary("WALK", "BUS", "WALK")])
+        self.assertEqual(self.find(watch, "bike-egress-missing"), [])
+
+    def test_an_all_walking_result_list_is_not_a_bike_defect(self):
+        """No transit came back at all: a different, honest answer."""
+        watch = self.ride("BICYCLE,TRANSIT", [self.itinerary("WALK")])
+        self.assertEqual(self.find(watch, "bike-egress-missing"), [])
+
+    def test_a_stubbed_response_says_nothing_either_way(self):
+        """The state of every recorded response today. Silence, not a guess."""
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        self.search(b.advance(1000), "BICYCLE,TRANSIT")
+        b.advance(1000).action("ROUTING_RESPONSE", {
+            "__summary": True, "chars": 461450,
+            "keys": ["index", "response", "searchId"]})
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "bike-egress-missing"), [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0901),
+                         "%s not present" % REAL_LOG_0901)
+    def test_the_recorded_responses_are_all_stubbed(self):
+        """Pins the reason this rule cannot fire on any ride recorded so far,
+        so a later session does not mistake silence for a passing rule."""
+        records = log_slice(REAL_LOG_0901, 0, 2 ** 62, {"ROUTING_RESPONSE"})
+        self.assertTrue(records)
+        self.assertTrue(all((r.get("payload") or {}).get("__summary")
+                            for r in records))
+
+
+class TestKnownInertConsoleErrors(RuleTestCase):
+    """6.9. Three sightings, confirmed inert, and one findings slot every ride
+    — six findings is a whole ride's budget for the wrap-up to triage."""
+
+    CAPGO = "\U0001f534 \u2728  CapgoUpdater : Error no url or wrong format"
+
+    def test_the_capgo_error_is_not_a_finding(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).console("error", [self.CAPGO])
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "console-error"), [])
+
+    def test_every_other_console_error_still_lands(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).console("error", ["Attempt to route from null to null"])
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "console-error")), 1)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0901),
+                         "%s not present" % REAL_LOG_0901)
+    def test_the_recorded_line_is_the_one_being_suppressed(self):
+        """Matched against the record as it actually appears in the stream —
+        2026-09-01 10:30:25 and 10:54:17 — not against a retyped string."""
+        lines = []
+        for line in open(REAL_LOG_0901):
+            if "CapgoUpdater" not in line:
+                continue
+            obj = json.loads(line)
+            args = obj.get("args") or []
+            if obj.get("kind") == "console" and args:
+                lines.append(str(args[0]))
+        self.assertTrue(lines, "no CapgoUpdater console record on 9/1")
+        for msg in lines:
+            self.assertTrue(
+                any(ig in msg for ig in ride_watch.CONSOLE_ERROR_IGNORE), msg)
 
 
 if __name__ == "__main__":

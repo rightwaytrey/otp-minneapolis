@@ -94,11 +94,22 @@ Quote the note verbatim. Do not paraphrase the rider.
    explicit rider choice), and `RIDER_NOTE` (`kind: "rider-note"`) — the
    rider's own notes, interleaved in the same stream at the second they
    were typed.
-3. Build the replay fixture so the ride can be re-run against the code:
+3. Build the replay fixture so the ride can be re-run against the code, and
+   **pass the ride's window explicitly** — `startMs` and `endMs` come from the
+   request file, as bare epoch milliseconds:
    ```
    cd /home/rwt/projects/otprr/otp-react-redux
-   node lib/util/go-mode/replay/build-fixture.js --session <session> --label ride-<date>
+   node lib/util/go-mode/replay/build-fixture.js --session <session> \
+     --since <startMs - 60000> --until <endMs> --label ride-<date>
    ```
+   With no window the script takes the **whole session**, and one session id
+   covers every trip the phone took that day. On 2026-09-01 the un-windowed
+   command produced a 15.5 MB fixture of rides 1 and 2 and left out the ride
+   being reported, which began three seconds after the window it chose ended;
+   the banner said `window: (none) .. (none)`, which reads as "everything is
+   here". The minute of lead-in on `--since` is for the onboard flow, which
+   runs before `START_GO_MODE`.
+   Check the window in the banner against the request before quoting the path.
    Report the fixture path it prints. If it fails, say so and continue — the
    report matters more than the fixture.
 4. For findings you call **real-bug**, locate the responsible code in

@@ -277,6 +277,44 @@ DEST_REPLAN_COLLAPSE_MS = 10 * 1000
 # push never had a reason to fire. A wrap-up that has not been written this
 # long after the ride ended is not "still thinking".
 REPORT_DEADLINE_MS = 10 * 60 * 1000
+# ...and then the pane goes away. A ride thread is that ride's console and
+# nothing else, but _kill_previous_threads only ever ran from the SPAWN path,
+# so a finished ride's pane lived until the next ride started — and a pane
+# spared because its wrap-up was outstanding was never revisited at all. On
+# 2026-09-01 ride-1029's trip ended 10:48:47, its wrap-up landed 10:51:22, and
+# `tmux ls` still showed it at 11:15 next to ride-1048. The rider caught it
+# mid-ride: "Ok makes sure all ride consoles wrap up upon complete."
+#
+# Two minutes rather than zero. The thread has just been told the ride is over
+# and is writing its last lines into a console the rider may still be reading;
+# retiring the pane in the same tick as "wrap-up landed" would cut that off.
+THREAD_REAP_GRACE_MS = 2 * 60 * 1000
+
+# console.error lines that are known-inert and cost a findings slot every ride.
+# Substring match against the first console argument, deliberately narrow.
+#
+# CapgoUpdater: the live-update plugin has no update URL in the native build.
+# Third sighting on 2026-09-01 10:54:17, mid-bus-leg, and confirmed inert —
+# nothing in the position, progress, route-match or vehicle-match streams
+# changed across it. The plugin config is an iOS-repo fix (backlog 6.9); until
+# then it is one of six findings the wrap-up has to triage every single ride.
+# This suppresses the FINDING, not the record: the line stays in the raw
+# telemetry, so a report can always go and look.
+CONSOLE_ERROR_IGNORE = (
+    "CapgoUpdater : Error no url or wrong format",
+)
+
+# vehicle-match-never. On 2026-09-01 ride 2 the app polled the vehicle matcher
+# 775 times across the Orange Line leg and every one came back
+# `confidence: "none"`, `vehicleId: null`, `distanceMeters: null`. The app
+# behaved correctly — it never claimed a match it did not have — so no rule had
+# anything to say, and the ride reached the report as though live-vehicle
+# tracking had worked. A transit leg ridden with no live vehicle behind it is a
+# fact the report should carry, because every downstream judgement about
+# boarding, delay and arrival on that leg was made without it.
+# Thirty polls is ~30 s of a 1 Hz stream: long enough that a leg the rider
+# passed straight through, or a matcher that had not warmed up, stays quiet.
+VEHICLE_MATCH_NEVER_MIN_POLLS = 30
 
 MAX_PAGES_PER_TRIP = 2
 PUSH_MIN_INTERVAL_MS = 120 * 1000
@@ -683,6 +721,15 @@ class Trip:
         self.dest_unreachable_ms = None            # the app said it itself
         self.dest_stall_fired = False
         self.last_rider_action_ms = 0
+        # legIndex -> {"polls", "matched", "firstMs", "lastMs", "bestConfidence"}
+        # for legs the itinerary calls transit. Read once, at trip end, by
+        # _rule_vehicle_match_never: "did the live matcher ever succeed on this
+        # leg?" is a question only the whole leg can answer.
+        self.vehicle_match_legs = {}
+        # searchId -> {"mode", "tMs"} for searches the rider ran mid-ride, so a
+        # ROUTING_RESPONSE can be judged against what was actually asked for.
+        self.searches = collections.OrderedDict()
+        self.bike_egress_fired = set()            # searchIds already reported
         self.console_seen = set()
         self.notes = []                           # rider-typed notes, in order
         # -- the ride thread ---------------------------------------------
@@ -726,7 +773,8 @@ class Trip:
 class RideWatch:
     def __init__(self, dry_run=DRY_RUN, replay=False, watch_dir=WATCH_DIR,
                  log=None, spawn_thread=None, push_line=None,
-                 thread_enabled=None, report_dir=REPORT_DIR):
+                 thread_enabled=None, report_dir=REPORT_DIR,
+                 kill_thread=None):
         self.dry_run = dry_run
         self.replay = replay
         self.watch_dir = watch_dir
@@ -751,6 +799,20 @@ class RideWatch:
         # from state.json below so a restart in the ten minutes after a ride
         # does not lose the deadline. See _check_report_deadlines.
         self.report_deadlines = []
+        # Panes whose ride is over and whose wrap-up is settled, waiting out
+        # THREAD_REAP_GRACE_MS before they are retired. The other half of the
+        # lifecycle report_deadlines opens: a deadline says "this pane still
+        # owes work", a reap says "this pane owes nothing and should stop
+        # existing". Persisted, so a restart inside the grace window still
+        # closes the console rather than leaving it for the next ride to kill.
+        self.thread_reaps = []        # [{"tmux", "atMs", "why"}]
+        # Panes this daemon killed, name -> ms. Read by _check_report_deadlines
+        # so it can never page the rider about a wrap-up it prevented itself.
+        self._panes_killed = {}
+        # device -> [session ids seen on it]. A brand-new session id on a phone
+        # we already know is an app re-mount, which is what tells a resumed
+        # trip from a daemon that simply started mid-ride.
+        self.device_sessions = {}
         # Intake dedup ring (see RECORD_DEDUP_RING).
         self._seen_records = collections.deque()
         self._seen_record_keys = {}
@@ -768,6 +830,7 @@ class RideWatch:
         # without the ~10s of real waiting each spawn costs.
         self.spawn_thread = spawn_thread
         self.push_line = push_line
+        self.kill_thread = kill_thread
         self.thread_enabled = (THREAD_ENABLED if thread_enabled is None
                                else thread_enabled)
         self._thread_lock = threading.RLock()
@@ -800,6 +863,14 @@ class RideWatch:
             return None
         self.report_deadlines = [d for d in (data.get("reportDeadlines") or [])
                                  if isinstance(d, dict) and d.get("reportPath")]
+        # Same reason as the deadlines: "restart the daemon on commit" happens
+        # mid-evening, and a console whose reap was two minutes out when the
+        # process died must still close rather than wait for the next ride.
+        self.thread_reaps = [r for r in (data.get("threadReaps") or [])
+                             if isinstance(r, dict) and r.get("tmux")]
+        self._panes_killed = dict(
+            (k, v) for k, v in (data.get("panesKilled") or {}).items()
+            if isinstance(k, str) and isinstance(v, (int, float)))
         # A ride closed at arrival whose app is STILL streaming outlives this
         # process — that is the shape of the whole 8/31 fault — and
         # restart-on-commit happens to this daemon mid-evening. Without this,
@@ -813,6 +884,12 @@ class RideWatch:
             with open(self._state_path(), "w") as f:
                 json.dump({"lastTrip": self.last_trip_summary,
                            "reportDeadlines": self.report_deadlines,
+                           "threadReaps": self.thread_reaps,
+                           # Bounded the same way: the newest 32 panes, far
+                           # more evenings than a deadline can outlive.
+                           "panesKilled": dict(sorted(
+                               self._panes_killed.items(),
+                               key=lambda kv: kv[1])[-32:]),
                            # Bounded: one session id per app load, so the tail
                            # is every ride of the last few days.
                            "endedArrived": sorted(self.ended_arrived)[-32:]}, f)
@@ -977,6 +1054,10 @@ class RideWatch:
                 self._on_notification(trip, t, obj.get("payload") or {})
             elif typ == "START_REROUTE":
                 self._on_start_reroute(trip, t, obj.get("payload") or {})
+            elif typ in ("REMEMBER_SEARCH", "ROUTING_REQUEST"):
+                self._note_search(trip, t, typ, obj.get("payload"))
+            elif typ == "ROUTING_RESPONSE":
+                self._rule_bike_egress_missing(trip, t, obj.get("payload"))
             elif typ == "SET_ACTIVE_ITINERARY":
                 # Rider picked an itinerary from the list — explicit action.
                 trip.last_rider_action_ms = t
@@ -1002,6 +1083,7 @@ class RideWatch:
             self.ended_arrived.discard(session)
             self._declined_completed.discard(session)
             trip.device = obj.get("device")
+            self._note_device_session(trip.device, session)
             self.trips[session] = trip
             self.log.info("trip started: session=%s itinerary=%s" % (
                 session, itinerary_one_liner(summary)))
@@ -1087,8 +1169,66 @@ class RideWatch:
         # just restarted under a rider who is still on the bus — so it
         # gets a thread too, marked as adopted in the digest.
         self._begin_ride_thread(trip, t)
+        # After the thread exists, so the console hears it: a finding filed
+        # before the spawn goes into the ledger and nowhere else.
+        self._rule_resumed_trip(trip, t, obj)
         self._on_progress(trip, t, p)
         self._mark_dirty()
+
+    def _note_device_session(self, device, session):
+        """Remember which session ids a phone has been seen under."""
+        if not device or not session:
+            return
+        seen = self.device_sessions.setdefault(device, [])
+        if session not in seen:
+            seen.append(session)
+            del seen[:-16]
+
+    def _rule_resumed_trip(self, trip, t, obj):
+        """A ride that begins without a START_GO_MODE cannot be replayed.
+
+        Two ways in. The app re-mounts onto a trip it is already running and
+        the debug-log client mints a fresh session id — Go Mode resumed from
+        persisted state emits no START_GO_MODE at all, which is exactly why
+        build-fixture.js rejects such sessions. Or this daemon was restarted
+        under a rider who is still on the bus, which is nobody's bug.
+
+        The two are told apart by the phone: a NEW session id on a device this
+        process has already seen is the app re-mounting. That is the one worth
+        a `warn` — it is an app defect, it splits the telemetry across two
+        ledgers, and the ride it produces has no fixture. A first sighting of
+        the device is the daemon's own restart and lands at `info`.
+
+        A re-mount that lands on a ride still in flight never reaches here:
+        _continuation_of catches it, the two ids become one ride, and
+        _adopt_continuation files `session-churn` instead. This rule is for
+        the one that arrives too late for that — after the prior ride ended,
+        or onto a trip the daemon had declined.
+        """
+        device = obj.get("device")
+        prior = [s for s in self.device_sessions.get(device, [])
+                 if s != trip.session] if device else []
+        self._note_device_session(device, trip.session)
+        remount = bool(prior)
+        p = obj.get("payload") or {}
+        if remount:
+            summary = ("ride resumed with no START_GO_MODE: session %s is new"
+                       " on a phone last seen as %s, so this ride has no"
+                       " fixture and cannot be replayed"
+                       % (trip.session, prior[-1]))
+        else:
+            summary = ("ride adopted mid-stream with no START_GO_MODE (leg %s"
+                       " at %s); it has no fixture and cannot be replayed"
+                       % (p.get("currentLegIndex"),
+                          fmt_pct(p.get("currentLegProgress"))))
+        self._finding(
+            trip, t, "resumed-trip", "warn" if remount else "info", summary,
+            {"session": trip.session, "device": device,
+             "priorSessions": prior,
+             "cause": "app-remount" if remount else "daemon-started-mid-ride",
+             "legIndex": p.get("currentLegIndex"),
+             "legProgressPct": p.get("currentLegProgress"),
+             "replayable": False})
 
     def _continuation_of(self, session, t, obj, p):
         """The live ride this brand-new session id is plainly a resumption of.
@@ -1156,6 +1296,7 @@ class RideWatch:
         gap_ms = t - trip.last_event_ms
         trip.sessions.append(session)
         self.trips[session] = trip
+        self._note_device_session(trip.device, session)
         self.log.info(
             "session %s continues %s (same device, leg %s at %s, %ds later)"
             % (session, trip.session, p.get("currentLegIndex"),
@@ -1329,6 +1470,11 @@ class RideWatch:
                           % (session, summary))
 
     def _end_trip(self, trip, t, reason):
+        # Whole-leg verdicts, before anything counts the findings: a rule whose
+        # question is "did this ever happen across the leg?" can only be
+        # answered once the ride is over, and the report request quotes
+        # len(trip.findings).
+        self._rule_vehicle_match_never(trip, t)
         # Flush first: a page must not be lost because the trip ended three
         # seconds into its coalescing window.
         self._flush_pages(trip, t, force=True)
@@ -1381,6 +1527,15 @@ class RideWatch:
             # A thread that spawned fine and took the wrap-up line is not the
             # same thing as a wrap-up. Arm a deadline. (8/28)
             self._arm_report_deadline(trip, t, n)
+        # The other half of the lifecycle. A pane that owes a wrap-up is now
+        # held by its deadline and reaped when that settles; a pane that owes
+        # nothing — no findings, so no request, or a spawn that failed — has
+        # no reason to outlive the ride at all. Before this, neither branch
+        # reaped anything and the pane waited for the NEXT ride's spawn.
+        if not self._deadline_for_pane((trip.thread or {}).get("tmux")):
+            self._schedule_thread_reap((trip.thread or {}).get("tmux"),
+                                       max(int(t), self.now_ms()),
+                                       "trip ended (%s), no wrap-up owed" % reason)
         self._mark_dirty()
         self.write_status(force=True)
 
@@ -1425,7 +1580,12 @@ class RideWatch:
             "session": trip.session,
             "reportPath": path,
             "dueMs": due,
+            # When the promise was made. _check_report_deadlines compares it
+            # against _panes_killed so it can tell "the thread had ten minutes
+            # and wrote nothing" from "this daemon killed the pane".
+            "armedMs": self.now_ms(),
             "findings": findings_n,
+            "requestPath": self._report_request_path(trip),
             # Which pane was asked. _kill_previous_threads reads this: the
             # next ride's thread must not kill the one still writing.
             "tmux": (trip.thread or {}).get("tmux"),
@@ -1455,18 +1615,96 @@ class RideWatch:
                 self.log.info("wrap-up landed for %s: %s"
                               % (entry.get("session"), path))
                 changed = True
+                # The pane has done the one thing it was being kept alive for.
+                self._schedule_thread_reap(entry.get("tmux"), now,
+                                           "wrap-up landed")
                 continue
             if now < entry.get("dueMs", 0):
+                # Still inside the window — but if the pane that was asked has
+                # gone, waiting the rest of it out changes nothing. Hand the
+                # request to the thread that IS alive instead (2.6's preferred
+                # fix: same session, same rider, and it is running anyway).
+                if self._maybe_reassign_wrap_up(entry, now):
+                    changed = True
                 keep.append(entry)
                 continue
             changed = True
+            # Never page about a report this daemon prevented. The pane is
+            # dead by our own hand and the thread never had the ten minutes
+            # the deadline claims to have given it, so "report pending, open
+            # Claude" is a page about our own bug — and it costs one of two
+            # ride interrupts, usually while the rider is on the next bus.
+            killed = self._panes_killed.get(entry.get("tmux"))
+            if killed is not None and killed >= entry.get("armedMs", 0):
+                self.log.error(
+                    "no wrap-up for %s (%s) and none was possible: this daemon"
+                    " killed its pane %s at %s. Not paging the rider about a"
+                    " report it prevented."
+                    % (entry.get("session"), path, entry.get("tmux"),
+                       fmt_hms(killed)))
+                continue
             self.log.warn(
                 "no wrap-up for %s %d min after the ride ended (%s); paging"
                 % (entry.get("session"), REPORT_DEADLINE_MS // 60000, path))
             self._report_fallback_push(entry.get("findings") or 0)
+            self._schedule_thread_reap(entry.get("tmux"), now,
+                                       "wrap-up deadline expired")
         if changed:
             self.report_deadlines = keep
             self._save_state()
+
+    def _deadline_for_pane(self, name):
+        if not name:
+            return None
+        for entry in self.report_deadlines:
+            if entry.get("tmux") == name:
+                return entry
+        return None
+
+    def _maybe_reassign_wrap_up(self, entry, now):
+        """Give an orphaned wrap-up to a thread that is actually alive.
+
+        The pane that was asked can be gone before its deadline for reasons
+        that have nothing to do with the thread: a spawn that collided on the
+        name, a rider who typed /exit, a kill this daemon made itself. Waiting
+        out the remaining minutes and then paging is the worst of both — no
+        report, and an interrupt.
+
+        Once per entry, and only onto a pane belonging to a live trip: the ride
+        thread holds the ride in its conversation, so the one that is running
+        now is the only other party that can write anything at all.
+        """
+        pane = entry.get("tmux")
+        if not pane or entry.get("reassigned"):
+            return False
+        # Cheap liveness only — no tmux subprocess on the tailer's 5 s tick.
+        # A pane we killed, or one whose spawn reported failure, is gone; a
+        # pane we know nothing about is assumed fine. The kill has to be
+        # NEWER than the promise: _panes_killed survives restarts and pane
+        # names are clock minutes, so yesterday's ride-1029 must not condemn
+        # today's.
+        killed = self._panes_killed.get(pane)
+        gone = ((killed is not None and killed >= entry.get("armedMs", 0))
+                or self._thread_status.get(pane) is False)
+        if not gone:
+            return False
+        target = None
+        for trip in self._active_trips():
+            name = (trip.thread or {}).get("tmux")
+            if name and name != pane and self._thread_ok(trip):
+                target = trip
+        if target is None:
+            return False
+        entry["reassigned"] = True
+        entry["tmux"] = (target.thread or {}).get("tmux")
+        entry["dueMs"] = now + REPORT_DEADLINE_MS
+        line = ("you also owe the previous ride's wrap-up: write %s from %s"
+                % (entry.get("reportPath"), entry.get("requestPath")))
+        self.log.warn("wrap-up for %s reassigned from %s to %s (%s)"
+                      % (entry.get("session"), pane, entry["tmux"], line))
+        self._thread_event(target, now, line)
+        self._thread_push(target, line)
+        return True
 
     def check_timers(self):
         """Silence-based rules + trip timeout. Called per event and on ticks.
@@ -1515,6 +1753,9 @@ class RideWatch:
         # phone that has gone home and stopped talking still gets its deadline
         # checked.
         self._check_report_deadlines(now)
+        # ...and the same is true of a console whose ride is over: the reap it
+        # is waiting out is not attached to any live trip either.
+        self._reap_due_threads(now)
 
     # -- rules --------------------------------------------------------------
 
@@ -1797,8 +2038,59 @@ class RideWatch:
             "tripId": (match or {}).get("tripId"),
             "distanceMeters": (match or {}).get("distanceMeters"),
         }
+        self._tally_vehicle_match(trip, t, match)
         self._rule_match_distance_absurd(trip, t, match)
         self._rule_match_trip_disagrees(trip, t, match)
+
+    def _tally_vehicle_match(self, trip, t, match):
+        """Per-transit-leg record of whether the matcher ever found anything.
+
+        Kept per leg rather than per ride because a ride with a transfer can
+        match one bus and not the other, and "the Orange Line matched" is not
+        an answer about the 539.
+        """
+        if not trip.current_leg_transit():
+            return
+        leg = (trip.progress or {}).get("currentLegIndex")
+        if not isinstance(leg, int):
+            return
+        tally = trip.vehicle_match_legs.get(leg)
+        if tally is None:
+            tally = {"polls": 0, "matched": False, "firstMs": t, "lastMs": t,
+                     "route": self._leg_label(trip, leg)}
+            trip.vehicle_match_legs[leg] = tally
+        tally["polls"] += 1
+        tally["lastMs"] = t
+        confidence = (match or {}).get("confidence")
+        # "matched" means the matcher named a vehicle. `confidence: "none"`
+        # with `vehicleId: null` is the matcher correctly reporting that it
+        # has nothing — 775 times in a row on 2026-09-01 ride 2.
+        if (match or {}).get("vehicleId") or (
+                confidence and confidence != "none"):
+            tally["matched"] = True
+
+    def _rule_vehicle_match_never(self, trip, t):
+        """A transit leg ridden with no live vehicle behind it, ever.
+
+        Not a page: the app did nothing wrong, and there is nothing the rider
+        can do about the feed while sitting on the bus. It is for the report —
+        every judgement made about boarding, delay and arrival on that leg was
+        made without live vehicle data, and a report that does not say so
+        reads as though the tracking worked.
+        """
+        for leg in sorted(trip.vehicle_match_legs):
+            tally = trip.vehicle_match_legs[leg]
+            if tally["matched"] or tally["polls"] < VEHICLE_MATCH_NEVER_MIN_POLLS:
+                continue
+            span_s = max(0, (tally["lastMs"] - tally["firstMs"]) // 1000)
+            self._finding(
+                trip, t, "vehicle-match-never", "warn",
+                "no live vehicle ever matched on leg %d (%s): %d polls over"
+                " %ds, all empty"
+                % (leg, tally.get("route") or "transit", tally["polls"], span_s),
+                {"legIndex": leg, "polls": tally["polls"],
+                 "spanSeconds": span_s, "firstPollMs": tally["firstMs"],
+                 "lastPollMs": tally["lastMs"]})
 
     def _rule_match_distance_absurd(self, trip, t, match):
         """The rider is not 10,000 km from the bus they are sitting on.
@@ -2135,6 +2427,135 @@ class RideWatch:
                       "after %d tries. Finish from here your own way."
                       % (far, trip.dest_replans_since_gain))
 
+    # -- the list view ------------------------------------------------------
+
+    @staticmethod
+    def _search_modes(query):
+        """The mode set a search asked for, upper-cased.
+
+        `mode` is the legacy comma string the app still persists
+        ("WALK,TRANSIT"); `modes` is the newer array of {mode, qualifier}.
+        Read both, because which one a build sends is not this daemon's
+        business to know.
+        """
+        modes = set()
+        if not isinstance(query, dict):
+            return modes
+        raw = query.get("mode")
+        if isinstance(raw, str):
+            modes.update(m.strip().upper() for m in raw.split(",") if m.strip())
+        for m in (query.get("modes") or []):
+            if isinstance(m, dict) and m.get("mode"):
+                modes.add(str(m["mode"]).upper())
+            elif isinstance(m, str):
+                modes.add(m.upper())
+        return modes
+
+    def _note_search(self, trip, t, typ, payload):
+        """Remember what a mid-ride search asked for, keyed by its search id.
+
+        The response arrives as a separate record carrying only `searchId`, so
+        without this the daemon can see a list of itineraries and have no idea
+        what was requested — and "no bike egress" is only a defect if bike was
+        asked for.
+        """
+        if not isinstance(payload, dict) or payload.get("__summary"):
+            return
+        sid = payload.get("id") or payload.get("searchId")
+        query = payload.get("query") if isinstance(
+            payload.get("query"), dict) else payload
+        modes = self._search_modes(query)
+        if not sid or not modes:
+            return
+        trip.searches[sid] = {"modes": sorted(modes), "tMs": t}
+        # Bounded: a rider re-planning hard produces a few dozen per ride.
+        while len(trip.searches) > 64:
+            trip.searches.popitem(last=False)
+
+    @staticmethod
+    def _response_itineraries(payload):
+        """Itineraries out of a ROUTING_RESPONSE, whichever shape it is in.
+
+        Returns None — "could not look" — rather than [] when the payload was
+        stubbed by the recorder's size cap, which is a different fact from
+        "the search returned nothing".
+        """
+        if not isinstance(payload, dict) or payload.get("__summary"):
+            return None
+        node = payload.get("response", payload)
+        for path in (("plan", "itineraries"),
+                     ("data", "plan", "itineraries"),
+                     ("itineraries",)):
+            cur = node
+            for key in path:
+                cur = cur.get(key) if isinstance(cur, dict) else None
+                if cur is None:
+                    break
+            if isinstance(cur, list):
+                return cur
+        return None
+
+    def _rule_bike_egress_missing(self, trip, t, payload):
+        """A bike+transit search whose results all end on foot.
+
+        Rider-caught on the bus on 2026-08-31: "search from here never shows
+        bike egress and ride to destination". Bike egress is the last leg of
+        the itinerary — the rider gets off the bus and rides the bike they are
+        carrying — so its absence from every result of a search that asked for
+        BICYCLE is the exact shape of the complaint.
+
+        Only fires on a search that asked for both BICYCLE and TRANSIT, and
+        only when at least one returned itinerary actually uses transit: an
+        all-walking fallback list is a different (and honest) answer.
+
+        Note for whoever reads this next: as of 2026-09-01 every recorded
+        ROUTING_RESPONSE payload is stubbed by the recorder's size cap
+        (`{"__summary": true, "chars": 461450}`), so this rule cannot fire on
+        any telemetry recorded to date. It goes live with the payload-ladder
+        deploy (backlog 2.1), not with this commit.
+        """
+        itineraries = self._response_itineraries(payload)
+        sid = payload.get("searchId") if isinstance(payload, dict) else None
+        search = trip.searches.get(sid) if sid else None
+        if search is None and len(trip.searches) == 1:
+            # One search in flight: the response is unambiguously its.
+            sid, search = next(iter(trip.searches.items()))
+        if not search:
+            return
+        modes = set(search.get("modes") or [])
+        if "BICYCLE" not in modes or not (modes & TRANSIT_MODES):
+            return
+        if itineraries is None:
+            self.log.info(
+                "bike+transit search %s: response payload was summarized away,"
+                " cannot check for bike egress (backlog 2.1)" % sid)
+            return
+        if sid in trip.bike_egress_fired:
+            return
+        transit_itins = [it for it in itineraries
+                         if isinstance(it, dict)
+                         and any(leg_is_transit(l) for l in (it.get("legs") or []))]
+        if not transit_itins:
+            return
+        with_bike_egress = 0
+        for it in transit_itins:
+            legs = [l for l in (it.get("legs") or []) if isinstance(l, dict)]
+            if legs and (legs[-1].get("mode") or "").upper() == "BICYCLE":
+                with_bike_egress += 1
+        if with_bike_egress:
+            return
+        trip.bike_egress_fired.add(sid)
+        self._finding(
+            trip, t, "bike-egress-missing", "warn",
+            "bike+transit search returned %d transit option(s) and not one of"
+            " them ends on the bike" % len(transit_itins),
+            {"searchId": sid, "modes": sorted(modes),
+             "itineraries": len(itineraries),
+             "transitItineraries": len(transit_itins),
+             "lastLegModes": sorted(set(
+                 ((it.get("legs") or [{}])[-1].get("mode") or "?")
+                 for it in transit_itins))})
+
     def _on_destination_unreachable(self, trip, t, p):
         """The app worked out for itself that it cannot get there.
 
@@ -2168,6 +2589,12 @@ class RideWatch:
         if msg in trip.console_seen:
             return
         trip.console_seen.add(msg)
+        if any(ignore in msg for ignore in CONSOLE_ERROR_IGNORE):
+            # Known-inert and re-confirmed each ride; see CONSOLE_ERROR_IGNORE.
+            # Logged, not filed: the daemon log still shows it happened.
+            self.log.info("console.error suppressed (known inert): %s"
+                          % msg[:120])
+            return
         self._finding(trip, t, "console-error", "info",
                       "console.error: %s" % msg[:120], {"message": msg})
 
@@ -2509,13 +2936,46 @@ class RideWatch:
     # rule engine and its pages do not depend on any of it.
 
     def _thread_name(self, trip):
-        return "%s-%s" % (THREAD_NAME_PREFIX, datetime.datetime.fromtimestamp(
-            trip.start_ms / 1000).strftime("%H%M"))
+        """`ride-1852`, unless that name is already somebody's.
 
-    def _thread_display(self, trip):
+        The name is the clock minute, and on 2026-08-31 two rides landed in
+        the same one: the app re-mounted at 18:52:55, 41 s after 18:52:14, and
+        both trips resolved to `ride-1852`. The second `tmux new-session`
+        failed with "duplicate session: ride-1852" and set
+        `_thread_status["ride-1852"] = False` — which is keyed by PANE, not by
+        trip, so it condemned the FIRST ride's live, ready pane as well. From
+        then on `_thread_missing` was true for both trips, so when each ended
+        the daemon sent the "report pending" fallback page instead of asking
+        the pane — which was still sitting there — to write the wrap-up. Two
+        pages, no wrap-up, one healthy console.
+
+        A suffix rather than a longer name: `ride-1852b` still reads as "the
+        18:52 ride" in the rider's app list, which is the whole point of the
+        name.
+        """
+        base = "%s-%s" % (THREAD_NAME_PREFIX, datetime.datetime.fromtimestamp(
+            trip.start_ms / 1000).strftime("%H%M"))
+        taken = self._live_thread_names() | self._panes_awaiting_wrap_up()
+        taken.update(r.get("tmux") for r in self.thread_reaps)
+        if base not in taken:
+            return base
+        for suffix in "bcdefghijklmnopqrstuvwxyz":
+            if base + suffix not in taken:
+                return base + suffix
+        return base
+
+    def _thread_display(self, trip, name=None):
         """What the rider sees in their Claude app list."""
-        return "%s %s" % (THREAD_NAME_PREFIX, datetime.datetime.fromtimestamp(
-            trip.start_ms / 1000).strftime("%m-%d %H:%M"))
+        stamp = datetime.datetime.fromtimestamp(
+            trip.start_ms / 1000).strftime("%m-%d %H:%M")
+        # Carry the disambiguating suffix through, so the pane the daemon
+        # types into and the conversation the rider opens are the same ride.
+        suffix = ""
+        if name and "-" in name:
+            tail = name.rsplit("-", 1)[-1]
+            if len(tail) > 4:
+                suffix = tail[4:]
+        return "%s %s%s" % (THREAD_NAME_PREFIX, stamp, suffix)
 
     def _begin_ride_thread(self, trip, t):
         """Spawn the ride's thread and send the kickoff line."""
@@ -2525,7 +2985,8 @@ class RideWatch:
         if not self.thread_enabled:
             self.log.info("ride thread disabled (RIDE_THREAD_ENABLED=0)")
             return
-        name, display = self._thread_name(trip), self._thread_display(trip)
+        name = self._thread_name(trip)
+        display = self._thread_display(trip, name)
         spawn = self.spawn_thread
         if spawn is None:
             if self.replay:
@@ -2798,6 +3259,13 @@ class RideWatch:
         self._thread_enqueue(("push", name, line))
         return True
 
+    def _tmux_kill(self, name):
+        """Queue the retirement. Same reason as the spawn: the tailer must not
+        wait on tmux, and a kill must not overtake the last push into the pane
+        it is killing."""
+        self._thread_enqueue(("kill", name, None))
+        return True
+
     def _thread_enqueue(self, job):
         with self._thread_lock:
             self._thread_jobs.append(job)
@@ -2821,6 +3289,8 @@ class RideWatch:
                 try:
                     if job[0] == "spawn":
                         self._tmux_spawn_blocking(job[1], job[2])
+                    elif job[0] == "kill":
+                        self._tmux_kill_blocking(job[1])
                     else:
                         self._tmux_push_blocking(job[1], job[2])
                 except Exception as exc:
@@ -2874,6 +3344,16 @@ class RideWatch:
                            % (name, one_line(res.stdout)))
             self._thread_status[name] = False
 
+    def _tmux_kill_blocking(self, name):
+        res = self._tmux(["kill-session", "-t", name])
+        if res.returncode != 0:
+            # Already gone (the rider typed /exit, or tmux is not running) is
+            # the ordinary case and not an error: the pane is closed either
+            # way, which is all this was for.
+            self.log.info("ride thread %s was already gone (%s)"
+                          % (name, one_line(res.stdout)))
+        self._thread_status[name] = False
+
     def _panes_awaiting_wrap_up(self):
         """tmux panes that were asked for a wrap-up and have not delivered.
 
@@ -2883,6 +3363,84 @@ class RideWatch:
         """
         return set(e.get("tmux") for e in self.report_deadlines
                    if e.get("tmux"))
+
+    def _live_thread_names(self):
+        """Panes belonging to a trip that is still running."""
+        return set(name for name in
+                   ((tr.thread or {}).get("tmux") for tr in self._active_trips())
+                   if name)
+
+    def _schedule_thread_reap(self, name, now, why):
+        """This pane's ride is over and it owes nothing. Retire it shortly.
+
+        Shortly, not now: THREAD_REAP_GRACE_MS. And never a pane that some
+        live trip is still using as its console — two rides can land on the
+        same clock-minute name, and reaping the wrong one would take the
+        rider's live console away mid-ride.
+        """
+        if not name:
+            return
+        if name in self._live_thread_names():
+            return
+        if any(r.get("tmux") == name for r in self.thread_reaps):
+            return
+        due = int(now) + THREAD_REAP_GRACE_MS
+        self.thread_reaps.append({"tmux": name, "atMs": due, "why": why})
+        self.log.info("ride thread %s retires at %s (%s)"
+                      % (name, fmt_hms(due), why))
+        self._save_state()
+
+    def _reap_due_threads(self, now):
+        """Close the consoles whose grace period has run out.
+
+        The second sweep the spare in _kill_previous_threads never had. A pane
+        spared there is spared because a deadline is holding it; when that
+        deadline settles — report landed, or window expired —
+        _check_report_deadlines schedules it here, and this is what actually
+        ends it. Nothing else in this file ever revisited a spared pane, which
+        is how ride-1029 was still running 26 minutes after its trip ended.
+        """
+        if not self.thread_reaps:
+            return
+        keep, changed = [], False
+        live = self._live_thread_names()
+        owed = self._panes_awaiting_wrap_up()
+        for reap in self.thread_reaps:
+            name = reap.get("tmux")
+            if now < reap.get("atMs", 0):
+                keep.append(reap)
+                continue
+            changed = True
+            if name in live:
+                # A new ride took this name back. It is somebody's console
+                # again and this reap is stale.
+                self.log.info("ride thread %s not retired: a live ride is"
+                              " using it" % name)
+                continue
+            if name in owed:
+                # Re-armed since: a reassigned wrap-up landed on it.
+                self.log.info("ride thread %s not retired: a wrap-up is"
+                              " outstanding on it" % name)
+                continue
+            self._retire_thread(name, reap.get("why") or "ride complete")
+        if changed:
+            self.thread_reaps = keep
+            self._save_state()
+
+    def _retire_thread(self, name, why):
+        """Kill one ride pane and remember that we did."""
+        self._panes_killed[name] = self.now_ms()
+        killer = self.kill_thread
+        if killer is None:
+            if self.replay:
+                return
+            killer = self._tmux_kill
+        try:
+            killer(name)
+        except Exception as exc:
+            self.log.error("ride thread %s kill failed: %r" % (name, exc))
+            return
+        self.log.info("ride thread %s wrapped up: %s" % (name, why))
 
     def _kill_previous_threads(self, keep=None):
         """The new ride's thread is the rider's thread; retire the old ones.
@@ -2908,9 +3466,18 @@ class RideWatch:
                 continue
             if self._tmux(["kill-session", "-t", name]).returncode == 0:
                 killed.append(name)
+                # Remembered for two reasons: _check_report_deadlines must
+                # never page about a report we made impossible, and a pane
+                # killed here needs no reap of its own.
+                self._panes_killed[name] = self.now_ms()
         if killed:
             self.log.info("previous ride thread(s) killed: %s"
                           % ", ".join(killed))
+            before = len(self.thread_reaps)
+            self.thread_reaps = [r for r in self.thread_reaps
+                                 if r.get("tmux") not in killed]
+            if len(self.thread_reaps) != before:
+                self._save_state()
         if spared:
             self.log.info("ride thread(s) spared, wrap-up outstanding: %s"
                           % ", ".join(spared))

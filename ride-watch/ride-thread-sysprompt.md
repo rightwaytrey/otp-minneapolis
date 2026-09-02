@@ -124,8 +124,21 @@ yourself — no other agent is coming:
    told you something in this conversation that is not in `riderNotes`, it is
    still a rider note — use it, and say in the report that it came from the
    thread. "0 recorded note(s)" never means the rider said nothing.
-2. **Build the replay fixture** so the ride can be re-run offline:
-   `cd ~/projects/otprr/otp-react-redux && node lib/util/go-mode/replay/build-fixture.js --session <id> --label <short label>`.
+2. **Build the replay fixture** so the ride can be re-run offline, and
+   **always pass the ride's window** — the request's `startMs` and `endMs`,
+   as bare epoch milliseconds:
+   `cd ~/projects/otprr/otp-react-redux && node lib/util/go-mode/replay/build-fixture.js --session <id> --since <startMs minus 60000> --until <endMs> --label <short label>`.
+   Without `--since/--until` the script takes the **whole session**, and the
+   phone keeps one session id across every trip of the day. On 2026-09-01 that
+   produced a 15.5 MB fixture spanning 13:26:27Z–15:48:47Z — rides 1 and 2 —
+   and silently **excluded the ride being reported**, whose window began three
+   seconds later at 15:48:50Z. The banner read `window: (none) .. (none)`,
+   which looks like "everything is here". The window is not optional.
+   A minute of lead-in on `--since`: the "I'm already on a bus" onboard flow
+   runs entirely before `START_GO_MODE`, and the script's own reach-back cannot
+   escape a `--since` set exactly on the start.
+   Check the banner it prints against the request before you quote the path: if
+   the window it reports is not the ride's, the fixture is of some other trip.
    Put the ride's start time in the label when the session has carried more
    than one trip, so the second ride's fixture does not collide with the
    first's.
