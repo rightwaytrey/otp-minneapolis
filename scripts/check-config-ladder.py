@@ -52,8 +52,55 @@ SKIP = 75
 
 OTPMIN = Path(__file__).resolve().parent.parent
 SIBLINGS = OTPMIN.parent
-OTPRR = Path(os.environ.get("OTPRR_DIR", SIBLINGS / "otprr" / "otp-react-redux"))
-TRANSITNAV = Path(os.environ.get("TRANSITNAV_DIR", SIBLINGS / "transitnav"))
+HOME_PROJECTS = Path.home() / "projects"
+
+# Every marker path _locate() looked at and did not find, so a SKIP can say
+# where it searched instead of naming one guess and leaving the reader to work
+# out whether it was the only one.
+TRIED = []
+
+
+def _locate(env_var, marker, *candidates):
+    """Find a sibling repo by a file only that repo has.
+
+    "Sibling of my own root" is right from the real checkout and wrong from a
+    git worktree: run out of ~/projects/otp-minneapolis-wt/<task>/scripts it
+    looked for ~/projects/otp-minneapolis-wt/otprr/otp-react-redux, missed, and
+    exited 75 -- a check that graded nothing while looking like it had run. It
+    fails safe and cron always runs the real path, but it is the agent verifying
+    the nightly from a worktree who most needs the answer. (backlog 2.26)
+
+    Order is deliberate: the env override wins outright (that is what it is
+    for), then the sibling, so a deliberately relocated set of repos still
+    resolves together, then the conventional ~/projects layout. Candidates are
+    tested by the MARKER FILE and not by the directory, because an empty
+    leftover directory winning the race is the same silent no-op in a new hat.
+    """
+    override = os.environ.get(env_var)
+    if override:
+        return Path(override).expanduser()
+    missed = []
+    for cand in candidates:
+        if (cand / marker).is_file():
+            return cand
+        missed.append(str(cand / marker))
+    # Only a repo that missed EVERY candidate goes on the record. Reporting the
+    # sibling miss for a repo the fallback then found would put a red herring in
+    # the SKIP of an unrelated repo, which is how the previous message misled.
+    TRIED.extend(missed)
+    return candidates[0]
+
+
+OTPRR = _locate(
+    "OTPRR_DIR", Path("lib") / "util" / "debug-log.js",
+    SIBLINGS / "otprr" / "otp-react-redux",
+    HOME_PROJECTS / "otprr" / "otp-react-redux",
+)
+TRANSITNAV = _locate(
+    "TRANSITNAV_DIR", Path("preferences_api.py"),
+    SIBLINGS / "transitnav",
+    HOME_PROJECTS / "transitnav",
+)
 
 DEBUG_LOG_JS = OTPRR / "lib" / "util" / "debug-log.js"
 PREFS_API = TRANSITNAV / "preferences_api.py"
@@ -75,6 +122,8 @@ PREFS_UNIT = "prefs-api"
 
 def die_skip(msg):
     print(f"SKIP: {msg}", file=sys.stderr)
+    for path in TRIED:
+        print(f"SKIP:   also looked at {path}", file=sys.stderr)
     print(
         "SKIP: the payload ladder was NOT verified. Resolve the repo paths (or set "
         "OTPRR_DIR / TRANSITNAV_DIR) and re-run.",

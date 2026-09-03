@@ -229,11 +229,46 @@ fi
 
 if want otp; then
 echo "${GREEN}=== 5/7  Build and start OTP ===${NC}"
+# --force-recreate, and then an assertion that it actually took.
+#
+# 2026-09-02 17:25 CDT, `--only jar,otp,graph`: the new shaded JAR and
+# router-config.json both landed, `docker build -t docker-otp` produced a new
+# image, and `docker compose up -d` printed nothing and left otp-minneapolis at
+# `Up 10 hours` on the PREVIOUS image. The deploy reported success; OTP was
+# serving the old JAR from a container created ten hours earlier, so the new
+# itinerary-filter key was on disk and ignored. Nothing in any log said so.
+# (backlog 2.27)
+#
+# Why plain `up -d` is not enough here: compose only recreates a container it
+# considers changed, and on this box it did not consider a same-tag rebuild a
+# change. It is NOT reproducible on the desktop -- measured 2026-09-02, Docker
+# 28.3 / overlay2 / Compose 2.29 does recreate on a same-tag rebuild. The Linode
+# is Docker 29.7 with the containerd image store and Compose v5.5, where the
+# container's `com.docker.compose.image` label and its `.Image` are two
+# different digests of the same image; which of them a given compose version
+# compares is not something this script should have to know. So force it:
+# this service is one JVM reading a bind-mounted graph, the recreate costs about
+# 40 s of downtime, and it only happens when the `otp` step was asked for.
+#
+# The assertion is the part that must never be dropped. A deploy that ships a
+# JAR the running process is not executing is worse than a deploy that fails,
+# because the next session reads "deployed" and debugs the wrong thing.
 ssh "${SSH_OPTS[@]}" "$RUSER" bash -s <<REMOTE
 set -euo pipefail
 cd '$RREPO'
 docker build -q -f docker/Dockerfile.runtime -t docker-otp . >/dev/null
-docker compose -f deployment/docker-compose.server.yml up -d
+BUILT="\$(docker image inspect docker-otp --format '{{.Id}}')"
+docker compose -f deployment/docker-compose.server.yml up -d --force-recreate otp
+RUNNING="\$(docker inspect --format '{{.Image}}' otp-minneapolis)"
+echo "  image built  : \${BUILT#sha256:}"
+echo "  image running: \${RUNNING#sha256:}"
+if [ "\$BUILT" != "\$RUNNING" ]; then
+  echo "ERROR: otp-minneapolis is NOT running the image this deploy just built." >&2
+  echo "       The JAR and router-config.json on the box are not what OTP loaded." >&2
+  echo "       Recreate it by hand and find out why compose declined:" >&2
+  echo "         docker compose -f deployment/docker-compose.server.yml up -d --force-recreate otp" >&2
+  exit 1
+fi
 REMOTE
 fi
 
@@ -351,6 +386,23 @@ curl -s --max-time 20 -H 'content-type: application/json' \
   http://127.0.0.1:8090/otp/gtfs/v1 >/dev/null 2>&1 && echo "graph queryable" || echo "QUERY FAILED"
 echo -n "  updaters   : "
 docker logs otp-minneapolis 2>&1 | grep -ciE "GtfsRealtime|stop-time-updater|vehicle-positions" || echo 0
+# Say, on EVERY run, whether the container is the image the docker-otp tag now
+# names -- not just on the runs that rebuilt it. `--only prefs` on a box whose
+# OTP is a rebuild behind is exactly the state backlog 2.27 hid for hours, and
+# it is invisible in "Up 10 hours (healthy)": a stale container is healthy.
+# This prints and does not exit non-zero. The `otp` step is where a mismatch
+# fails the deploy; making the health ssh exit 1 would kill the script under
+# `set -e` before the manifest is recorded, which is backlog 2.19 again.
+echo -n "  otp image  : "
+IMG_TAG="$(docker image inspect docker-otp --format '{{.Id}}' 2>/dev/null || echo none)"
+IMG_RUN="$(docker inspect --format '{{.Image}}' otp-minneapolis 2>/dev/null || echo none)"
+if [ "$IMG_TAG" = "$IMG_RUN" ]; then
+  echo "${IMG_RUN#sha256:} (container matches the docker-otp tag)"
+else
+  echo "MISMATCH  tag=${IMG_TAG#sha256:}  container=${IMG_RUN#sha256:}"
+  echo "               the running container was not created from the current"
+  echo "               image -- re-run deploy-app.sh <host> --only otp"
+fi
 echo -n "  prefs-api  : "; curl -s --max-time 10 http://127.0.0.1:8092/api/health || echo unreachable
 echo
 free -h | sed 's/^/  /'
@@ -399,6 +451,14 @@ RECORD_ARGV=(
   --file "$RREPO/data/router-config.json"
   --file "$RREPO/data/otp-config.json"
   --file "$RREPO/data/graph.obj"
+  # The shaded JAR. It was the one artefact the manifest did not record, and it
+  # is half of what decides how OTP routes -- backlog 2.27 is precisely the case
+  # where the JAR on the box was right and every recorded file agreed, while the
+  # process serving traffic was running a different one. Too large to digest, so
+  # this is size+mtime; rsync -a preserves the desktop's mtime, which is what
+  # identifies the build. The name comes from the local $JAR because the remote
+  # path is the same file under the same name.
+  --file "$RREPO/OpentripPlanner/otp-shaded/target/$(basename "$JAR")"
 )
 printf -v RECORD_CMD '%q ' "${RECORD_ARGV[@]}"
 ssh "${SSH_OPTS[@]}" "$RUSER" "$RECORD_CMD"

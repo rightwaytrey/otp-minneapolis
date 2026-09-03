@@ -121,6 +121,12 @@ STATIC_CHECKS=(
   # only true while a default holds is the failure this block warns about.
   "config-ladder-deployed-prod|python3 $(dirname "$0")/check-config-ladder.py --deployed --ssh rwt@100.126.171.72"
   "config-ladder-deployed-house|python3 $(dirname "$0")/check-config-ladder.py --deployed --ssh local"
+  # The three entries above are only as good as check-config-ladder.py's ability
+  # to FIND the three repos, and when it cannot it exits 75 -- a SKIP that sits
+  # in this report looking like a deliberate abstention rather than a check that
+  # graded nothing. This grades the resolution itself, on throwaway trees, with
+  # no ssh and no real repo. (backlog 2.26)
+  "config-ladder-paths|bash $(dirname "$0")/test-config-ladder-paths.sh"
   "nginx-render-parity|python3 $(dirname "$0")/../deployment/render-nginx.py --check"
   # The desktop's transitnav/.env is the source for the Linode's, and two of its
   # keys now say which box you are (backlog 2.22). deploy-app.sh strips them;
