@@ -459,6 +459,15 @@ RECORD_ARGV=(
   # identifies the build. The name comes from the local $JAR because the remote
   # path is the same file under the same name.
   --file "$RREPO/OpentripPlanner/otp-shaded/target/$(basename "$JAR")"
+  # The two image ids, recorded beside the files. Every recorded FILE agreed with
+  # the manifest on 2026-09-02 while the process serving traffic ran a different
+  # image, because compose had declined to recreate the container (backlog 2.27);
+  # files can never show that, and these two ids can. `verify` prints them and
+  # does not grade them -- the container is recreated by ordinary operations, and
+  # scripts/check-otp-image.py is the thing that asks whether the ids still
+  # agree, nightly, on both boxes (backlog 2.28).
+  --docker-image docker-otp
+  --docker-container otp-minneapolis
 )
 printf -v RECORD_CMD '%q ' "${RECORD_ARGV[@]}"
 ssh "${SSH_OPTS[@]}" "$RUSER" "$RECORD_CMD"

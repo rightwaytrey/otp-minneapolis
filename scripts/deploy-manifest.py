@@ -136,6 +136,51 @@ def repo_provenance(repos):
     return out
 
 
+def _short(digest):
+    """Digest for a human. `none` stays `none` -- slicing it produced an empty
+    column that read as "recorded, and empty"."""
+    if not digest:
+        return "none"
+    return digest[7:23] if digest.startswith("sha256:") else digest[:16]
+
+
+def docker_state(image, container):
+    """Which image the tag names, and which image the container is running.
+
+    Run on the TARGET, where docker is. These are the two ids backlog 2.27 was
+    about: the deploy built a new `docker-otp`, compose declined to recreate the
+    container, and every recorded FILE on the box agreed with the manifest while
+    the process serving traffic ran a different image. Files alone cannot show
+    that, so record both ids and both timestamps beside them.
+
+    RECORDED, NOT ASSERTED. `verify` prints this block and never fails on it: a
+    container is legitimately recreated by things that are not deploys (a reboot,
+    a hand recreate), and the drift `verify` hunts is a FILE edited on the box.
+    The check that grades these ids is scripts/check-otp-image.py, nightly, on
+    both boxes. Missing docker, or a tag or container that does not exist, is
+    recorded as null rather than raised — a manifest that refuses to be written
+    is a manifest nobody has (backlog 2.19).
+    """
+    def d(*argv):
+        try:
+            return subprocess.check_output(
+                ["docker", *argv], text=True, stderr=subprocess.DEVNULL).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return None
+
+    out = {
+        "image_tag": image,
+        "container": container,
+        "image_id": d("image", "inspect", image, "--format", "{{.Id}}"),
+        "image_created": d("image", "inspect", image, "--format", "{{.Created}}"),
+        "container_image": d("inspect", "--format", "{{.Image}}", container),
+        "container_created": d("inspect", "--format", "{{.Created}}", container),
+        "container_started": d("inspect", "--format", "{{.State.StartedAt}}", container),
+    }
+    out["match"] = bool(out["image_id"]) and out["image_id"] == out["container_image"]
+    return out
+
+
 # --------------------------------------------------------------------------
 
 
@@ -157,10 +202,17 @@ def cmd_record(args):
         "provenance": provenance,
         "files": files,
     }
+    if args.docker_image and args.docker_container:
+        manifest["docker"] = docker_state(args.docker_image, args.docker_container)
     out = Path(args.out or DEFAULT_PATH)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(f"manifest written: {out}")
+    dk = manifest.get("docker")
+    if dk:
+        print(f"  docker: {dk['image_tag']} {_short(dk['image_id'])} / "
+              f"{dk['container']} {_short(dk['container_image'])} "
+              + ("(match)" if dk["match"] else "(MISMATCH — see check-otp-image.py)"))
     if missing:
         # Not fatal: a partial deploy (--only nginx) legitimately leaves other
         # paths untouched, and a manifest that refuses to record the truth is
@@ -282,6 +334,15 @@ def cmd_verify(args):
         flag = " +DIRTY" if p.get("dirty") else ""
         print(f"  {name:<16}: {sha}{flag}")
     print(f"  files       : {len(files)} recorded, {len(drift)} drifted")
+    # Printed, never graded. The container legitimately gets recreated between
+    # deploys; check-otp-image.py is what compares these ids against the box.
+    dk = manifest.get("docker")
+    if dk:
+        print(f"  otp image   : {dk.get('image_tag')} "
+              f"{_short(dk.get('image_id'))}, container "
+              f"{_short(dk.get('container_image'))} at record time "
+              + ("(match)" if dk.get("match") else "(MISMATCH at record time)")
+              + " — not re-checked here; run check-otp-image.py")
 
     if drift:
         print("\nFAIL: the box no longer matches its own deploy manifest.", file=sys.stderr)
@@ -307,6 +368,15 @@ def main():
     r.add_argument("--provenance", default="", help="JSON from --emit-provenance")
     r.add_argument("--out", default="")
     r.add_argument("--file", action="append", default=[], help="path to record (repeatable)")
+    # Both must be given, or neither: half of this pair records a question
+    # instead of an answer.
+    r.add_argument("--docker-image", default="",
+                   help="image tag whose id to record, e.g. docker-otp (needs "
+                        "--docker-container; read-only, and `verify` never "
+                        "grades it)")
+    r.add_argument("--docker-container", default="",
+                   help="container whose running image id to record, e.g. "
+                        "otp-minneapolis")
     r.set_defaults(func=cmd_record)
 
     p = sub.add_parser("provenance", help="emit repo shas as JSON (run on the DEPLOYING host)")

@@ -140,6 +140,23 @@ STATIC_CHECKS=(
   # arriving alone puts the Southdale search back to a lone walk card, and
   # nothing else in this suite would notice.
   "transit-not-hidden-prod|python3 $(dirname "$0")/check-transit-not-hidden.py --target prod"
+  # Asks each box, directly, whether the container serving traffic is the image
+  # its `docker-otp` tag names. `docker ps` cannot answer that: it prints
+  # "Up 10 hours (healthy)" for a container running a JAR from weeks ago exactly
+  # as it does for one created a minute ago, and cron-gtfs-refresh.sh's scheduled
+  # `docker restart` (scripts/cron-gtfs-refresh.sh:165,169) keeps that "Up"
+  # looking recent while changing nothing. deploy-app.sh asserts the match, but
+  # only on the runs that deploy; between deploys nothing did, which is how
+  # backlog 2.27 stood green for hours. Read-only: docker inspect, no rebuild.
+  # (backlog 2.28)
+  "otp-image-prod|python3 $(dirname "$0")/check-otp-image.py --target prod"
+  "otp-image-house|python3 $(dirname "$0")/check-otp-image.py --target house"
+  # ...and the two entries above can only ever demonstrate the passing case,
+  # since making a live box disagree means breaking production. This drives the
+  # same check through a stubbed docker: match, a restart without a rebuild, the
+  # two digest-spelling passes, a real mismatch, no container, and an unreachable
+  # daemon. No docker, no ssh, no network.
+  "otp-image-check-harness|bash $(dirname "$0")/test-otp-image-check.sh"
 )
 for entry in "${STATIC_CHECKS[@]}"; do
   name="${entry%%|*}"
