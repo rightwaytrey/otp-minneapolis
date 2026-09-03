@@ -70,6 +70,25 @@ INCIDENT_END_MS = 1785364400000
 
 T0 = 1785360000000  # arbitrary base for synthetic streams
 SESSION = "test-session"
+# The rider's phone, as the sink writes it (envelope `deviceId` -> `device`).
+DEVICE = "dev-mt7rztrf-z96e5zno"
+
+# The 2026-09-02 white screen, in the shape the client would now report it.
+# Taken from otprr lib/util/debug-log-boot.js: a window `error` becomes
+# `{kind: "boot-error", message, stack, source, line, col, bundle,
+# sinceBootMs, storage}` and rides the ordinary beacon envelope, so the sink
+# writes it alongside `session` / `device` / `href` / `ua` and an entry `id`.
+BOOT_MESSAGE = "undefined is not an object (evaluating 'e.routes.map')"
+BOOT_HREF = ("capacitor://localhost#/?ui_activeItinerary=0&routeLock=%7B%22"
+             "routes%22%3Anull%7D")
+BOOT_SOURCE = "capacitor://localhost/js/main.f3a9c1.js"
+BOOT_STACK = ("@capacitor://localhost/js/main.f3a9c1.js:2:117439\n"
+              "Ha@capacitor://localhost/js/main.f3a9c1.js:2:284012")
+BOOT_STORAGE = [{"k": "otpDeviceId", "n": 22},
+                {"k": "otpGoModeSession", "n": 48213},
+                {"k": "otpDebugLog", "n": 1}]
+BUNDLE = "2026.0902.3"
+NATIVE = "1.0.54"
 
 
 def transit_itinerary():
@@ -103,6 +122,60 @@ class StreamBuilder:
         self.device = device
         self.t = t
         self.events = []
+        # Entry ids are minted densely per session by the client
+        # (debug-log-entry.js) and are what intake's dedup ring keys on when
+        # they are present. Two records that are genuinely distinct — the
+        # buffered bundle_health and the beacon carrying the same verdict —
+        # carry different ids on purpose, so the builder mints them too.
+        self._entry_seq = 0
+
+    def _entry_id(self):
+        self._entry_seq += 1
+        return "%s-%d" % (self.session, self._entry_seq)
+
+    def _envelope(self, **fields):
+        """The keys the sink writes onto every record from a beacon batch."""
+        ev = {"t": self.t, "recv": self.t / 1000.0, "session": self.session,
+              "id": self._entry_id(), "href": BOOT_HREF,
+              "ua": ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X)"
+                     " AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148")}
+        if self.device:
+            ev["device"] = self.device
+        ev.update(fields)
+        self.events.append(ev)
+        return self
+
+    def boot_error(self, message=BOOT_MESSAGE, bundle=BUNDLE,
+                   kind="boot-error", since_ms=412, **kw):
+        """A crash beacon, exactly as debug-log-boot.js captureBootError sends
+        it: no `type` and no `event`, which is why _process could not see it.
+        """
+        rec = {"kind": kind, "message": message, "stack": BOOT_STACK,
+               "source": BOOT_SOURCE, "line": 2, "col": 117439,
+               "sinceBootMs": since_ms, "storage": BOOT_STORAGE}
+        if bundle is not None:
+            rec["bundle"] = bundle
+        rec.update(kw)
+        return self._envelope(**rec)
+
+    def boot_rejection(self, message="Load failed", **kw):
+        """An unhandledrejection: message and stack only, no source/line."""
+        rec = {"kind": "boot-rejection", "message": message,
+               "stack": BOOT_STACK, "sinceBootMs": 900, "storage": None,
+               "source": None, "line": None, "col": None}
+        rec.update(kw)
+        return self._envelope(**rec)
+
+    def bundle(self, version=BUNDLE, native=NATIVE):
+        """`recordSessionEvent('bundle', bundle)` — otprr lib/main.js."""
+        return self._envelope(kind="session", event="bundle",
+                              version=version, native=native)
+
+    def bundle_health(self, confirmed=True, reason=None):
+        """The 5s health gate's verdict (native-updates.ts)."""
+        return self._envelope(
+            kind="session", event="bundle_health", confirmed=confirmed,
+            reason=reason or ("confirmed" if confirmed else "not-rendered"))
 
     def at(self, offset_ms):
         self.t = T0 + offset_ms
@@ -3572,6 +3645,341 @@ class TestKnownInertConsoleErrors(RuleTestCase):
         for msg in msgs:
             self.assertTrue(
                 any(ig in msg for ig in ride_watch.CONSOLE_ERROR_IGNORE), msg)
+
+
+class BootTestCase(RuleTestCase):
+    """Boot crashes and bundle verdicts: the events that have no ride."""
+
+    def sent(self, watch):
+        return [p for p in watch.push_log if p.get("sent")]
+
+    def suppressed(self, watch, why):
+        return [p for p in watch.push_log if p.get("suppressed") == why]
+
+
+class TestBootCrash(BootTestCase):
+    """The 2026-09-02 white screen, as the daemon would now see it.
+
+    Before this rule the record fell through _process untouched: `typ` is
+    derived from `event` only for non-session records, and a crash beacon
+    carries neither `type` nor `event`, so the whole dispatch chain missed it.
+    """
+
+    def test_a_boot_error_is_a_finding_and_a_page(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "boot-crash")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "page")
+        self.assertEqual(hits[0]["device"], DEVICE)
+        self.assertTrue(hits[0]["paged"])
+        self.assertEqual(len(self.sent(watch)), 1)
+
+    def test_the_page_names_the_message_the_bundle_and_the_href(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        body = self.sent(watch)[0]["body"]
+        self.assertIn(BUNDLE, body)
+        self.assertIn("undefined is not an object", body)
+        # The hash, not the origin: capacitor://localhost is the same on
+        # every boot and routeLock is what killed 2026.0902.3.
+        self.assertIn("#/?ui_active", body)
+        self.assertNotIn("capacitor://", body)
+        # Same rider-copy rules as every other push here.
+        self.assertLess(len(body), 120, body)
+        self.assertNotIn("!", body)
+
+    def test_the_finding_keeps_the_whole_record_for_the_report(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        ctx = self.find(watch, "boot-crash")[0]["context"]
+        self.assertEqual(ctx["message"], BOOT_MESSAGE)
+        self.assertEqual(ctx["stack"], BOOT_STACK)
+        self.assertEqual(ctx["bundle"], BUNDLE)
+        self.assertEqual(ctx["bundleKnownFrom"], "event")
+        self.assertEqual(ctx["sinceBootMs"], 412)
+        self.assertEqual(ctx["href"], BOOT_HREF)
+        # Key names and sizes, which is all the client ever sends.
+        self.assertEqual(ctx["storage"], BOOT_STORAGE)
+        # The finding is read by the wrap-up agent, not off a lock screen, so
+        # it carries the whole message and the source line — only the page
+        # body is clipped to 44 characters.
+        summary = self.find(watch, "boot-crash")[0]["summary"]
+        self.assertIn(BOOT_MESSAGE, summary)
+        self.assertIn("main.f3a9c1.js:2", summary)
+        # Sub-second, in milliseconds: fmt_ms_span would round 412 to "0s".
+        self.assertIn("412ms into the boot", summary)
+
+    def test_an_unhandled_rejection_reports_the_same_way(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_rejection()
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "boot-crash")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["context"]["kind"], "boot-rejection")
+        self.assertEqual(len(self.sent(watch)), 1)
+
+    def test_one_page_per_phone_per_thirty_minutes(self):
+        """A phone that cannot start gets relaunched, and each relaunch is a
+        fresh boot with a fresh three beacons. One interrupt covers them."""
+        b = StreamBuilder(device=DEVICE)
+        for _ in range(4):
+            b.advance(5 * 60 * 1000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "boot-crash")), 4)
+        self.assertEqual(len(self.sent(watch)), 1)
+        self.assertEqual(len(self.suppressed(watch, "device-budget")), 3)
+
+    def test_a_crash_past_the_budget_pages_again(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        b.advance(ride_watch.BOOT_PAGE_INTERVAL_MS + 60000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.sent(watch)), 2)
+
+    def test_a_second_phone_has_its_own_budget(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        b.device = "dev-other-phone"
+        b.advance(ride_watch.PUSH_MIN_INTERVAL_MS + 5000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.sent(watch)), 2)
+
+    def test_a_boot_page_never_spends_the_rides_budget(self):
+        """The point of the separate budget: a crash on a re-mount mid-ride
+        must not cost the rider one of the two interrupts the ride has."""
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(ride_watch.PUSH_MIN_INTERVAL_MS + 5000).boot_error()
+        b.advance(ride_watch.PUSH_MIN_INTERVAL_MS + 5000).riding(
+            trip_id="1:200")                                   # riding-flip
+        b.advance(ride_watch.PUSH_MIN_INTERVAL_MS + 5000).riding(
+            trip_id="1:300")                                   # riding-flip
+        # A page is held for the coalescing window and sent by the next
+        # event's check_timers, so the last one needs a tick after it.
+        b.advance(ride_watch.PUSH_MIN_INTERVAL_MS + 5000).progress(stops=5)
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips[SESSION]
+        # Two ride pages, exactly the ride's cap, plus the boot page on top.
+        self.assertEqual(trip.pages_sent, ride_watch.MAX_PAGES_PER_TRIP)
+        self.assertEqual(len(self.sent(watch)), 3)
+        kinds = sorted(p["kind"] for p in self.sent(watch))
+        self.assertEqual(kinds, ["boot-crash", "page", "page"])
+
+    def test_a_crash_during_a_ride_reaches_that_rides_ledger(self):
+        thread = StubThread()
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress(stops=5)
+        b.advance(1000).boot_error()
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        trip = watch.trips[SESSION]
+        self.assertEqual([f["rule"] for f in trip.findings], ["boot-crash"])
+        ledger = read_text(watch._findings_path(trip))
+        self.assertIn("boot-crash", ledger)
+        # ...and the console hears about it like any other finding.
+        self.assertTrue(any("boot-crash" in line for line in thread.lines()))
+
+    def test_a_crash_with_no_ride_still_lands_in_a_ledger(self):
+        """There is no trip, so the record goes to the file a ride under this
+        session id WOULD have used — where the report will find it."""
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        path = watch._findings_path_for(ride_watch.fmt_date(T0 + 1000), SESSION)
+        rows = [json.loads(x) for x in read_text(path).splitlines() if x]
+        self.assertEqual([r["rule"] for r in rows], ["boot-crash"])
+        # Persisted only once the paging verdict was known, like every other
+        # page finding in this file — never left as "pending".
+        self.assertIs(rows[0]["paged"], True)
+
+    def test_a_crash_in_the_first_tick_falls_back_to_the_known_bundle(self):
+        """noteBundleVersion resolves from a promise, so a throw in the first
+        tick genuinely carries no bundle. The phone told us one at start."""
+        b = StreamBuilder(device=DEVICE).bundle().advance(200)
+        b.boot_error(bundle=None, since_ms=180)
+        watch = self.run_stream(b, finalize=False)
+        ctx = self.find(watch, "boot-crash")[0]["context"]
+        self.assertEqual(ctx["bundle"], BUNDLE)
+        self.assertEqual(ctx["bundleKnownFrom"], "device")
+        self.assertIn(BUNDLE, self.sent(watch)[0]["body"])
+
+    def test_a_crash_on_a_phone_we_know_nothing_about_still_pages(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error(bundle=None)
+        watch = self.run_stream(b, finalize=False)
+        ctx = self.find(watch, "boot-crash")[0]["context"]
+        self.assertIsNone(ctx["bundle"])
+        self.assertIsNone(ctx["bundleKnownFrom"])
+        self.assertEqual(len(self.sent(watch)), 1)
+        self.assertIn("App crashed on boot", self.sent(watch)[0]["body"])
+
+    def test_the_crash_shows_up_on_current_ride_md(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        watch.write_status(force=True)
+        status = read_text(os.path.join(self.tmp, "current-ride.md"))
+        self.assertIn("## App boot health", status)
+        self.assertIn("boot-crash", status)
+        self.assertIn(BUNDLE, status)
+        self.assertIn("[paged]", status)
+
+    def test_a_crash_never_opens_or_ends_a_trip(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.trips, {})
+        self.assertEqual(watch.ended_trips, [])
+
+
+class TestBundleHealth(BootTestCase):
+    """confirmBundleHealthyWhenStable's verdict (otprr native-updates.ts)."""
+
+    def test_a_withheld_verdict_pages_and_names_the_bundle(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(5000)
+        b.bundle_health(confirmed=False, reason="not-rendered")
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "bundle-health")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "page")
+        self.assertEqual(hits[0]["context"]["reason"], "not-rendered")
+        body = self.sent(watch)[0]["body"]
+        self.assertIn(BUNDLE, body)
+        self.assertIn("not-rendered", body)
+        self.assertLess(len(body), 120, body)
+
+    def test_a_confirmed_verdict_is_info_and_never_pages(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(5000).bundle_health()
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "bundle-health")
+        self.assertEqual([h["severity"] for h in hits], ["info"])
+        self.assertEqual(watch.push_log, [])
+
+    def test_the_withheld_verdict_shares_the_crashs_budget(self):
+        """A boot error and the verdict it produces five seconds later are one
+        incident. The rider is told once."""
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        b.advance(5000).bundle_health(confirmed=False, reason="boot-error")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "boot-crash")), 1)
+        self.assertEqual(len(self.find(watch, "bundle-health")), 1)
+        self.assertEqual(len(self.sent(watch)), 1)
+        self.assertEqual(self.sent(watch)[0]["kind"], "boot-crash")
+        self.assertEqual(len(self.suppressed(watch, "device-budget")), 1)
+
+    def test_a_confirmed_verdict_after_a_crash_page_says_it_came_back(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        # The rider relaunches; the shell has rolled back, and this time the
+        # gate confirms.
+        b.advance(10 * 60 * 1000).bundle(version="2026.0902.4")
+        b.advance(5000).bundle_health()
+        watch = self.run_stream(b, finalize=False)
+        bodies = [p["body"] for p in self.sent(watch)]
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("App came back on 2026.0902.4", bodies[1])
+
+    def test_the_app_came_back_is_said_once(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        for _ in range(3):
+            b.advance(10 * 60 * 1000).bundle_health()
+        watch = self.run_stream(b, finalize=False)
+        recovery = [p for p in self.sent(watch) if p["kind"] == "boot-recovery"]
+        self.assertEqual(len(recovery), 1)
+
+    def test_a_healthy_boot_an_hour_later_says_nothing(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        b.advance(ride_watch.BOOT_RECOVERY_WINDOW_MS + 60000).bundle_health()
+        watch = self.run_stream(b, finalize=False)
+        recovery = [p for p in self.sent(watch) if p["kind"] == "boot-recovery"]
+        self.assertEqual(recovery, [])
+
+    def test_a_confirmed_verdict_with_no_prior_crash_says_nothing(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(5000).bundle_health()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.push_log, [])
+
+    def test_a_fresh_crash_re_arms_the_came_back_page(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        b.advance(10 * 60 * 1000).bundle_health()               # came back
+        b.advance(ride_watch.BOOT_PAGE_INTERVAL_MS + 60000).boot_error()
+        b.advance(10 * 60 * 1000).bundle_health()               # came back again
+        watch = self.run_stream(b, finalize=False)
+        recovery = [p for p in self.sent(watch) if p["kind"] == "boot-recovery"]
+        self.assertEqual(len(recovery), 2)
+
+
+class TestBundleBookkeeping(BootTestCase):
+    """Which bundle a ride ran on. The `bundle` session event has been in the
+    stream since the OTA lane shipped and was ignored for the same reason the
+    crash beacons were."""
+
+    def test_the_bundle_event_is_recorded_against_the_phone(self):
+        b = StreamBuilder(device=DEVICE).bundle()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.device_bundles[DEVICE]["version"], BUNDLE)
+        self.assertEqual(watch.device_bundles[DEVICE]["native"], NATIVE)
+
+    def test_a_ride_names_the_bundle_it_ran_on(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(1000)
+        b.start().advance(1000).progress(stops=6, prog=20.0)
+        # One finding, so the ride gets a report request to name it in.
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.ended_trips[0]
+        self.assertEqual(trip.bundle, BUNDLE)
+        self.assertEqual(trip.bundle_native, NATIVE)
+        req = json.loads(read_text(report_requests(self.tmp)[0]))
+        self.assertEqual(req["bundle"], BUNDLE)
+        self.assertEqual(req["bundleNative"], NATIVE)
+
+    def test_a_ride_with_no_bundle_event_says_unknown(self):
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress(stops=5)
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips[SESSION]
+        self.assertIsNone(trip.bundle)
+        lines = watch._trip_state_lines(trip, watch.now_ms())
+        self.assertIn("- Bundle: unknown", lines)
+
+    def test_the_bundle_line_reaches_the_status_file(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(1000)
+        b.start().advance(1000).progress(stops=5)
+        watch = self.run_stream(b, finalize=False)
+        watch.write_status(force=True)
+        status = read_text(os.path.join(self.tmp, "current-ride.md"))
+        self.assertIn("- Bundle: %s (native %s)" % (BUNDLE, NATIVE), status)
+
+    def test_a_bundle_swapped_under_a_live_ride_updates_the_trip(self):
+        b = StreamBuilder(device=DEVICE).bundle().advance(1000)
+        b.start().advance(1000).progress(stops=5)
+        b.advance(1000).bundle(version="2026.0902.6")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.trips[SESSION].bundle, "2026.0902.6")
+
+    def test_a_crash_teaches_the_daemon_the_bundle(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.device_bundles[DEVICE]["version"], BUNDLE)
+
+    def test_the_bundle_event_does_not_make_the_next_ride_a_remount(self):
+        """device_sessions is what tells `resumed-trip` an app re-mount from a
+        daemon restart. A bundle event lands on EVERY app start, so recording
+        a session id from one would relabel every first adopted ride."""
+        b = StreamBuilder(device=DEVICE).bundle().advance(1000)
+        b.progress(stops=5)                     # adopted, no START_GO_MODE
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "resumed-trip")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "info")
+        self.assertEqual(hits[0]["context"]["cause"], "daemon-started-mid-ride")
+
+    def test_the_bundle_survives_a_daemon_restart(self):
+        b = StreamBuilder(device=DEVICE).bundle()
+        self.run_stream(b, finalize=False)
+        restarted = quiet_watch(self.tmp)
+        self.assertEqual(restarted.device_bundles[DEVICE]["version"], BUNDLE)
+
+    def test_the_boot_page_budget_survives_a_daemon_restart(self):
+        b = StreamBuilder(device=DEVICE).advance(1000).boot_error()
+        self.run_stream(b, finalize=False)
+        restarted = quiet_watch(self.tmp)
+        b2 = StreamBuilder(device=DEVICE).advance(5 * 60 * 1000).boot_error()
+        for ev in b2.events:
+            restarted.process(ev)
+        self.assertEqual([p for p in restarted.push_log if p.get("sent")], [])
+        self.assertEqual(len(self.suppressed(restarted, "device-budget")), 1)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,17 @@ The app batches JSONL telemetry to the Flask sidecar
 `~/otp-debug-logs/debug-<UTC-date>.jsonl`. ride-watch tails that file.
 
 Each line is a redux action (`{type, payload, t, session, recv}`), a console
-line (`{kind:"console", level, args}`), or a session marker.
+line (`{kind:"console", level, args}`), a session marker
+(`{kind:"session", event}`), or — since otprr `26e0afec` — a **boot crash
+beacon** (`{kind:"boot-error"|"boot-rejection", message, stack, bundle, …}`),
+which is the only record here that arrives by `sendBeacon` and so survives the
+force-quit that follows a white screen.
+
+Note the shape trap: `_process` derives its `typ` from `type`, falling back to
+`event` **only for non-session records**. A session marker and a crash beacon
+therefore have no `typ` at all, and every rule keyed on one is blind to them.
+That is exactly how the crash beacons, the `bundle_health` verdict and the
+`bundle` event all reached the daemon and were dropped.
 
 **State machine**, per session:
 
@@ -72,6 +82,11 @@ line (`{kind:"console", level, args}`), or a session marker.
 | `resumed-trip` | a ride that began with no `START_GO_MODE`, so it has no replay fixture | warn (info when it is the daemon that restarted) |
 | `vehicle-match-never` | a transit leg polled >=30 times and the live matcher never named a vehicle | warn |
 | `bike-egress-missing` | a bike+transit search whose transit results all end on foot | warn |
+| `boot-crash` | the app threw before it could run (`boot-error` / `boot-rejection`) | page |
+| `bundle-health` | the 5s health gate withheld its verdict, so the bundle rolls back | page (info when confirmed) |
+
+The last two are about the **phone**, not a ride, and are the only findings
+here that can fire with no trip open — see *Boot crashes* below.
 
 Two of those were written on 2026-07-31, after a ride where **every single
 finding was a rider note** — the engine had nothing to say while the app
@@ -155,6 +170,11 @@ by the first page and later pages do **not** extend it, so a continuing storm
 cannot defer paging indefinitely; subsequent pages simply open the next
 window. The 2-per-trip cap and the 120s global rate limit still apply on top.
 
+`boot-crash` and `bundle-health` are **not** in this scheme at all: they are
+outside a ride, so there is no trip buffer to enter, nothing concurrent to be
+ranked against, and no trip budget to charge. Do not add them to `PAGE_RANK`
+— see *Boot crashes*.
+
 `PAGE_RANK`, highest first — the question is "how much does this change what
 the rider does in the next minute?", not "how broken is the app" (the
 post-ride report covers that):
@@ -172,7 +192,53 @@ post-ride report covers that):
 Rules absent from `PAGE_RANK` get `PAGE_RANK_DEFAULT` (25, mid-pack) so a new
 page rule is neither silently starved nor able to outrank the stop counter
 before anyone has decided where it belongs — **add your rule to `PAGE_RANK`
-when you add it.** Non-page severities never push at all.
+when you add it** (unless it pages outside a ride, like the two below).
+Non-page severities never push at all.
+
+## Boot crashes, bundle verdicts, and which bundle a ride ran on
+
+On 2026-09-02 the OTA bundle `2026.0902.3` white-screened the rider's phone
+and the sink recorded **nothing at all** for the whole 45-minute incident. The
+client fixed its half (otprr `26e0afec`): a beacon armed at `main.js`'s first
+import reports the throw immediately, and a 5s health gate reports whether the
+bundle was confirmed or is about to be rolled back. This daemon reads both.
+
+- **`boot-crash`** fires on a `boot-error` (a window `error`) or
+  `boot-rejection` (an unhandled promise). The page names the message, the
+  bundle and the **hash** of the href — the origin is `capacitor://localhost`
+  on every boot and carries nothing, while the hash is what `2026.0902.3` was
+  actually diagnosed from. The finding keeps the whole record: stack, source,
+  line, `sinceBootMs`, and the localStorage inventory (key **names and sizes**
+  only — the client never sends values).
+- **`bundle-health`** fires on the gate's verdict. Withheld
+  (`boot-error` / `not-rendered`) pages; `confirmed` is an `info` line, except
+  on a phone paged about within the last hour, which gets a one-line
+  **"App came back on `<bundle>`"** to close the incident.
+
+**Their own page budget.** These pay out of a per-phone budget
+(`BOOT_PAGE_INTERVAL_MS`, **30 min**), never out of a ride's two interrupts,
+and they share it with each other on purpose: a boot error and the withheld
+verdict it produces five seconds later are one incident. The 120s global rate
+limit still applies on top. The budget and the bundle map are persisted in
+`state.json`, because a phone reports its bundle once per app start and this
+daemon is restarted more often than that.
+
+Findings with no trip behind them go to the ledger a ride under that session
+id *would* have used (`<date>-<session>.findings.jsonl`), so a crash that
+preceded a ride is already in the file that ride's report reads, and they are
+listed under **`## App boot health`** at the top of `current-ride.md`.
+
+**Which bundle a ride ran on.** The `bundle` session event
+(`{kind:"session", event:"bundle", version, native}`) has been in the stream
+since the OTA lane shipped and was ignored for the same `typ` reason. It is
+now recorded per phone, stamped onto each ride as it opens, carried in
+`_trip_state_lines` (so it appears on `current-ride.md` and in the thread
+digest) and in the report request as `bundle` / `bundleNative` — the store
+version no longer implies the build, so a report that omits it cannot say
+which build a defect belongs to. It deliberately does **not** feed
+`device_sessions`: that map is what tells `resumed-trip` an app re-mount from
+a daemon restart, and a marker that lands on every app start would relabel
+every first adopted ride.
 
 A buffered page is flushed by the main loop's 5s tick, so it goes out even if
 the log falls silent right after the finding, and immediately on trip end, so

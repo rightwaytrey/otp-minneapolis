@@ -340,6 +340,48 @@ VEHICLE_MATCH_NEVER_MIN_POLLS = 30
 
 MAX_PAGES_PER_TRIP = 2
 PUSH_MIN_INTERVAL_MS = 120 * 1000
+# Every push body the rider sees is one bounded line. 120 is the number the
+# suite has asserted since the copy rules were written; this is that, minus
+# room for the ellipsis one_line() adds when it has to cut.
+PUSH_BODY_MAX = 118
+
+# -- boot crashes and bundle verdicts (the events that happen with no ride) --
+#
+# On 2026-09-02 the OTA bundle `2026.0902.3` white-screened the rider's phone
+# and the sink recorded NOTHING from it for the whole incident. The client now
+# fixes its half (otprr `lib/util/debug-log-boot.js`, merged 26e0afec): a
+# `sendBeacon` armed at main.js's first import writes a `boot-error` /
+# `boot-rejection` record the instant the app throws, and the 5 s health gate
+# in `lib/util/native-updates.ts` writes a `bundle_health` verdict saying
+# whether the bundle was confirmed or is about to be rolled back.
+#
+# A boot crash is the single most page-worthy thing this daemon can see: the
+# app the rider would otherwise hear it from is the thing that is broken. It
+# is also the only one that happens OUTSIDE a ride, so it cannot be charged
+# against a trip's two interrupts (there is no trip) and it cannot be
+# coalesced against anything (nothing else is happening). Hence a budget of
+# its own, per phone.
+#
+# Thirty minutes, not per-boot: the client sends at most three beacons per
+# boot, but a phone that cannot start gets relaunched by hand, and each
+# relaunch is a fresh boot with a fresh three. One interrupt per half hour
+# says "your app is not starting" exactly as well as twenty do.
+BOOT_PAGE_INTERVAL_MS = 30 * 60 * 1000
+# ...and if it starts again inside the hour, the rider is told once that it
+# did. A page saying "it broke" and no page saying "it is back" leaves them
+# checking.
+BOOT_RECOVERY_WINDOW_MS = 60 * 60 * 1000
+# A minified stack's message is long and the useful part is the front. Two
+# limits: the page is one bounded line the rider reads on a lock screen, while
+# the finding is read by the wrap-up agent and can afford the whole sentence.
+BOOT_MESSAGE_MAX = 44
+BOOT_SUMMARY_MESSAGE_MAX = 160
+# The href's origin (`capacitor://localhost`) is identical on every boot; the
+# hash is what 6.46 was actually diagnosed from, so that is what is kept.
+BOOT_HREF_MAX = 24
+# Boot findings shown on current-ride.md. Small: this is a status file about
+# right now, and the ledger keeps the history.
+BOOT_EVENT_RING = 12
 # Intake dedup ring. The debug-log client re-POSTs a batch it is not sure
 # landed, so the same record arrives twice with the same `t` and the same
 # payload id, differing only in `recv` — 208 ms apart on 8/27 13:10:42. That
@@ -525,6 +567,27 @@ def short_session(session):
     return session.rsplit("-", 1)[-1]
 
 
+def short_boot_href(href, limit=BOOT_HREF_MAX):
+    """The part of a boot URL that differs between one boot and the next.
+
+    The native app always loads `capacitor://localhost`, so the origin costs
+    twenty characters of a page body and carries no information. What killed
+    2026.0902.3 was a legacy `routeLock` in the HASH, and the only way anyone
+    reconstructed that URL was by hand out of the previous day's log. So the
+    hash is what survives the truncation, and the origin is what is dropped.
+    """
+    if not isinstance(href, str) or not href:
+        return None
+    tail = href
+    if "#" in tail:
+        tail = tail[tail.index("#"):]
+    else:
+        m = re.match(r"^[A-Za-z][\w+.-]*://[^/]*(/.*)$", tail)
+        if m:
+            tail = m.group(1)
+    return one_line(tail, limit)
+
+
 def one_line(text, limit=THREAD_LINE_MAX):
     """Collapse anything to a single bounded line.
 
@@ -697,6 +760,14 @@ class Trip:
         # rest are aliases in RideWatch.trips. See _adopt_continuation.
         self.sessions = [session]
         self.device = None            # which phone; the anchor for a remount
+        # Which web bundle the phone was running. Stamped from the device's
+        # `bundle` session event (otprr lib/main.js), which lands at app start
+        # and so is normally already known by the time a ride opens. A report
+        # that cannot name the bundle cannot say which build a defect belongs
+        # to — and since the OTA lane shipped, the build is no longer implied
+        # by the store version.
+        self.bundle = None
+        self.bundle_native = None
         self.start_ms = start_ms
         self.itinerary = itinerary_summary        # latest itinerary summary
         self.adopted = adopted                    # trip inferred mid-stream
@@ -835,6 +906,22 @@ class RideWatch:
         # we already know is an app re-mount, which is what tells a resumed
         # trip from a daemon that simply started mid-ride.
         self.device_sessions = {}
+        # device -> {"version", "native", "atMs", "source"}: the web bundle a
+        # phone is running. Fed by the `bundle` session event and by the
+        # `bundle` field on a crash beacon. Read by the ride's own bundle
+        # stamp and by the bundle_health rule, whose verdict names no version
+        # of its own. Persisted, because a phone reports its bundle once per
+        # app start and this daemon restarts more often than that.
+        self.device_bundles = {}
+        # device -> ms of the last boot-crash / withheld-verdict page. The
+        # budget these pages are charged to, separate from any trip's.
+        self.device_boot_page_ms = {}
+        # device -> the page timestamp already followed up with "it is back",
+        # so one crash episode produces at most one recovery page.
+        self.device_boot_ack = {}
+        # The newest boot findings, for current-ride.md. These have no trip to
+        # be listed under; the whole point is that the app never got that far.
+        self.boot_events = []
         # Intake dedup ring (see RECORD_DEDUP_RING).
         self._seen_records = collections.deque()
         self._seen_record_keys = {}
@@ -899,6 +986,22 @@ class RideWatch:
         # a restart re-adopts the finished ride as a new one on the next tick.
         self.ended_arrived = set(
             x for x in (data.get("endedArrived") or []) if isinstance(x, str))
+        # A phone announces its bundle once, at app start, and this daemon is
+        # restarted on every commit — so without this a restart mid-evening
+        # loses the version every ride report and every withheld verdict is
+        # about, until the rider next relaunches the app.
+        self.device_bundles = dict(
+            (k, v) for k, v in (data.get("deviceBundles") or {}).items()
+            if isinstance(k, str) and isinstance(v, dict))
+        # ...and the boot-page budget, for the same reason it is a budget at
+        # all: a restart that forgets it would page again about the crash it
+        # has already paged about.
+        self.device_boot_page_ms = dict(
+            (k, int(v)) for k, v in (data.get("deviceBootPages") or {}).items()
+            if isinstance(k, str) and isinstance(v, (int, float)))
+        self.device_boot_ack = dict(
+            (k, int(v)) for k, v in (data.get("deviceBootAck") or {}).items()
+            if isinstance(k, str) and isinstance(v, (int, float)))
         return data.get("lastTrip")
 
     def _save_state(self):
@@ -914,7 +1017,19 @@ class RideWatch:
                                key=lambda kv: kv[1])[-32:]),
                            # Bounded: one session id per app load, so the tail
                            # is every ride of the last few days.
-                           "endedArrived": sorted(self.ended_arrived)[-32:]}, f)
+                           "endedArrived": sorted(self.ended_arrived)[-32:],
+                           # One entry per phone; the rider has one, and a
+                           # spare bound keeps a stray device id from growing
+                           # the file without limit.
+                           "deviceBundles": dict(sorted(
+                               self.device_bundles.items(),
+                               key=lambda kv: kv[1].get("atMs") or 0)[-8:]),
+                           "deviceBootPages": dict(sorted(
+                               self.device_boot_page_ms.items(),
+                               key=lambda kv: kv[1])[-8:]),
+                           "deviceBootAck": dict(sorted(
+                               self.device_boot_ack.items(),
+                               key=lambda kv: kv[1])[-8:])}, f)
         except OSError:
             pass
 
@@ -1021,6 +1136,24 @@ class RideWatch:
         elif typ == "STOP_GO_MODE":
             if trip:
                 self._end_trip(trip, t, "stop")
+        elif kind in ("boot-error", "boot-rejection"):
+            # Keyed on `kind`, because there is no `typ` to key on: the crash
+            # beacon carries neither `type` nor `event` (otprr
+            # debug-log-boot.js captureBootError), and the line above only
+            # falls back to `event` for non-session records. That is why these
+            # fell through this whole chain inertly from the moment the client
+            # started sending them.
+            #
+            # And it sits ABOVE `elif trip is not None`, like the rider-note
+            # and onboard branches, because a boot crash is by definition
+            # outside a ride: the app never got far enough to have one.
+            self._rule_boot_crash(session, t, obj, trip)
+        elif kind == "session" and obj.get("event") in ("bundle",
+                                                        "bundle_health"):
+            # Same blind spot, other half: `typ` is left None for every
+            # session record, so the bundle the phone is running and the
+            # health gate's verdict on it both arrived and were dropped.
+            self._on_session_event(session, t, obj, trip)
         elif typ == "RIDER_NOTE" or kind == "rider-note":
             # Typed by the rider on the /ride console mid-trip. Handled before
             # the `trip is not None` branch because the note's session id is a
@@ -1106,6 +1239,7 @@ class RideWatch:
             self._declined_completed.discard(session)
             trip.device = obj.get("device")
             self._note_device_session(trip.device, session)
+            self._stamp_trip_bundle(trip)
             self.trips[session] = trip
             self.log.info("trip started: session=%s itinerary=%s" % (
                 session, itinerary_one_liner(summary)))
@@ -1185,6 +1319,7 @@ class RideWatch:
             return
         trip = Trip(session, t, None, adopted=True)
         trip.device = obj.get("device")
+        self._stamp_trip_bundle(trip)
         self.trips[session] = trip
         self.log.info("adopted mid-stream trip for session %s" % session)
         # An adopted trip is a ride in progress — usually the daemon was
@@ -1205,6 +1340,274 @@ class RideWatch:
         if session not in seen:
             seen.append(session)
             del seen[:-16]
+
+    # -- the phone itself: boot crashes and bundle verdicts -----------------
+    #
+    # Everything else in this file is about a ride. These three are about the
+    # app, and they are here because the app failing to start is the one
+    # failure a rider cannot be told about by the app.
+
+    def _on_session_event(self, session, t, obj, trip):
+        """Session-scoped facts the app reports once per app start."""
+        event = obj.get("event")
+        if event == "bundle":
+            self._note_bundle(obj.get("device"), t, obj.get("version"),
+                              obj.get("native"), source="bundle")
+        elif event == "bundle_health":
+            self._rule_bundle_health(session, t, obj, trip)
+
+    def _note_bundle(self, device, t, version, native=None, source="bundle"):
+        """Remember which web bundle a phone is running.
+
+        `{"kind": "session", "event": "bundle", "version": "2026.0902.5",
+        "native": "1.0.54"}` — otprr lib/main.js, in the stream since the OTA
+        lane shipped and ignored the whole time for the reason above. Worth
+        having twice over: a ride report that cannot name the bundle cannot
+        say which build a defect belongs to, and a withheld `bundle_health`
+        verdict carries only `confirmed` and `reason`, so the version it is
+        about has to come from here.
+
+        Deliberately does NOT call _note_device_session. That map is what
+        tells `resumed-trip` a re-mount from a daemon restart, and recording a
+        session id here — one lands on every single app start — would make
+        every first adopted ride after a restart look like an app re-mount.
+        """
+        if not isinstance(version, str) or not version:
+            return
+        if device:
+            prev = (self.device_bundles.get(device) or {}).get("version")
+            self.device_bundles[device] = {
+                "version": version,
+                "native": native if isinstance(native, str) else None,
+                "atMs": int(t), "source": source}
+            if prev != version:
+                self.log.info("device %s is running bundle %s (native %s, via %s)"
+                              % (device, version, native, source))
+                self._save_state()
+        for trip in self._active_trips():
+            if device and trip.device == device:
+                self._stamp_trip_bundle(trip)
+        self._mark_dirty()
+
+    def _stamp_trip_bundle(self, trip):
+        """Record on the ride which bundle the phone was running."""
+        info = self.device_bundles.get(trip.device) if trip.device else None
+        if not info or not info.get("version"):
+            return
+        if trip.bundle != info.get("version"):
+            self.log.info("trip %s is running bundle %s"
+                          % (trip.session, info.get("version")))
+        trip.bundle = info.get("version")
+        trip.bundle_native = info.get("native")
+        self._mark_dirty()
+
+    def _rule_boot_crash(self, session, t, obj, trip):
+        """The app threw before it could run. Page, once per phone per 30 min.
+
+        The record (otprr lib/util/debug-log-boot.js): `kind` is `boot-error`
+        for a window `error` or `boot-rejection` for an unhandled promise,
+        with `message`, `stack`, `source`, `line`, `col`, `bundle`,
+        `sinceBootMs` and `storage` (key NAMES and sizes only, never values),
+        under the ordinary envelope's `device` / `href` / `ua`. It arrives by
+        `sendBeacon`, so unlike everything else in the stream it survives the
+        force-quit that follows a white screen.
+
+        Paged out of the phone's own budget rather than a trip's: there is no
+        trip to charge, and on the one occasion this has happened the app was
+        unopenable for 45 minutes, which is not a thing to spend a ride's two
+        interrupts on. See BOOT_PAGE_INTERVAL_MS.
+        """
+        device = obj.get("device")
+        raw_message = obj.get("message") or "(no message)"
+        message = one_line(raw_message, BOOT_MESSAGE_MAX)
+        bundle = obj.get("bundle")
+        if isinstance(bundle, str) and bundle:
+            # The crash names the bundle it happened on, which is better
+            # evidence than the last one we were told about.
+            self._note_bundle(device, t, bundle, source=obj.get("kind"))
+            bundle_from = "event"
+        else:
+            # Legitimately absent: noteBundleVersion is resolved from a
+            # promise, so a throw in the first tick genuinely has no bundle
+            # yet. Fall back to what the phone last reported, and say so.
+            bundle = (self.device_bundles.get(device) or {}).get("version")
+            bundle_from = "device" if bundle else None
+        href = short_boot_href(obj.get("href"))
+        where = obj.get("source")
+        if where and obj.get("line") is not None:
+            where = "%s:%s" % (where.rsplit("/", 1)[-1], obj.get("line"))
+        elif where:
+            where = where.rsplit("/", 1)[-1]
+        since = obj.get("sinceBootMs")
+        summary = ("the app threw during boot on bundle %s: %s"
+                   % (bundle or "(unknown)",
+                      one_line(raw_message, BOOT_SUMMARY_MESSAGE_MAX)))
+        if where:
+            summary += " (at %s)" % where
+        if isinstance(since, (int, float)):
+            # Sub-second in milliseconds: a boot throw is usually a few
+            # hundred ms in, and fmt_ms_span rounds every one of those to
+            # "0s", which reads as "no data" rather than "immediately".
+            summary += " %s into the boot" % (
+                "%dms" % since if since < 1000 else fmt_ms_span(since))
+        context = {
+            "device": device, "session": session, "kind": obj.get("kind"),
+            "message": obj.get("message"), "stack": obj.get("stack"),
+            "source": obj.get("source"), "line": obj.get("line"),
+            "col": obj.get("col"), "bundle": bundle,
+            "bundleKnownFrom": bundle_from, "sinceBootMs": since,
+            "href": obj.get("href"), "storage": obj.get("storage"),
+            "ua": obj.get("ua"),
+        }
+        finding = self._device_finding(session, device, t, "boot-crash",
+                                       "page", summary, context, trip)
+        body = ("App crashed on boot on %s: %s" % (bundle, message)
+                if bundle else "App crashed on boot: %s" % message)
+        if href:
+            body += " - %s" % href
+        self._page_device(device, t, "boot-crash", body, finding, trip)
+
+    def _rule_bundle_health(self, session, t, obj, trip):
+        """The 5 s health gate's verdict on the bundle that just booted.
+
+        `{"kind": "session", "event": "bundle_health", "confirmed": <bool>,
+        "reason": "confirmed" | "boot-error" | "not-rendered"}` — otprr
+        lib/util/native-updates.ts confirmBundleHealthyWhenStable. It goes
+        into the buffered stream always, and ALSO by beacon when it is
+        withheld, so the daemon may see the same verdict twice; intake's
+        duplicate ring does not collapse those (they carry different entry ids
+        on purpose), so the per-device page budget is what keeps it to one
+        interrupt.
+
+        A withheld verdict means the shell rolls this bundle back at the next
+        launch. It pages on the SAME budget as the crash that usually precedes
+        it, deliberately: a boot error and the verdict it produced five
+        seconds later are one incident, and the rider should be told once.
+
+        A confirmed verdict is ordinary and lands at `info` — except on a
+        phone we paged about within the last hour, where "it is working again"
+        is the other half of a page already spent.
+        """
+        device = obj.get("device")
+        confirmed = bool(obj.get("confirmed"))
+        reason = obj.get("reason") or ("confirmed" if confirmed else "withheld")
+        bundle = (self.device_bundles.get(device) or {}).get("version")
+        context = {"device": device, "session": session,
+                   "confirmed": confirmed, "reason": reason,
+                   "bundle": bundle, "href": obj.get("href")}
+        if confirmed:
+            self._device_finding(
+                session, device, t, "bundle-health", "info",
+                "the app confirmed bundle %s healthy (%s)"
+                % (bundle or "(unknown)", reason), context, trip)
+            self._maybe_page_recovery(device, t, bundle)
+            return
+        summary = ("the app withheld its health verdict on bundle %s (%s), so"
+                   " the shell rolls it back at the next launch"
+                   % (bundle or "(unknown)", reason))
+        finding = self._device_finding(session, device, t, "bundle-health",
+                                       "page", summary, context, trip)
+        self._page_device(
+            device, t, "bundle-health",
+            "Bundle %s not confirmed (%s); it rolls back on relaunch"
+            % (bundle or "unknown", reason), finding, trip)
+
+    def _maybe_page_recovery(self, device, t, bundle):
+        """One line closing a boot crash we already paged about."""
+        if not device:
+            return
+        paged_ms = self.device_boot_page_ms.get(device)
+        if not paged_ms or t - paged_ms > BOOT_RECOVERY_WINDOW_MS:
+            return
+        if self.device_boot_ack.get(device) == paged_ms:
+            return
+        body = "App came back on %s" % (bundle or "the current bundle")
+        if self._send_push("Ride watch", one_line(body, PUSH_BODY_MAX),
+                           kind="boot-recovery"):
+            # Only on a send: a recovery page lost to the 120 s rate limit
+            # gets one more chance at the next launch, which is the shape of
+            # the thing anyway.
+            self.device_boot_ack[device] = paged_ms
+            self._save_state()
+
+    def _device_finding(self, session, device, t, rule, severity, summary,
+                        context, trip=None):
+        """A finding about the PHONE rather than about a ride.
+
+        The trip-less sibling of _finding. Boot crashes and bundle verdicts
+        happen with no trip to hang on — the app never reached Go Mode, or
+        never reached anything at all — so the record goes into the same
+        per-day, per-session ledger _findings_path would have chosen for a
+        ride under that session id. If a ride does open under it later, the
+        crash that preceded it is already in the file the report reads.
+
+        When a trip IS live (a crash on a mid-ride re-mount) the finding is
+        filed on that trip and pushed to its thread as well — but never into
+        the trip's page buffer, because these pay out of their own budget and
+        must not be able to supersede, or be superseded by, a ride page.
+        """
+        finding = {
+            "tsMs": int(t), "time": fmt_hms(t), "session": session,
+            "device": device, "rule": rule, "severity": severity,
+            "summary": summary, "context": context,
+        }
+        self.all_findings.append(finding)
+        self.boot_events.append(finding)
+        del self.boot_events[:-BOOT_EVENT_RING]
+        self.log.info("FINDING [%s/%s] %s %s"
+                      % (severity, rule, fmt_hms(t), summary))
+        if trip is not None:
+            trip.findings.append(finding)
+            line = "finding [%s] %s: %s" % (severity, rule, summary)
+            self._thread_event(trip, t, line)
+            self._thread_push(trip, line)
+        if severity == "page":
+            # Same rule as _finding: persisted once the paging verdict is
+            # known, so the record always says whether the rider was told.
+            finding["paged"] = "pending"
+        else:
+            self._persist_device_finding(finding, trip)
+        self._mark_dirty()
+        return finding
+
+    def _page_device(self, device, t, rule, body, finding, trip=None):
+        """Page about the phone, on the phone's own budget.
+
+        Not the trip budget and not the coalescing buffer. There is nothing to
+        coalesce against — the app is not running, so nothing else is being
+        reported — and nothing to charge, because these fire outside a ride.
+        One page per phone per BOOT_PAGE_INTERVAL_MS keeps a relaunch loop
+        down to one interrupt. The global 120 s rate limit still applies on
+        top, in _send_push, exactly as it does for every other push here.
+        """
+        body = one_line(body, PUSH_BODY_MAX)
+        last = self.device_boot_page_ms.get(device) if device else None
+        if last is not None and 0 <= t - last < BOOT_PAGE_INTERVAL_MS:
+            self.log.info("page suppressed (one per phone per %dm): %s"
+                          % (BOOT_PAGE_INTERVAL_MS // 60000, body))
+            self.push_log.append({"tsMs": int(t), "title": "Ride watch",
+                                  "body": body, "sent": False, "kind": rule,
+                                  "suppressed": "device-budget"})
+            sent = False
+        else:
+            sent = self._send_push("Ride watch", body, kind=rule)
+            if sent and device:
+                self.device_boot_page_ms[device] = int(t)
+                # A fresh crash re-arms the "it came back" follow-up.
+                self.device_boot_ack.pop(device, None)
+                self._save_state()
+        finding["paged"] = sent
+        self._persist_device_finding(finding, trip)
+        self._mark_dirty()
+        return sent
+
+    def _persist_device_finding(self, finding, trip):
+        if trip is not None:
+            self._persist_finding(trip, finding)
+            return
+        self._append_finding(
+            self._findings_path_for(fmt_date(finding["tsMs"]),
+                                    finding["session"]), finding)
 
     def _rule_resumed_trip(self, trip, t, obj):
         """A ride that begins without a START_GO_MODE cannot be replayed.
@@ -2736,16 +3139,28 @@ class RideWatch:
         self._mark_dirty()
 
     def _persist_finding(self, trip, finding):
+        self._append_finding(self._findings_path(trip), finding)
+
+    def _append_finding(self, path, finding):
         try:
-            with open(self._findings_path(trip), "a") as f:
+            with open(path, "a") as f:
                 f.write(json.dumps(finding) + "\n")
         except OSError as exc:
             self.log.error("could not append finding: %r" % exc)
 
     def _findings_path(self, trip):
-        return os.path.join(
-            self.watch_dir,
-            "%s-%s.findings.jsonl" % (fmt_date(trip.start_ms), trip.session))
+        return self._findings_path_for(fmt_date(trip.start_ms), trip.session)
+
+    def _findings_path_for(self, date, session):
+        """The per-day, per-session findings ledger.
+
+        Split out from _findings_path so a finding with no trip behind it — a
+        boot crash, which by construction happens before any ride — lands in
+        the file the ride under that session id would use, rather than in a
+        second one nobody's report reads.
+        """
+        return os.path.join(self.watch_dir,
+                            "%s-%s.findings.jsonl" % (date, session))
 
     def _buffer_page(self, trip, ts_ms, rule, body, finding):
         """Hold a page for the coalescing window instead of sending it now."""
@@ -2920,6 +3335,13 @@ class RideWatch:
             # earlier ride's findings too. Only records at or after this
             # timestamp belong to this ride; findingsCount counts only those.
             "findingsFrom": trip.start_ms,
+            # Which web bundle this ride ran on. Since the OTA lane shipped
+            # the store version no longer implies it, so a report that omits
+            # it cannot say which build a defect belongs to. None when the
+            # phone never reported one (a browser, or an app start this daemon
+            # did not see).
+            "bundle": trip.bundle,
+            "bundleNative": trip.bundle_native,
             "itinerarySummary": trip.itinerary or {"unavailable": True},
             "findingsCount": len(trip.findings),
             # The rider's notes are in findingsPath too (rule "rider-note"),
@@ -3519,6 +3941,13 @@ class RideWatch:
         lines = [
             "- Started: %s %s" % (fmt_date(trip.start_ms), fmt_hms(trip.start_ms)),
             "- Itinerary: %s" % itinerary_one_liner(trip.itinerary),
+            # Named on every ride, "unknown" included: an OTA bundle is what a
+            # defect belongs to now, and a wrap-up that has to go and guess it
+            # from the log gets it wrong.
+            "- Bundle: %s%s" % (
+                trip.bundle or "unknown",
+                " (native %s)" % trip.bundle_native if trip.bundle_native
+                else ""),
         ]
         if trip.swap_seq:
             lines.append("- Itinerary swaps: %d (last %s)" % (
@@ -3566,6 +3995,21 @@ class RideWatch:
         # about to read. (8/28)
         lines.extend(self._daemon_lines())
         lines.append("")
+        # Above the rides, because a phone that will not start is the one
+        # thing here that no ride can be running through. These findings have
+        # no trip section to live in — that is the whole point of them.
+        if self.boot_events:
+            lines.append("## App boot health (%d, newest first)"
+                         % len(self.boot_events))
+            lines.append("")
+            for ev in reversed(self.boot_events):
+                paged = {True: " [paged]", "dry-run": " [paged]",
+                         "pending": " [paging]"}.get(ev.get("paged"), "")
+                lines.append("- %s [%s] %s on %s: %s%s" % (
+                    ev["time"], ev["severity"], ev["rule"],
+                    short_session(ev.get("device")),
+                    one_line(ev["summary"], 200), paged))
+            lines.append("")
         if not self.trips:
             if self.last_trip_summary:
                 s = self.last_trip_summary
