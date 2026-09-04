@@ -77,6 +77,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
 | `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
 | `console-error` | a `console.error` line (deduped by message, minus `CONSOLE_ERROR_IGNORE`) | info |
+| `wake-lock-denied` | the screen wake lock was refused during a trip (one finding per launch/resume, with the count) | warn |
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
 | `session-churn` | the app re-mounted mid-ride and minted a new session id | warn |
 | `resumed-trip` | a ride that began with no `START_GO_MODE`, so it has no replay fixture | warn (info when it is the daemon that restarted) |
@@ -87,6 +88,23 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 
 The last two are about the **phone**, not a ride, and are the only findings
 here that can fire with no trip open — see *Boot crashes* below.
+
+**`wake-lock-denied` is a warn on purpose, and it is a rule of its own on
+purpose.** The client logs the refusal at `console.warn`
+(otprr `use-active-trip-guards.ts`), and `_rule_console` reads
+`level == "error"` only — which is why 2026-08-31 and 2026-09-04 both reached
+their reports with the screen sleeping under the rider and nothing said. It is
+not fixed by widening `console-error` to warns: the stream carries warns by the
+hundred, and one finding per distinct warn string would drown a ride's budget
+the way the map-sprite burst did (see `CONSOLE_ERROR_IGNORE`). It does not page
+because it fires on **every** launch inside WKWebView, so it would spend both
+of a ride's interrupts before the bus arrived, and because the rider cannot do
+anything about it in the next minute. The requester retries on a bounded ladder
+(4 tries, 5 s apart, re-armed per return to visibility), so the warns arrive in
+bursts; a burst is collapsed into one finding once it has been quiet for
+`WAKE_LOCK_BURST_QUIET_MS` (**30s**) or the ride ends, and the finding carries
+the count. The real fix is native — a keep-awake plugin in the Capacitor shell
+— and this rule is what tells a report whether it worked.
 
 Two of those were written on 2026-07-31, after a ride where **every single
 finding was a rider note** — the engine had nothing to say while the app

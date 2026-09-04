@@ -326,6 +326,34 @@ CONSOLE_ERROR_IGNORE = (
     'An image named ',
 )
 
+# wake-lock-denied. The screen wake lock is what keeps the phone awake while
+# Go Mode navigates; when it is refused the screen sleeps mid-ride and the
+# rider loses the map, the turn cards, and the fix rate with them.
+#
+# The client says so out loud — otprr `use-active-trip-guards.ts` logs
+# `console.warn('Wake lock request failed:', err)` — and until 2026-09-04 no
+# rule heard it, because `_rule_console` reads `level == "error"` only. Three
+# rides now carry the refusal and all three reached their report silently; the
+# 09-04 one was found by a human reading the raw JSONL.
+#
+# The PREFIX is matched, not the whole string, because the second console arg
+# is the DOMException and the sink writes it as its own array element:
+#   {"kind": "console", "level": "warn",
+#    "args": ["Wake lock request failed:",
+#             {"message": "Permission was denied", "name": "NotAllowedError",
+#              "stack": ""}]}
+# (~/otp-debug-logs/debug-2026-09-04.jsonl, session mtn4ui3s-xfjx8m, entry ids
+# mtn53eer-6ssi0g-h / -12 and mtn5akh8-s2nbaj-h / -y.)
+WAKE_LOCK_WARN_PREFIX = "Wake lock request failed"
+# One launch's refusals are ONE finding. The requester retries on a bounded
+# ladder — 4 tries, 5 s apart, re-armed per return to visibility
+# (`use-active-trip-guards.ts` WAKE_LOCK_RETRY_MS / WAKE_LOCK_RETRIES) — so a
+# single denied launch emits up to five warns spread over ~20 s. A refusal that
+# arrives after this much quiet is a new launch or a new resume and gets its
+# own finding: on 09-04 the two relaunches were 5 m 35 s apart, and each
+# produced exactly two warns 5 s apart.
+WAKE_LOCK_BURST_QUIET_MS = 30 * 1000
+
 # vehicle-match-never. On 2026-09-01 ride 2 the app polled the vehicle matcher
 # 775 times across the Orange Line leg and every one came back
 # `confidence: "none"`, `vehicleId: null`, `distanceMeters: null`. The app
@@ -824,6 +852,13 @@ class Trip:
         self.searches = collections.OrderedDict()
         self.bike_egress_fired = set()            # searchIds already reported
         self.console_seen = set()
+        # The open wake-lock refusal burst, or None. One launch's ladder of
+        # denials is one finding, so the warns are accumulated here and the
+        # finding is emitted once the burst goes quiet (or the ride ends) —
+        # which is also the only moment the count is known.
+        # {"firstMs", "lastMs", "count", "errorName", "errorMessage"}
+        self.wake_lock_burst = None
+        self.wake_lock_bursts = 0                 # launches denied this ride
         self.notes = []                           # rider-typed notes, in order
         # -- the ride thread ---------------------------------------------
         self.thread = None            # {"tmux","display","spawnedMs","ok"}
@@ -1168,6 +1203,7 @@ class RideWatch:
         elif trip is not None:
             if kind == "console":
                 self._rule_console(trip, t, obj)
+                self._rule_wake_lock_denied(trip, t, obj)
             elif typ == "UPDATE_POSITION":
                 trip.last_pos_ms = max(trip.last_pos_ms, t)
                 # Only a fix that actually closes the gap closes the gap. A
@@ -1900,6 +1936,9 @@ class RideWatch:
         # answered once the ride is over, and the report request quotes
         # len(trip.findings).
         self._rule_vehicle_match_never(trip, t)
+        # ...and a refusal burst still inside its quiet window: the ride ending
+        # is the end of that launch by definition.
+        self._flush_wake_lock(trip, t, force=True)
         # Flush first: a page must not be lost because the trip ended three
         # seconds into its coalescing window.
         self._flush_pages(trip, t, force=True)
@@ -2171,6 +2210,10 @@ class RideWatch:
             # deviated-streak may mature between UPDATE_PROGRESS ticks
             self._check_deviated_streak(trip, now)
             self._check_stalled(trip, now)
+            # A refusal burst matures the same way: the last warn of a ladder
+            # is followed by silence, not by another event, so nothing but the
+            # 5 s tick can tell us the launch is done being denied.
+            self._flush_wake_lock(trip, now)
             self._maybe_heartbeat(trip, now)
         # Outside the loop on purpose: a promised wrap-up outlives its trip,
         # which was deleted from self.trips the moment the ride ended. The
@@ -3022,6 +3065,90 @@ class RideWatch:
             return
         self._finding(trip, t, "console-error", "info",
                       "console.error: %s" % msg[:120], {"message": msg})
+
+    def _rule_wake_lock_denied(self, trip, t, obj):
+        """The phone refused to stay awake while a trip was running.
+
+        Why `_rule_console` did not catch it: that rule opens with
+        `if obj.get("level") != "error": return`, and this is a
+        `console.warn`. The client logs the refusal at warn level on purpose —
+        it is recoverable and it retries — so the one rule that reads the
+        console dropped every one of them on the floor. Deliberately NOT fixed
+        by widening `_rule_console` to warns: the stream carries warns by the
+        hundred (deprecations, tile misses, upstream chatter) and one
+        catch-all `console-warn` finding per distinct string would drown a
+        ride's findings budget the way the map-sprite burst did to
+        `console-error` (see CONSOLE_ERROR_IGNORE). This is a named rule for a
+        known symptom instead.
+
+        `warn`, not a page. A sleeping screen is bad, but the rider cannot act
+        on it in the next minute the way they can act on the wrong stop count,
+        and a ride has only MAX_PAGES_PER_TRIP interrupts to spend. It also
+        fires on EVERY launch on iOS, which is precisely the kind of rule that
+        would burn both pages before the bus arrives.
+
+        Deduped to one finding per launch/resume: see WAKE_LOCK_BURST_QUIET_MS.
+        Accumulates here and is emitted by _flush_wake_lock, because the count
+        the finding reports is not known until the burst is over.
+        """
+        if obj.get("level") != "warn":
+            return
+        args = obj.get("args") or []
+        if not args:
+            return
+        head = args[0]
+        if not isinstance(head, str) or WAKE_LOCK_WARN_PREFIX not in head:
+            return
+        # The DOMException rides as the second arg, already serialised by the
+        # client's console shim. Its `name` is the whole diagnosis:
+        # NotAllowedError is WKWebView refusing the API outright, and no
+        # amount of retrying from the web layer will turn that into a lock.
+        name, message = None, None
+        if len(args) > 1 and isinstance(args[1], dict):
+            name = args[1].get("name")
+            message = args[1].get("message")
+        elif len(args) > 1 and isinstance(args[1], str):
+            message = args[1]
+        burst = trip.wake_lock_burst
+        if burst is not None and t - burst["lastMs"] <= WAKE_LOCK_BURST_QUIET_MS:
+            burst["lastMs"] = t
+            burst["count"] += 1
+            burst["errorName"] = burst["errorName"] or name
+            burst["errorMessage"] = burst["errorMessage"] or message
+            self._mark_dirty()
+            return
+        # A burst that was still open belongs to an earlier launch: close it
+        # before opening this one, or its count would be folded into this one.
+        self._flush_wake_lock(trip, t, force=True)
+        trip.wake_lock_burst = {"firstMs": t, "lastMs": t, "count": 1,
+                                "errorName": name, "errorMessage": message}
+        self._mark_dirty()
+
+    def _flush_wake_lock(self, trip, now, force=False):
+        """Emit the accumulated refusal burst once it is over."""
+        burst = trip.wake_lock_burst
+        if burst is None:
+            return
+        if not force and now - burst["lastMs"] <= WAKE_LOCK_BURST_QUIET_MS:
+            return
+        trip.wake_lock_burst = None
+        trip.wake_lock_bursts += 1
+        name = burst["errorName"] or "unknown error"
+        detail = name
+        if burst["errorMessage"]:
+            detail = "%s: %s" % (name, burst["errorMessage"])
+        self._finding(
+            trip, burst["firstMs"], "wake-lock-denied", "warn",
+            "screen wake lock denied %dx on this launch (%s) — the screen "
+            "will sleep mid-ride" % (burst["count"], detail),
+            {"count": burst["count"],
+             "errorName": burst["errorName"],
+             "errorMessage": burst["errorMessage"],
+             "firstMs": burst["firstMs"],
+             "lastMs": burst["lastMs"],
+             "launchesDeniedThisRide": trip.wake_lock_bursts,
+             "bundle": trip.bundle,
+             "native": trip.bundle_native})
 
     # -- rider notes --------------------------------------------------------
 
