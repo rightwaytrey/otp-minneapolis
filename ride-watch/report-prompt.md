@@ -30,6 +30,13 @@ Read it first. Everything else follows from it.
 they typed it (leg, progress, status, stopsRemaining, riding, secondsSinceFix).
 They also appear in `findingsPath` as `rule: "rider-note"`, severity `info`.
 
+A note with `source: "feedback"` came from the app's own "Share feedback"
+screen, and may carry `image`: an absolute path under `~/otp-debug-logs/feedback/`
+holding the screenshot the rider attached. **Look at it** — the whole reason that
+screen exists is that a UI defect produces no telemetry, so for those findings the
+picture is the only evidence there is. Cite the path in the report the way you
+cite `findingsPath`.
+
 ## What actually happened, and what you must decide
 
 Each line of `findingsPath` is one finding the rule engine emitted:

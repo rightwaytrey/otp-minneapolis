@@ -277,7 +277,7 @@ class StreamBuilder:
             "legIndex": leg, "distanceFromRoute": dist,
             "progressAlongLeg": 0.1, "isOnRoute": on_route})
 
-    def note(self, text, session=None, source=None):
+    def note(self, text, session=None, source=None, image=None, **extra):
         """A rider note exactly as the Flask sidecar writes it to the JSONL."""
         rec = {
             "kind": "rider-note", "event": "RIDER_NOTE", "text": text,
@@ -286,6 +286,11 @@ class StreamBuilder:
             "ip": "10.0.0.5"}
         if source is not None:
             rec["source"] = source
+        # The "Share feedback" screen's attachment: the sidecar stores the bytes
+        # and writes only the path (preferences_api.py _store_feedback_image).
+        if image is not None:
+            rec["image"] = image
+        rec.update(extra)
         self.events.append(rec)
         return self
 
@@ -1481,6 +1486,57 @@ class TestRiderNotes(RuleTestCase):
         b.advance(1000).note("   ")
         watch = self.run_stream(b, finalize=False)
         self.assertEqual(watch.trips[SESSION].notes, [])
+
+    def test_a_feedback_screenshot_reaches_the_note_the_report_reads(self):
+        """9.3: the sidecar stores the image and puts a path on the record; if
+        the daemon does not copy it onto the note, no report can ever cite it."""
+        b = StreamBuilder().start().advance(1000).progress(stops=3, prog=45.0)
+        b.advance(1000).note("white line along the top", source="feedback",
+                             image="/home/rwt/otp-debug-logs/feedback/s1-17885.jpg")
+        watch = self.run_stream(b, finalize=False)
+        note = watch.trips[SESSION].notes[0]
+        self.assertEqual(note["source"], "feedback")
+        self.assertEqual(note["image"],
+                         "/home/rwt/otp-debug-logs/feedback/s1-17885.jpg")
+        self.assertEqual(note["context"]["image"], note["image"])
+
+    def test_a_screenshot_path_is_written_into_the_status_file(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=3, prog=45.0)
+        b.advance(1000).note("see the picture", source="feedback",
+                             image="/home/rwt/otp-debug-logs/feedback/s1-1.jpg")
+        watch = self.run_stream(b, finalize=False)
+        watch.write_status(force=True)
+        text = read_text(os.path.join(self.tmp, "current-ride.md"))
+        self.assertIn("screenshot: `/home/rwt/otp-debug-logs/feedback/s1-1.jpg`",
+                      text)
+
+    def test_the_report_request_carries_the_screenshot_path(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).note("use this menu is too tall", source="feedback",
+                             image="/home/rwt/otp-debug-logs/feedback/s1-2.png")
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        req = json.loads(read_text(report_requests(self.tmp)[0]))
+        self.assertEqual(req["riderNotes"][0]["image"],
+                         "/home/rwt/otp-debug-logs/feedback/s1-2.png")
+
+    def test_extra_fields_on_a_note_record_do_not_choke_the_daemon(self):
+        """The sidecar also writes imageBytes / tripId. The daemon reads named
+        keys only, so a record it does not fully understand must still land."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).note("note with sidecar extras", source="feedback",
+                             image="/tmp/x.jpg", imageBytes=204800,
+                             tripId="trip:MT:12345")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(watch.trips[SESSION].notes), 1)
+        self.assertEqual(watch.trips[SESSION].notes[0]["text"],
+                         "note with sidecar extras")
+
+    def test_a_note_without_an_image_carries_no_image_key(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).note("plain console note")
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("image", watch.trips[SESSION].notes[0])
 
     def test_the_report_request_carries_the_riders_notes(self):
         b = StreamBuilder().start().advance(1000).progress(stops=5)
