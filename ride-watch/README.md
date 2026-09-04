@@ -83,11 +83,13 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `resumed-trip` | a ride that began with no `START_GO_MODE`, so it has no replay fixture | warn (info when it is the daemon that restarted) |
 | `vehicle-match-never` | a transit leg polled >=30 times and the live matcher never named a vehicle | warn |
 | `bike-egress-missing` | a bike+transit search whose transit results all end on foot | warn |
+| `panel-torn-down` | a settings/detail screen unmounted by the rider's own query change (one finding per episode, with the count) | warn |
 | `boot-crash` | the app threw before it could run (`boot-error` / `boot-rejection`) | page |
 | `bundle-health` | the 5s health gate withheld its verdict, so the bundle rolls back | page (info when confirmed) |
 
-The last two are about the **phone**, not a ride, and are the only findings
-here that can fire with no trip open — see *Boot crashes* below.
+`boot-crash` and `bundle-health` are about the **phone**, not a ride — see
+*Boot crashes* below. Those two and `panel-torn-down` are the findings that can
+fire with **no trip open**; everything else in the table needs a live ride.
 
 **`wake-lock-denied` is a warn on purpose, and it is a rule of its own on
 purpose.** The client logs the refusal at `console.warn`
@@ -105,6 +107,32 @@ bursts; a burst is collapsed into one finding once it has been quiet for
 `WAKE_LOCK_BURST_QUIET_MS` (**30s**) or the ride ends, and the finding carries
 the count. The real fix is native — a keep-awake plugin in the Capacitor shell
 — and this rule is what tells a report whether it worked.
+
+**`panel-torn-down` is the first rule here that reads the router.** On
+2026-09-04 the settings tab shipped that morning could not be dragged: every
+slider notch dispatched `setRoutingPreferences` with no options, the replan
+pushed the router, and the `/settings` route unmounted under the rider's thumb
+(otprr `settings-screen.tsx` -> `routing-profiles.ts:64` -> `form.js:81` ->
+`api.js:106`). It happened three times in eight minutes and the ride's report
+carried five records, **all five rider notes** — the rule engine had no way to
+see a screen closing. The signal turns out to be entirely in the ordering: a
+`SET_QUERY_PARAM` carrying a key the *rider* moves (`routingPreferences`,
+`from`, `to`, `time`), then a `@@router/LOCATION_CHANGE` off a panel route
+within `PANEL_TEARDOWN_WINDOW_MS` (**500 ms**; the real gaps were 8, 11 and
+26 ms). The rider deliberately backing out of `/settings` produces an identical
+record — same pathname, and the record's `action` field reads `"POP"` for every
+navigation this app makes, so it carries no information — and is told apart
+solely by there being no query change in the half-second before it. The panel
+set is `webapp-routes.js`'s entries that name their own component, minus the
+two `RedirectWithQuery` routes and the Auth0 callback, where leaving *is* the
+function; the map screen's own routes (`/`, `/route`, `/schedule`, `/nearby`,
+`/trip/:id`) are excluded, or every search run from the stop viewer would fire
+it. It is a `warn` and never a page — the rider is looking straight at the
+screen that vanished — and one episode is one finding, collapsed after
+`PANEL_TEARDOWN_QUIET_MS` (**10 min**) of quiet or at the end of the ride, with
+the count in the text. The state is keyed by **session, not trip**: two of the
+three real teardowns happened before `START_GO_MODE`, so a trip-scoped rule
+would have seen one of three.
 
 Two of those were written on 2026-07-31, after a ride where **every single
 finding was a rider note** — the engine had nothing to say while the app
@@ -705,7 +733,7 @@ states the convention outright.
 python3 ride-watch/test_ride_watch.py
 ```
 
-193 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
+309 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
 (both the firing case and the case that must stay quiet), the state machine, and
 page ranking (supersession inside the window, tie-breaking, flush on a quiet log,
 flush on trip end).
@@ -717,6 +745,9 @@ data does not work:
   page-worthy findings in those eight seconds cost the rider exactly one
   interrupt, the one they get is `stop-count-collapse`, and the two progress
   teleports (17:05, 17:20) are flagged.
+- `TestPanelTornDown.test_the_real_1504_ride_reports_all_three` (9/4) — the
+  three settings teardowns of session `mtndpstb-m2vpey` collapse to one `warn`
+  with `count: 3`, spanning both sides of `START_GO_MODE`, costing no page.
 - `TestNotificationStormReplay` (7/31) — `notification-repeat` fires at
   **11:53:07**, before the rider had to type the complaint by hand, and the 14
   buzzes cost them one finding.

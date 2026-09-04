@@ -277,6 +277,22 @@ class StreamBuilder:
             "legIndex": leg, "distanceFromRoute": dist,
             "progressAlongLeg": 0.1, "isOnRoute": on_route})
 
+    def location(self, pathname, first=False):
+        """A `@@router/LOCATION_CHANGE`, in the shape the real records carry.
+
+        `action` is "POP" because that is what every one of the thirteen
+        LOCATION_CHANGE records in the 09-04 session says — including the
+        three teardowns and the rider's own navigations — which is precisely
+        why the rule does not read it.
+        """
+        return self.action("@@router/LOCATION_CHANGE", {
+            "action": "POP", "isFirstRendering": first,
+            "location": {"hash": "", "pathname": pathname,
+                         "search": "?ui_activeSearch=5pbakifcz"}})
+
+    def query_param(self, payload):
+        return self.action("SET_QUERY_PARAM", payload)
+
     def note(self, text, session=None, source=None):
         """A rider note exactly as the Flask sidecar writes it to the JSONL."""
         rec = {
@@ -4122,6 +4138,279 @@ class TestWakeLockDenied(RuleTestCase):
                          [1788537576819, 1788537911288])
         self.assertEqual({h["context"]["errorName"] for h in hits},
                          {"NotAllowedError"})
+
+
+
+# --- panel-torn-down --------------------------------------------------------
+
+# The 15:04 ride of 2026-09-04, in the same day's log as the wake-lock one.
+# The rider opened the new settings tab three times and was thrown off it
+# three times; the ride's report carried five records and all five were rider
+# notes, because no rule in ride_watch.py read the router at all (Tier 9.5).
+RIDE_M2VPEY_SESSION = "mtndpstb-m2vpey"
+RIDE_M2VPEY_FIRST_MS = 1788552058720   # the mount's own LOCATION_CHANGE
+RIDE_M2VPEY_LAST_MS = 1788552371595    # the last record of the 15:06 teardown
+# LOCATION_CHANGE off /settings at 15:01:34.972, 15:01:41.002 and 15:06:11.587.
+RIDE_M2VPEY_TEARDOWNS = (1788552094972, 1788552101002, 1788552371587)
+
+
+class TestPanelTornDown(RuleTestCase):
+    """9.5: a settings/detail screen torn down by the rider's own edit.
+
+    The mechanism is 9.1 (otprr): the settings screen calls
+    setRoutingPreferences with no options, the replan pushes the router, and
+    the /settings route unmounts mid-drag. This rule does not fix it — it is
+    the watcher finally being able to SEE it, which on 09-04 it could not.
+    """
+
+    def test_a_teardown_inside_a_trip_is_one_warn(self):
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress()
+        b.advance(30 * 1000).location("/settings")
+        b.advance(6 * 1000).query_param(
+            {"routingPreferences": {"bikeSpeed": 5.5}})
+        b.advance(20).location("/")
+        b.advance(2 * 1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "panel-torn-down")
+        self.assertEqual(len(hits), 1, [h["summary"] for h in hits])
+        hit = hits[0]
+        self.assertEqual(hit["severity"], "warn")
+        self.assertEqual(hit["context"]["count"], 1)
+        self.assertEqual(hit["context"]["panelPaths"], ["/settings"])
+        self.assertEqual(hit["context"]["toPaths"], ["/"])
+        self.assertEqual(hit["context"]["queryKeys"], ["routingPreferences"])
+        self.assertEqual(hit["context"]["gapsMs"], [20])
+        self.assertTrue(hit["context"]["duringTrip"])
+        self.assertFalse(hit["context"]["outsideTrip"])
+        self.assertIn("/settings", hit["summary"])
+        self.assertIn("1x", hit["summary"])
+
+    def test_a_teardown_outside_any_trip_still_lands(self):
+        """Two of the three real ones happened before START_GO_MODE. A rule
+        hung off the Trip would have seen one of three."""
+        b = StreamBuilder(device=DEVICE)
+        b.location("/", first=True)
+        b.advance(20 * 1000).location("/settings")
+        b.advance(5 * 1000).query_param(
+            {"routingPreferences": {"bikeSpeed": 5.5}})
+        b.advance(8).location("/")
+        watch = self.run_stream(b)
+        hits = self.find(watch, "panel-torn-down")
+        self.assertEqual(len(hits), 1, [h["summary"] for h in hits])
+        self.assertEqual(watch.trips, {})
+        self.assertTrue(hits[0]["context"]["outsideTrip"])
+        self.assertFalse(hits[0]["context"]["duringTrip"])
+        # ...and it reaches the same per-day ledger the ride under that
+        # session id would have used, so a report can still find it.
+        ledger = os.path.join(self.tmp, "%s-%s.findings.jsonl"
+                              % (ride_watch.fmt_date(hits[0]["tsMs"]), SESSION))
+        self.assertIn("panel-torn-down", read_text(ledger))
+        # Not the "App boot health" section of current-ride.md: a settings
+        # screen closing is not the app failing to start.
+        self.assertEqual(watch.boot_events, [])
+
+    def test_a_burst_across_the_start_of_the_ride_is_one_finding(self):
+        """The 09-04 shape, synthesised: two teardowns on the search form,
+        START_GO_MODE, then a third. One episode, count 3."""
+        b = StreamBuilder(device=DEVICE)
+        b.location("/", first=True)
+        for _ in range(2):
+            b.advance(10 * 1000).location("/settings")
+            b.advance(6 * 1000).query_param(
+                {"routingPreferences": {"bikeSpeed": 5.5}})
+            b.advance(10).location("/")
+        b.advance(3 * 60 * 1000).start()
+        b.advance(1000).progress()
+        b.advance(2 * 60 * 1000).location("/settings")
+        b.advance(7 * 1000).query_param(
+            {"routingPreferences": {"bikeSpeed": 6}})
+        b.advance(26).location("/")
+        b.advance(3 * 1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "panel-torn-down")
+        self.assertEqual(len(hits), 1, [h["summary"] for h in hits])
+        self.assertEqual(hits[0]["context"]["count"], 3)
+        self.assertEqual(hits[0]["context"]["gapsMs"], [10, 10, 26])
+        self.assertTrue(hits[0]["context"]["outsideTrip"])
+        self.assertTrue(hits[0]["context"]["duringTrip"])
+        self.assertIn("3x", hits[0]["summary"])
+        # Filed on the ride it ended inside, so the report request counts it.
+        self.assertEqual(len(watch.ended_trips), 1)
+        self.assertIn("panel-torn-down",
+                      [f["rule"] for f in watch.ended_trips[0].findings])
+
+    def test_a_second_sitting_is_its_own_finding(self):
+        """Beyond PANEL_TEARDOWN_QUIET_MS the rider came back to the screen
+        later; that is a second episode, not a longer one."""
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress()
+        for _ in range(2):
+            b.advance(11 * 60 * 1000).location("/settings")
+            b.advance(4 * 1000).query_param(
+                {"routingPreferences": {"bikeSpeed": 5.5}})
+            b.advance(12).location("/")
+        b.advance(2 * 1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "panel-torn-down")
+        self.assertEqual(len(hits), 2, [h["summary"] for h in hits])
+        self.assertEqual([h["context"]["count"] for h in hits], [1, 1])
+
+    def test_an_ordinary_search_from_the_form_is_silent(self):
+        """The control that matters most: `/` -> SET_QUERY_PARAM -> `/` is
+        every search the app has ever run, and it must never fire."""
+        b = StreamBuilder(device=DEVICE)
+        b.location("/", first=True)
+        b.advance(6 * 1000).query_param({"time": "15:01"})
+        b.advance(900).query_param({"from": {"lat": 44.8, "lon": -93.3},
+                                    "to": {"lat": 44.9, "lon": -93.2},
+                                    "time": "15:01"})
+        b.advance(60).location("/")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "panel-torn-down"), [])
+
+    def test_the_checkbox_path_is_silent(self):
+        """8.9's checkboxes go through setTurnCueDefault, not the routing
+        path: on 09-04 SET_TURN_CUE_DEFAULT fired twice on /settings at
+        15:06:07 and :08 and the screen stayed put. No query change, no
+        navigation, nothing to report."""
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress()
+        b.advance(30 * 1000).location("/settings")
+        b.advance(3 * 1000).action("SET_TURN_CUE_DEFAULT", True)
+        b.advance(1700).action("SET_TURN_CUE_DEFAULT", False)
+        b.advance(60 * 1000).progress()
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "panel-torn-down"), [])
+
+    def test_the_rider_leaving_the_screen_themselves_is_silent(self):
+        """A back-tap off /settings looks identical in the record — same
+        pathname, same "POP" — and is told apart only by there being no query
+        change in the half second before it."""
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress()
+        b.advance(10 * 1000).query_param({"time": "15:01"})
+        b.advance(20 * 1000).location("/settings")
+        b.advance(30 * 1000).location("/")
+        b.advance(60 * 1000).progress()
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "panel-torn-down"), [])
+
+    def test_a_query_key_the_app_owns_is_silent(self):
+        """`wheelchair` is applied from the saved accessibility default
+        (user.js:302), not moved by the rider."""
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress()
+        b.advance(30 * 1000).location("/settings")
+        b.advance(4 * 1000).query_param({"wheelchair": True})
+        b.advance(15).location("/")
+        b.advance(60 * 1000).progress()
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "panel-torn-down"), [])
+
+    def test_going_deeper_into_a_panel_is_not_a_teardown(self):
+        b = StreamBuilder(device=DEVICE)
+        b.location("/places", first=False)
+        b.advance(4 * 1000).query_param({"to": {"lat": 44.9, "lon": -93.2}})
+        b.advance(15).location("/places/new")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "panel-torn-down"), [])
+
+    def test_the_stop_viewer_is_not_a_panel(self):
+        """`/schedule/:id` renders inside the map screen
+        (webapp-routes.js `shouldRenderWebApp: true`), and searching from a
+        stop lands the rider back on `/` by design."""
+        b = StreamBuilder(device=DEVICE)
+        b.location("/schedule/1:56")
+        b.advance(4 * 1000).query_param({"to": {"lat": 44.9, "lon": -93.2}})
+        b.advance(15).location("/")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "panel-torn-down"), [])
+
+    def test_a_slow_navigation_is_not_attributed_to_the_edit(self):
+        """Past PANEL_TEARDOWN_WINDOW_MS the two are unrelated events."""
+        b = StreamBuilder(device=DEVICE)
+        b.location("/settings")
+        b.advance(4 * 1000).query_param(
+            {"routingPreferences": {"bikeSpeed": 6}})
+        b.advance(ride_watch.PANEL_TEARDOWN_WINDOW_MS + 1).location("/")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "panel-torn-down"), [])
+
+    def test_a_summarised_query_payload_still_counts(self):
+        """An oversized SET_QUERY_PARAM reaches the sink as
+        `{"__summary": true, "chars": N, "keys": [...]}` — the key names
+        survive, and the key names are all this rule needs."""
+        b = StreamBuilder(device=DEVICE)
+        b.location("/settings")
+        b.advance(4 * 1000).query_param(
+            {"__summary": True, "chars": 11640,
+             "keys": ["from", "to", "date", "time", "routingPreferences"]})
+        b.advance(12).location("/")
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "panel-torn-down")), 1)
+
+    def test_it_never_costs_the_rider_a_page(self):
+        """The rider is looking straight at the screen that vanished."""
+        b = StreamBuilder(device=DEVICE).start().advance(1000).progress()
+        for _ in range(3):
+            b.advance(30 * 1000).location("/settings")
+            b.advance(4 * 1000).query_param(
+                {"routingPreferences": {"bikeSpeed": 5.5}})
+            b.advance(9).location("/")
+        b.advance(2 * 1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "panel-torn-down")), 1)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0904),
+                         "%s not present" % REAL_LOG_0904)
+    def test_the_real_1504_ride_reports_all_three(self):
+        """Replay the ride's own records. Three teardowns, one finding.
+
+        Against the unfixed daemon this class is the whole of 9.5: every
+        assertion below was zero.
+        """
+        tmp = tempfile.mkdtemp(prefix="ride-watch-panel-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        keep = ("START_GO_MODE", "STOP_GO_MODE", "SET_QUERY_PARAM",
+                "@@router/LOCATION_CHANGE", "SET_TURN_CUE_DEFAULT",
+                "UPDATE_PROGRESS")
+        records = []
+        with open(REAL_LOG_0904) as fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("session") != RIDE_M2VPEY_SESSION:
+                    continue
+                t = obj.get("t") or 0
+                if not (RIDE_M2VPEY_FIRST_MS <= t <= RIDE_M2VPEY_LAST_MS):
+                    continue
+                if obj.get("type") in keep:
+                    records.append(obj)
+        changes = [r for r in records
+                   if r.get("type") == "@@router/LOCATION_CHANGE"]
+        self.assertEqual(len(changes), 13, "the 09-04 session carries 13")
+        for obj in records:
+            watch.process(obj)
+        watch.finalize_replay()
+        hits = self.find(watch, "panel-torn-down")
+        self.assertEqual(len(hits), 1, [h["summary"] for h in hits])
+        hit = hits[0]
+        self.assertEqual(hit["severity"], "warn")
+        self.assertEqual(hit["context"]["count"], 3)
+        self.assertEqual(hit["tsMs"], RIDE_M2VPEY_TEARDOWNS[0])
+        self.assertEqual(hit["context"]["lastMs"], RIDE_M2VPEY_TEARDOWNS[-1])
+        self.assertEqual(hit["context"]["panelPaths"], ["/settings"])
+        self.assertEqual(hit["context"]["toPaths"], ["/"])
+        self.assertEqual(hit["context"]["queryKeys"], ["routingPreferences"])
+        # The synchronous push: 8 ms, 11 ms and 26 ms after the last slider
+        # notch registered — two orders of magnitude inside the 500 ms window.
+        self.assertEqual(hit["context"]["gapsMs"], [8, 11, 26])
+        # Both sides of START_GO_MODE (15:04:04) — which is what says the
+        # defect belongs to the settings screen and not to Go Mode.
+        self.assertTrue(hit["context"]["outsideTrip"])
+        self.assertTrue(hit["context"]["duringTrip"])
+        # ...and it cost the rider none of their two interrupts.
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
 
 
 

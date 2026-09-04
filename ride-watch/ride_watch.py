@@ -366,6 +366,76 @@ WAKE_LOCK_BURST_QUIET_MS = 30 * 1000
 # passed straight through, or a matcher that had not warmed up, stays quiet.
 VEHICLE_MATCH_NEVER_MIN_POLLS = 30
 
+# panel-torn-down. A rider-facing screen that vanishes under the thumb that is
+# using it, because the query change the rider just made pushed the router back
+# to the map. 8.9 shipped the settings tab on the morning of 2026-09-04 and the
+# first rider to touch it could not drag a single slider (Tier 9.1):
+# `settings-screen.tsx:113` onBikeSpeedChange -> `setRoutingPreferences(prefs)`
+# with no options -> `routing-profiles.ts:64` `replan` is true under a live
+# query -> `setQueryParam(next, randId())` -> `form.js:81` `routingQuery()` ->
+# `api.js:106` `dispatch(push(path))` -> the `/settings` route unmounts. It
+# happened three times in one eight-minute session (15:01:34, 15:01:41,
+# 15:06:11 CDT, session mtndpstb-m2vpey) and the ledger said nothing, because
+# no rule in this file reads the router at all.
+#
+# The whole signal is an ordering, and it is available from telemetry alone:
+# a SET_QUERY_PARAM carrying a key the RIDER moves, then a LOCATION_CHANGE off
+# a panel route, inside half a second. The rider deliberately backing out of
+# /settings looks identical EXCEPT that no query change precedes it, which is
+# what makes the window the discriminator rather than a heuristic.
+#
+# Explicitly NOT used as a discriminator: the record's own `action` field.
+# Every one of the thirteen LOCATION_CHANGE records in that session reads
+# "POP", including the three teardowns and the rider's own navigations, so
+# PUSH-vs-POP carries no information here.
+PANEL_TEARDOWN_WINDOW_MS = 500
+# The measured gaps on 09-04 were 8 ms, 11 ms and 26 ms — a `push` dispatched
+# synchronously from the same reducer pass. 500 ms is two orders of magnitude
+# of slack for a slow phone and still far short of any deliberate tap.
+
+# One rider fighting one screen is ONE finding, with the count in its text.
+# The 09-04 episode ran 15:01:34.972 -> 15:06:11.587: 4 m 37 s between the pair
+# on the search form and the one inside Go Mode, all three the same defect on
+# the same tab. A window shorter than that reports it as two unrelated events.
+# Nothing waits on this in practice: _end_trip force-flushes, so a ride's
+# finding is always in the ledger before its report request is written.
+PANEL_TEARDOWN_QUIET_MS = 10 * 60 * 1000
+
+# Query keys a RIDER moves. `routingPreferences` is the settings tab's sliders,
+# `from`/`to` the location fields, `time` the departure picker.
+#
+# Deliberately excluded, because the app sets them for its own reasons and a
+# navigation that follows one is not a screen being taken away: `wheelchair`
+# (user.js:302, applied from the saved accessibility default), `bannedTrips`,
+# `numItineraries` (field-trip.js), and `banned` / `preferred` / `modes` /
+# `routeLock` / `activeProfileId` (route-lock.ts, go-mode.ts). Note that Go
+# Mode's own reroute (go-mode.ts:1357) does dispatch from/to/time/date — but it
+# runs on the map screen, so the "previous location was a panel" gate is what
+# keeps it out, not this list.
+RIDER_QUERY_KEYS = frozenset(("routingPreferences", "from", "to", "time"))
+
+# Routes that are a screen of their own, from otprr lib/util/webapp-routes.js
+# (read at 26ab9817): every entry there that names its own `component` —
+# SettingsScreen, LocalPlacesScreen, LocalPlaceEditorScreen,
+# FavoritePlaceScreen, SavedTripList, SavedTripScreen, UserAccountScreen — plus
+# the two terms pages. Matched by prefix so the `:id` and `:step` children come
+# along.
+#
+# The file's FIRST route entry is deliberately absent: `/`, `/@/:latLonZoom`,
+# `/start/:latLonZoom`, `/route`, `/route/:id`, `/schedule`, `/schedule/:id`,
+# `/nearby`, `/trip/:id` are all `shouldRenderWebApp: true`, i.e. the map
+# screen itself. A query change that moves the rider from `/schedule/:id` to
+# `/` is an ordinary search from the stop viewer, not a panel being torn down,
+# and treating the stop and route viewers as panels would fire this rule on
+# the app's most common flow.
+PANEL_ROUTE_PREFIXES = ("/settings", "/places", "/account",
+                        "/terms-of-service", "/terms-of-storage")
+# ...and three routes under those prefixes where leaving IS the function:
+# `/account` and `/account/create` are RedirectWithQuery entries that exist to
+# send the rider somewhere else, and `/signedin` is the Auth0 callback.
+NOT_A_PANEL_ROUTE = frozenset(("/account", "/account/create", "/signedin"))
+
+
 MAX_PAGES_PER_TRIP = 2
 PUSH_MIN_INTERVAL_MS = 120 * 1000
 # Every push body the rider sees is one bounded line. 120 is the number the
@@ -715,6 +785,20 @@ def notification_key(payload):
     return (ntype, title)
 
 
+def is_panel_route(pathname):
+    """Is this path a rider-facing screen of its own, rather than the map?
+
+    See PANEL_ROUTE_PREFIXES for the derivation and for what is left out.
+    """
+    if not isinstance(pathname, str) or not pathname:
+        return False
+    path = pathname.rstrip("/") or "/"
+    if path in NOT_A_PANEL_ROUTE:
+        return False
+    return any(path == prefix or path.startswith(prefix + "/")
+               for prefix in PANEL_ROUTE_PREFIXES)
+
+
 def leg_is_transit(leg):
     if not isinstance(leg, dict):
         return False
@@ -957,6 +1041,15 @@ class RideWatch:
         # The newest boot findings, for current-ride.md. These have no trip to
         # be listed under; the whole point is that the app never got that far.
         self.boot_events = []
+        # The router and the query, per session, for _rule_panel_torn_down.
+        # Per SESSION and not per Trip on purpose: the settings tab is reached
+        # from the search form as often as from a live ride, and two of the
+        # three teardowns on 2026-09-04 happened before START_GO_MODE existed
+        # — a Trip-scoped rule would have seen one of the three.
+        self.panel_route = {}      # session -> {"pathname", "atMs"}
+        self.rider_query = {}      # session -> {"atMs", "keys"}
+        # session -> an open burst of teardowns; see PANEL_TEARDOWN_QUIET_MS.
+        self.panel_teardowns = {}
         # Intake dedup ring (see RECORD_DEDUP_RING).
         self._seen_records = collections.deque()
         self._seen_record_keys = {}
@@ -1200,6 +1293,14 @@ class RideWatch:
             # one of these fell through and the daemon saw none of it.
             self._rule_stale_alight_candidate(session, t, typ,
                                               obj.get("payload"), trip)
+        elif typ == "SET_QUERY_PARAM":
+            # Above the `trip is not None` chain for the same reason as the
+            # onboard branch: the rider edits the query from the search form
+            # as often as from a live ride, and on 2026-09-04 two of the three
+            # teardowns this feeds happened before START_GO_MODE.
+            self._note_query_param(session, t, obj)
+        elif typ == "@@router/LOCATION_CHANGE":
+            self._rule_panel_torn_down(session, t, obj, trip)
         elif trip is not None:
             if kind == "console":
                 self._rule_console(trip, t, obj)
@@ -1567,15 +1668,19 @@ class RideWatch:
             self._save_state()
 
     def _device_finding(self, session, device, t, rule, severity, summary,
-                        context, trip=None):
+                        context, trip=None, boot_health=True):
         """A finding about the PHONE rather than about a ride.
 
-        The trip-less sibling of _finding. Boot crashes and bundle verdicts
-        happen with no trip to hang on — the app never reached Go Mode, or
+        The trip-less sibling of _finding. Boot crashes, bundle verdicts and
+        a panel torn down from the search form all happen with no trip to
+        hang on — the app never reached Go Mode, or
         never reached anything at all — so the record goes into the same
         per-day, per-session ledger _findings_path would have chosen for a
         ride under that session id. If a ride does open under it later, the
         crash that preceded it is already in the file the report reads.
+
+        `boot_health` is what separates the two kinds: only a finding about
+        the app failing to START belongs in current-ride.md's boot section.
 
         When a trip IS live (a crash on a mid-ride re-mount) the finding is
         filed on that trip and pushed to its thread as well — but never into
@@ -1588,8 +1693,13 @@ class RideWatch:
             "summary": summary, "context": context,
         }
         self.all_findings.append(finding)
-        self.boot_events.append(finding)
-        del self.boot_events[:-BOOT_EVENT_RING]
+        if boot_health:
+            # `boot_health=False` for a finding that has no trip to hang on
+            # but is not about the app failing to START (panel-torn-down is
+            # the first): current-ride.md's "App boot health" section would
+            # otherwise report a settings screen closing as a boot problem.
+            self.boot_events.append(finding)
+            del self.boot_events[:-BOOT_EVENT_RING]
         self.log.info("FINDING [%s/%s] %s %s"
                       % (severity, rule, fmt_hms(t), summary))
         if trip is not None:
@@ -1939,6 +2049,13 @@ class RideWatch:
         # ...and a refusal burst still inside its quiet window: the ride ending
         # is the end of that launch by definition.
         self._flush_wake_lock(trip, t, force=True)
+        # ...and any panel the rider was fighting with. Before the deletion
+        # loop below, so the burst is still filed on this ride rather than
+        # landing trip-less in the ledger after the report request quoted
+        # len(trip.findings). Every session key this trip answers to, because
+        # an adopted continuation carries the burst under its own id.
+        for key in [s for s, tr in self.trips.items() if tr is trip]:
+            self._flush_panel_teardown(key, t, force=True)
         # Flush first: a page must not be lost because the trip ended three
         # seconds into its coalescing window.
         self._flush_pages(trip, t, force=True)
@@ -2221,6 +2338,12 @@ class RideWatch:
         # phone that has gone home and stopped talking still gets its deadline
         # checked.
         self._check_report_deadlines(now)
+        # Outside the loop as well, and for a stronger reason: a panel
+        # teardown burst is keyed by session and can be open with no trip
+        # behind it at all (the rider on the settings tab from the search
+        # form). The 5 s live tick is the only thing that can tell us the
+        # rider has stopped fighting the screen.
+        self._flush_panel_teardowns(now)
         # ...and the same is true of a console whose ride is over: the reap it
         # is waiting out is not attached to any live trip either.
         self._reap_due_threads(now)
@@ -3149,6 +3272,140 @@ class RideWatch:
              "launchesDeniedThisRide": trip.wake_lock_bursts,
              "bundle": trip.bundle,
              "native": trip.bundle_native})
+
+    # -- the screen under the rider's thumb ---------------------------------
+
+    @staticmethod
+    def _query_param_keys(payload):
+        """Which query keys a SET_QUERY_PARAM touched.
+
+        Handles the sink's oversized-payload form,
+        `{"__summary": true, "chars": N, "keys": [...]}` — the key NAMES
+        survive summarisation and the key names are all this rule reads. Every
+        other rule in this file bails on `__summary` because it needs values;
+        this one does not have to.
+        """
+        if not isinstance(payload, dict):
+            return set()
+        if payload.get("__summary"):
+            keys = payload.get("keys")
+            if not isinstance(keys, list):
+                return set()
+            return set(k for k in keys if isinstance(k, str))
+        return set(k for k in payload.keys() if isinstance(k, str))
+
+    def _note_query_param(self, session, t, obj):
+        """Remember the last query change the RIDER made, per session."""
+        hit = sorted(self._query_param_keys(obj.get("payload"))
+                     & RIDER_QUERY_KEYS)
+        if not hit:
+            return
+        self.rider_query[session] = {"atMs": int(t), "keys": hit}
+        self._mark_dirty()
+
+    def _rule_panel_torn_down(self, session, t, obj, trip):
+        """A settings/detail screen unmounted by the rider's own query change.
+
+        `warn`, never a page. The rider is looking straight at it — they do
+        not need to be told, and a ride has MAX_PAGES_PER_TRIP interrupts to
+        spend on things they cannot already see. What they need is for it to
+        reach the ledger, which on 2026-09-04 it did not: the ride's report
+        carried five records and every one of them was a rider note.
+
+        Deduped to one finding per episode (PANEL_TEARDOWN_QUIET_MS), with the
+        count in the text, on the wake-lock pattern: the number of times the
+        screen threw the rider out is the measurement, and it is not known
+        until the rider gives up.
+        """
+        payload = obj.get("payload") or {}
+        location = payload.get("location") or {}
+        path = location.get("pathname")
+        if not isinstance(path, str) or not path:
+            return
+        prev = self.panel_route.get(session)
+        self.panel_route[session] = {"pathname": path, "atMs": int(t)}
+        # The mount's own LOCATION_CHANGE describes where the app started, not
+        # a navigation, and there is nothing before it to have been left.
+        if payload.get("isFirstRendering") or prev is None:
+            return
+        if not is_panel_route(prev["pathname"]):
+            return
+        # /places -> /places/new is the rider going deeper into the same
+        # surface, not losing it.
+        if is_panel_route(path):
+            return
+        q = self.rider_query.get(session)
+        if q is None:
+            return
+        gap = int(t) - q["atMs"]
+        if gap < 0 or gap > PANEL_TEARDOWN_WINDOW_MS:
+            return
+        burst = self.panel_teardowns.get(session)
+        if (burst is not None
+                and int(t) - burst["lastMs"] <= PANEL_TEARDOWN_QUIET_MS):
+            burst["lastMs"] = int(t)
+            burst["count"] += 1
+        else:
+            # An episode that was still open belongs to an earlier sitting;
+            # close it before opening this one or its count folds into this.
+            self._flush_panel_teardown(session, t, force=True)
+            burst = {"firstMs": int(t), "lastMs": int(t), "count": 1,
+                     "panels": [], "dests": [], "keys": [], "gapsMs": [],
+                     "device": None, "duringTrip": False,
+                     "outsideTrip": False}
+            self.panel_teardowns[session] = burst
+        for bucket, value in (("panels", prev["pathname"]),
+                              ("dests", path)):
+            if value not in burst[bucket]:
+                burst[bucket].append(value)
+        # One entry per occurrence, not a set: the gaps ARE the evidence that
+        # the navigation is synchronous with the query change, and collapsing
+        # three identical 8 ms gaps into one would hide two of them.
+        burst["gapsMs"].append(gap)
+        for key in q["keys"]:
+            if key not in burst["keys"]:
+                burst["keys"].append(key)
+        burst["device"] = burst["device"] or obj.get("device")
+        if trip is None:
+            burst["outsideTrip"] = True
+        else:
+            burst["duringTrip"] = True
+        self._mark_dirty()
+
+    def _flush_panel_teardowns(self, now):
+        for session in list(self.panel_teardowns):
+            self._flush_panel_teardown(session, now)
+
+    def _flush_panel_teardown(self, session, now, force=False):
+        """Emit the episode once the rider has stopped being thrown out."""
+        burst = self.panel_teardowns.get(session)
+        if burst is None:
+            return
+        if not force and now - burst["lastMs"] <= PANEL_TEARDOWN_QUIET_MS:
+            return
+        del self.panel_teardowns[session]
+        trip = self.trips.get(session)
+        panels = ", ".join(burst["panels"])
+        summary = ("%s closed itself %dx under the rider — a %s change made on "
+                   "the screen navigated to %s within %d ms"
+                   % (panels, burst["count"], "/".join(burst["keys"]),
+                      ", ".join(burst["dests"]), max(burst["gapsMs"])))
+        self._device_finding(
+            session, burst["device"], burst["firstMs"], "panel-torn-down",
+            "warn", summary,
+            {"count": burst["count"],
+             "panelPaths": burst["panels"],
+             "toPaths": burst["dests"],
+             "queryKeys": burst["keys"],
+             "gapsMs": burst["gapsMs"],
+             "firstMs": burst["firstMs"],
+             "lastMs": burst["lastMs"],
+             # Which side of START_GO_MODE this happened on. Both, on 09-04 —
+             # and that is the fact that says the defect is the screen's, not
+             # Go Mode's.
+             "duringTrip": burst["duringTrip"],
+             "outsideTrip": burst["outsideTrip"]},
+            trip=trip, boot_health=False)
 
     # -- rider notes --------------------------------------------------------
 
@@ -4235,6 +4492,11 @@ class RideWatch:
         """End any still-active trips at replay EOF."""
         for trip in self._active_trips():
             self._end_trip(trip, trip.last_event_ms, "replay-eof")
+        # Bursts that never had a trip to be closed by. EOF is the end of the
+        # quiet window by definition; without this a replay of a rider who
+        # only ever touched the settings tab would emit nothing.
+        for session in list(self.panel_teardowns):
+            self._flush_panel_teardown(session, self.now_ms(), force=True)
         self.write_status(force=True)
 
 
