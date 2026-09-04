@@ -3982,5 +3982,148 @@ class TestBundleBookkeeping(BootTestCase):
         self.assertEqual(len(self.suppressed(restarted, "device-budget")), 1)
 
 
+# --- wake-lock-denied -------------------------------------------------------
+
+REAL_LOG_0904 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-04.jsonl")
+# The 2026-09-04 ride, session mtn4ui3s-xfjx8m: START_GO_MODE at 10:52:51 and
+# the last of the four refusals at 11:05:16.
+RIDE_0904_SESSION = "mtn4ui3s-xfjx8m"
+RIDE_0904_START_MS = 1788537171672
+RIDE_0904_LAST_WAKE_MS = 1788537916290
+
+# Verbatim from ~/otp-debug-logs/debug-2026-09-04.jsonl (entry
+# mtn4ui3s-xfjx8m.mtn53eer-6ssi0g-h). The DOMException is its own array
+# element, already serialised by the client's console shim, which is why the
+# rule matches a prefix on args[0] and reads name/message off args[1].
+WAKE_LOCK_ARGS = ["Wake lock request failed:",
+                  {"message": "Permission was denied",
+                   "name": "NotAllowedError", "stack": ""}]
+
+
+class TestWakeLockDenied(RuleTestCase):
+    """8.8: the screen wake lock is refused on every launch inside WKWebView.
+
+    Three rides carry it (2026-08-31, and 2026-09-04 four times) and not one
+    of them reached its report with a finding, because `_rule_console` reads
+    `level == "error"` and the client logs this at `warn`. A rider whose
+    screen sleeps mid-navigation loses the map and the turn cards.
+    """
+
+    def test_one_launch_of_refusals_is_one_warn_finding(self):
+        """The real spacing: two denials 5 s apart, then 5 m 35 s, then two more.
+
+        1788537576819 / 1788537581821 (the 10:59:36 relaunch) and
+        1788537911288 / 1788537916290 (the 11:05:11 one). Two launches, two
+        findings, two denials each — not four findings, and not one.
+        """
+        b = StreamBuilder().start().advance(1000).progress()
+        b.advance(60 * 1000).console("warn", WAKE_LOCK_ARGS)
+        b.advance(5 * 1000).console("warn", WAKE_LOCK_ARGS)
+        b.advance(5 * 60 * 1000 + 35 * 1000).console("warn", WAKE_LOCK_ARGS)
+        b.advance(5 * 1000).console("warn", WAKE_LOCK_ARGS)
+        b.advance(60 * 1000).progress()
+        watch = self.run_stream(b)
+        hits = self.find(watch, "wake-lock-denied")
+        self.assertEqual(len(hits), 2, [h["summary"] for h in hits])
+        for hit in hits:
+            self.assertEqual(hit["severity"], "warn")
+            self.assertEqual(hit["context"]["count"], 2)
+            self.assertEqual(hit["context"]["errorName"], "NotAllowedError")
+            self.assertEqual(hit["context"]["errorMessage"],
+                             "Permission was denied")
+            self.assertIn("2x", hit["summary"])
+            self.assertIn("NotAllowedError", hit["summary"])
+        self.assertEqual([h["context"]["launchesDeniedThisRide"] for h in hits],
+                         [1, 2])
+
+    def test_the_whole_retry_ladder_is_still_one_finding(self):
+        """otprr retries 4 times, 5 s apart, per return to visibility.
+
+        Five warns out of one launch must not be five findings; the count is
+        what says how hard the shell refused.
+        """
+        b = StreamBuilder().start().advance(1000).progress()
+        b.advance(60 * 1000).console("warn", WAKE_LOCK_ARGS)
+        for _ in range(4):
+            b.advance(5 * 1000).console("warn", WAKE_LOCK_ARGS)
+        b.advance(60 * 1000).progress()
+        watch = self.run_stream(b)
+        hits = self.find(watch, "wake-lock-denied")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["context"]["count"], 5)
+
+    def test_a_refusal_at_the_very_end_of_a_ride_still_lands(self):
+        """The burst is emitted when it goes quiet — and a ride ending is
+        quiet. Without the force-flush in _end_trip the last launch's
+        refusals would die with the trip."""
+        b = StreamBuilder().start().advance(1000).progress()
+        b.advance(60 * 1000).console("warn", WAKE_LOCK_ARGS)
+        b.advance(2 * 1000).stop()
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "wake-lock-denied")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["context"]["count"], 1)
+
+    def test_a_ride_without_the_warn_is_silent(self):
+        """The control. Ordinary console traffic — a warn that is not this
+        one, and an error that is — must not produce a wake-lock finding."""
+        b = StreamBuilder().start().advance(1000).progress()
+        b.advance(1000).console("warn", ["Deprecation: something upstream"])
+        b.advance(1000).console("error", ["boom happened"])
+        b.advance(60 * 1000).progress()
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "wake-lock-denied"), [])
+
+    def test_the_refusal_never_costs_the_rider_a_page(self):
+        """warn, not page: it fires on every iOS launch, and a ride has two
+        interrupts to spend on things the rider can act on this minute."""
+        b = StreamBuilder().start().advance(1000).progress()
+        for _ in range(3):
+            b.advance(60 * 1000).console("warn", WAKE_LOCK_ARGS)
+        b.advance(60 * 1000).progress()
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "wake-lock-denied")), 3)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0904),
+                         "%s not present" % REAL_LOG_0904)
+    def test_the_real_0904_ride_fires_once_per_relaunch(self):
+        """Replay the ride's own records: one finding per relaunch, two each."""
+        tmp = tempfile.mkdtemp(prefix="ride-watch-wakelock-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        records = []
+        with open(REAL_LOG_0904) as fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("session") != RIDE_0904_SESSION:
+                    continue
+                t = obj.get("t") or 0
+                if not (RIDE_0904_START_MS <= t <= RIDE_0904_LAST_WAKE_MS):
+                    continue
+                if (obj.get("type") == "START_GO_MODE"
+                        or obj.get("kind") == "console"):
+                    records.append(obj)
+        warns = [r for r in records
+                 if r.get("level") == "warn"
+                 and (r.get("args") or [""])[0] == "Wake lock request failed:"]
+        self.assertEqual(len(warns), 4, "the 09-04 log should carry four")
+        for obj in records:
+            watch.process(obj)
+        watch.finalize_replay()
+        hits = self.find(watch, "wake-lock-denied")
+        self.assertEqual(len(hits), 2, [h["summary"] for h in hits])
+        self.assertEqual([h["context"]["count"] for h in hits], [2, 2])
+        self.assertEqual([h["tsMs"] for h in hits],
+                         [1788537576819, 1788537911288])
+        self.assertEqual({h["context"]["errorName"] for h in hits},
+                         {"NotAllowedError"})
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
