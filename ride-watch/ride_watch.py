@@ -3475,6 +3475,18 @@ class RideWatch:
         context["source"] = source
         note = {"tsMs": int(t), "time": fmt_hms(t), "text": text,
                 "source": source, "context": context}
+        # A screenshot from the in-app "Share feedback" screen. The sidecar
+        # writes the bytes under ~/otp-debug-logs/feedback/ and puts only the
+        # path in the record (preferences_api.py _store_feedback_image), so this
+        # is a filename to cite, never an attachment to carry. It has to reach
+        # `riderNotes` explicitly: the report agent reads that list, and a path
+        # left in the raw log line is a path no report ever mentions — which is
+        # the whole of backlog 9.3, where the one screenshot of the 2026-09-04
+        # ride reached the record only because it was handed over by hand.
+        image = obj.get("image")
+        if isinstance(image, str) and image.strip():
+            note["image"] = image.strip()[:512]
+            context["image"] = note["image"]
         trip.notes.append(note)
         # The finding is what reaches the ride thread (see _finding), so the
         # note is answered in the conversation the rider is already reading —
@@ -4056,6 +4068,8 @@ class RideWatch:
                 note["time"], one_line(note["text"]),
                 fmt_pct(c.get("legProgressPct")), c.get("legIndex"),
                 c.get("status"), c.get("stopsRemaining")))
+            if note.get("image"):
+                L.append("  - screenshot: `%s`" % note["image"])
         if not trip.notes:
             L.append("- (none)")
         L.append("")
@@ -4437,6 +4451,8 @@ class RideWatch:
                         where += ", %s" % c["status"]
                     section.append("- %s — %s  _(%s)_" % (
                         note["time"], note["text"], where))
+                    if note.get("image"):
+                        section.append("  - screenshot: `%s`" % note["image"])
                 section.append("")
             if trip.findings:
                 section.append("### Findings (%d, newest first)" % len(trip.findings))
