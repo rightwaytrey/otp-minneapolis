@@ -230,6 +230,27 @@
         proxy_send_timeout 120s;
     }
 
+    # The dev channel's download route (backlog 11.1, 2026-09-05): the prefs
+    # API serves a second bundle store to the "TransitNav Dev" app
+    # (org.rightwaytrey.transitnav.dev) from ~/app-bundles-dev, offered at
+    # /api/app-bundle-dev/<version>. A separate location because the
+    # /api/app-bundle/ prefix above does not cover it — without this block the
+    # download fell through to the SPA catch-all and its Basic Auth (the 401
+    # deployment/verify-server.sh:147 exists to catch). Same settings as the
+    # production route; its own rate-limit bucket comes for free.
+    location /api/app-bundle-dev/ {
+        auth_basic off;
+        limit_req zone=otp_api burst=10 nodelay;
+
+        proxy_pass http://127.0.0.1:8092;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+
     # Ride console (the /ride page below) -> Flask (127.0.0.1:8092).
     # /api/ride-note appends the rider's typed note to the same daily JSONL as
     # the telemetry, so ride-watch reads it in stream order and can pin it to
