@@ -299,64 +299,40 @@
         add_header Cache-Control "no-cache";
     }
 
-    # --- Geocoding: Stadia Maps (hosted Pelias), BOTH HOSTS ------------------
-    # Until 2026-09-04 this was the server variant only, and the desktop kept a
-    # local Pelias on :4000 as the house variant. That stack (Elasticsearch
-    # ~1.9 GiB resident + libpostal ~1.8 GiB for a 964 MB index) was stopped at
-    # the Linode cutover and nobody noticed for ten days: the dev app's address
-    # search 502'd while the config-parity check passed (backlog 9.8). The house
-    # lane exists to behave like production, so it now takes the same upstream;
-    # the containers stay on disk as the rollback deployment/README.md describes
-    # (start them and point this location back at http://127.0.0.1:4000/).
+    # --- Geocoding: the desktop's Pelias, BOTH HOSTS ---------------------------
+    # 2026-09-05: the Stadia Professional trial ends 2026-09-08 and the free tier
+    # keeps neither forward nor reverse geocoding (backlog 9.9), so the geocoder
+    # is the local Pelias on the desktop again (68 GB corpus, pelias/ compose,
+    # ~4 GB resident) — for BOTH hosts. The house proxies straight to the
+    # container; the server proxies over the tailnet to the HOUSE'S nginx on
+    # :9966 (TLS, rate-limited, already reachable), not to :4000 directly, so
+    # nothing new is opened on the desktop and the container stays bound to
+    # 127.0.0.1. Cost: production address search depends on the desktop being
+    # up. The Stadia variant (regex capture -> api.stadiamaps.com with the key
+    # injected server-side) is in git history at 3abb37c if it is ever paid for.
     #
-    # Stadia's geocoder is built on Pelias over OSM + OpenAddresses + Foursquare,
-    # so this is a change of upstream, not of API. Measured before the swap on 25
-    # addresses sampled from the same OpenAddresses layer the local index uses:
-    # Stadia 25/25 exact, local Pelias 25/25 exact, every match within metres.
-    # (Public Photon, the other candidate, managed 9/25 — it is OSM-only, and
-    # OpenAddresses is exactly what supplies suburban house numbers. Misses ran
-    # to 4.8 km, which silently plans a different trip.)
-    #
-    # The path MUST stay /pelias/v1/* — docs/API-COMPAT.md rules 1-3 require it
-    # to keep working for every already-shipped TestFlight build, and it is what
-    # lets this whole migration happen with no app rebuild. Stadia serves the
-    # same routes under /geocoding/v1/*, so the capture below re-prefixes them:
-    #   /pelias/v1/autocomplete  ->  /geocoding/v1/autocomplete
-    # (Verified: /geocoding/v1/autocomplete = 200, /v1/autocomplete = 404.)
-    #
-    # CORS is left entirely to the upstream, same rule as the local Pelias had:
-    # Stadia already returns "access-control-allow-origin: *" and answers the
-    # preflight with 204. Adding our own here would DUPLICATE the header and
-    # browsers reject that outright.
-    #
-    # The API key is injected here, server-side, so it never reaches the phone.
-    # Its placeholder below is filled from deployment/.env at render time; the
-    # value set in deployment/env/prod.env declares it SECRET, which is what
-    # makes a real key impossible to commit here.
-    #
-    # A regex location is needed to capture the path; it also takes precedence
-    # over the "/" prefix location below, so the app bundle never swallows it.
-    # proxy_pass to a name in a variable needs an explicit resolver.
-    location ~ ^/pelias/(?<geo_path>.*)$ {
+    # The path MUST stay /pelias/v1/* (docs/API-COMPAT.md rules 1-3). A
+    # trailing-slash proxy_pass strips the matched "/pelias/" prefix, so the
+    # house forwards "/v1/autocomplete" to pelias-api and the server forwards
+    # "/pelias/v1/autocomplete" to the house. Pelias emits its own CORS headers
+    # (ACAO *, answers OPTIONS); adding ours here would duplicate them.
+    # Upstream is a literal, not a variable, so no resolver is needed and the
+    # server's copy uses the desktop's tailnet IP rather than a MagicDNS name
+    # that may not resolve when nginx starts at boot.
+    location /pelias/ {
         auth_basic off;
         limit_req zone=otp_api burst=20 nodelay;
-
-        resolver 127.0.0.53 valid=300s;
-        resolver_timeout 5s;
-
-        set $geo_args "api_key=__STADIA_API_KEY__";
-        if ($args) { set $geo_args "$args&api_key=__STADIA_API_KEY__"; }
-
-        proxy_pass https://api.stadiamaps.com/geocoding/$geo_path?$geo_args;
-        proxy_ssl_server_name on;
+        proxy_pass __PELIAS_UPSTREAM__;
         proxy_http_version 1.1;
-        proxy_set_header Host api.stadiamaps.com;
-        # Do not forward the client's Origin/Referer: the key is ours, and the
-        # free tier is scoped to this account rather than to a browser origin.
-        proxy_set_header Origin "";
-        proxy_set_header Referer "";
-        proxy_set_header Accept-Encoding "";
+        proxy_ssl_server_name on;
+        proxy_ssl_name __PELIAS_HOST__;
+        proxy_set_header Host __PELIAS_HOST__;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 15s;
     }
+
 #@if house
     # --- Desktop-only proxies -------------------------------------------------
     # Two proxies the server deliberately does not have. See the #@one-sided
