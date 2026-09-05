@@ -17,8 +17,6 @@
 # renders in only some environments. An undeclared one-sided location fails
 # `render-nginx.py --check`, which is what replaced check-nginx-parity.py.
 #
-#@one-sided ~ ^/pelias/(?<geo_path>.*)$ :: prod only. The Linode has no local Pelias (Elasticsearch alone did not fit a 4 GB box), so geocoding is proxied to Stadia; a regex capture is what lets the /pelias/v1/* contract survive that (docs/API-COMPAT.md rules 1-3).
-#@one-sided /pelias/ :: house only. rwtpc4 runs a real Pelias on :4000, so the plain prefix proxy is enough.
 #@one-sided /photon/api :: house only. Photon geocoder fallback the frontend stopped using in Jan 2026; the server never proxies komoot.io.
 #@one-sided /delivery/api :: house only. The groupdelivery FastAPI on :8000 — an unrelated project that lives on the desktop.
     # --- Access control: whole site locked; only credentialed users get in. ---
@@ -301,11 +299,15 @@
         add_header Cache-Control "no-cache";
     }
 
-#@if prod
-    # --- Geocoding: Stadia Maps (hosted Pelias) ------------------------------
-    # SERVER VARIANT. The desktop runs a local Pelias on :4000; this box does
-    # not, and that is what makes a 4 GB Linode enough — Elasticsearch alone was
-    # 1.6 GiB resident (732 MB of heap inside a 2 GB ceiling) for a 964 MB index.
+    # --- Geocoding: Stadia Maps (hosted Pelias), BOTH HOSTS ------------------
+    # Until 2026-09-04 this was the server variant only, and the desktop kept a
+    # local Pelias on :4000 as the house variant. That stack (Elasticsearch
+    # ~1.9 GiB resident + libpostal ~1.8 GiB for a 964 MB index) was stopped at
+    # the Linode cutover and nobody noticed for ten days: the dev app's address
+    # search 502'd while the config-parity check passed (backlog 9.8). The house
+    # lane exists to behave like production, so it now takes the same upstream;
+    # the containers stay on disk as the rollback deployment/README.md describes
+    # (start them and point this location back at http://127.0.0.1:4000/).
     #
     # Stadia's geocoder is built on Pelias over OSM + OpenAddresses + Foursquare,
     # so this is a change of upstream, not of API. Measured before the swap on 25
@@ -355,11 +357,10 @@
         proxy_set_header Referer "";
         proxy_set_header Accept-Encoding "";
     }
-#@else
-    # --- Geocoding: local Pelias (HOUSE VARIANT) -----------------------------
-    # rwtpc4 runs the real thing on :4000, plus two desktop-only proxies the
-    # server deliberately does not have. See the #@one-sided declarations in the
-    # header for why each is one-sided.
+#@if house
+    # --- Desktop-only proxies -------------------------------------------------
+    # Two proxies the server deliberately does not have. See the #@one-sided
+    # declarations in the header for why each is one-sided.
     # Proxy Geocoder API to avoid CORS issues
     # PhotonGeocoder sends requests to /photon/api (baseUrl + "/api")
     # Use variable-based proxy_pass to avoid DNS resolution at startup
@@ -388,28 +389,6 @@
         if ($request_method = 'OPTIONS') {
             return 204;
         }
-    }
-
-    # Proxy Pelias Geocoder API.
-    # The frontend (baseUrl: /pelias/v1) requests /pelias/v1/autocomplete etc.
-    # A trailing-slash proxy_pass strips the matched "/pelias/" prefix and forwards
-    # "/v1/autocomplete" to pelias-api. (A bare "rewrite ... ; proxy_pass http://host;"
-    # is silently IGNORED by nginx, which is why this used to 404 with /pelias/ intact.)
-    # 127.0.0.1, not "localhost": the backend is IPv4-only.
-    # PUBLIC (rate-limited): geocoding for the native app, cross-origin. Pelias
-    # emits its own CORS headers (ACAO *, handles OPTIONS) — the add_header trio
-    # that used to live here would DUPLICATE them on proxied responses and make
-    # browsers reject the response, so CORS is left entirely to the upstream.
-    location /pelias/ {
-        auth_basic off;
-        limit_req zone=otp_api burst=20 nodelay;
-
-        proxy_pass http://127.0.0.1:4000/;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     # Group Delivery API - proxy to FastAPI backend on port 8000
