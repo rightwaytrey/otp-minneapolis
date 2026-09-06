@@ -271,21 +271,29 @@
     # (127.0.0.1). On the Linode they proxy back to the DESKTOP over Tailscale:
     # ride-watch stays on rwtpc4 (it drives tmux and the claude CLI under the
     # user's login), and /api/ride-note and /api/ride-status read and write the
-    # daemon's files, so they have to resolve where the daemon actually is. The
-    # tailnet gate above is unchanged and still does the real work.
+    # daemon's files, so they have to resolve where the daemon actually is.
+    #
+    # 2026-09-06 (backlog 9.10): /api/ride-note is OPEN, not tailnet-gated. Since
+    # 9.3 it is also the in-app "Share feedback" screen, which the rider uses from
+    # CELLULAR — and the 7/29 "every event came over the tailnet" premise stopped
+    # being true when the split-DNS route was removed (9.6/11.4): the phone's
+    # posts now arrive from its public address. The gate turned every report
+    # into a 403 the phone held forever ("Saved. It will send the next time…"),
+    # and the 4k cap, sized for the /ride console typing a sentence, refused
+    # even a text-only report. It is a WRITE, rate-limited here (otp_log, like
+    # /api/debug-log) and again in Flask (RIDE_NOTE_RATE_LIMIT_PER_MIN); the
+    # body cap is the 1536k rung of the 2.1 ladder. The READ, /api/ride-status,
+    # keeps the tailnet gate below: that one hands out the rider's location.
     location /api/ride-note {
         auth_basic off;
-        allow 100.64.0.0/10;
-        allow 127.0.0.1;
-        deny all;
-        limit_req zone=otp_ai burst=10 nodelay;
+        limit_req zone=otp_log burst=20 nodelay;
 
         proxy_pass http://__RIDE_UPSTREAM__:8092;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        client_max_body_size 4k;
+        client_max_body_size 1536k;
     }
 
     location /api/ride-status {
