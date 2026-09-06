@@ -67,7 +67,8 @@ def main():
                     with open(LOCAL_DIR / f"debug-{date}.jsonl", "ab") as f:
                         f.write(chunk[:cut])
                     offset_path(date).write_text(str(offset + cut))
-                    print(f"{time.strftime('%H:%M:%S')} +{chunk[:cut].count(b'\n')} lines ({date})", flush=True)
+                    added = chunk[:cut].count(b"\n")
+                    print(f"{time.strftime('%H:%M:%S')} +{added} lines ({date})", flush=True)
         except Exception as exc:  # noqa: BLE001 — keep following no matter what
             print(f"{time.strftime('%H:%M:%S')} mirror error: {exc}", flush=True)
             time.sleep(15)
