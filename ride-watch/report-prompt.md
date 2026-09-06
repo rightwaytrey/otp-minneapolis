@@ -199,10 +199,13 @@ the backlog, below.
 
 After the report is written, add its actionable findings to the one ordered backlog,
 `~/.claude/plans/please-make-a-centralized-sharded-petal.md`. That file is the only
-place open TransitNav work is tracked, across all four repos.
+place open TransitNav work is tracked, across all four repos, and it holds **open rows
+only** — closed rows, the Session index and the history are in
+`~/.claude/plans/transitnav-backlog-record.md` beside it. Dedupe against BOTH: a
+recurrence of a closed row reopens it (move it back with the new sighting).
 
-1. **Read the existing tiers first, and dedupe.** If a finding recurs, do **not** open
-   a new row — add the observation to that tier's dedupe list against the existing
+1. **Read the existing tiers first (backlog, then the record), and dedupe.** If a
+   finding recurs, do **not** open a new row — add the observation against the existing
    item number and say it is now the Nth sighting. A recurrence outranks a novelty.
 2. Open one new tier for the ride:
    `## Tier N — <what these findings share> *(opened <date>, all OPEN)*`, with a
@@ -211,9 +214,9 @@ place open TransitNav work is tracked, across all four repos.
 3. One row per finding: `N.M`, a **bolded one-line finding**, and a Note carrying the
    evidence you already gathered — action types, timestamps, real numbers, `file:line`.
    Link the report rather than restating it.
-4. Add each row to the **Session index** table, naming the repo the fix lands in.
-   Add a **Sequencing constraints** line when one finding is downstream of another.
-   Add a bullet to **"OPEN, and this is the whole list"** for the new tier.
+4. Name the repo the fix lands in on each row, and whether it needs a deploy, an OTA
+   or a store build. Add a **Sequencing** note when one finding is downstream of
+   another. Add the new rows to the **"Open — N rows"** list at the top and bump N.
 5. Say what you **ruled out**. Never delete or rewrite an existing row that is not
    yours; mark, do not remove.
 
