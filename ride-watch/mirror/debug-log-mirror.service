@@ -1,0 +1,11 @@
+[Unit]
+Description=Mirror the Linode debug-log sink into ~/otp-debug-logs for ride-watch
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/rwt/projects/otp-minneapolis/ride-watch/mirror/debug_log_mirror.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
