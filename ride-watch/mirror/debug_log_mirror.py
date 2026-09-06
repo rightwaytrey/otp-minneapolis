@@ -29,6 +29,11 @@ HOST = os.environ.get("MIRROR_HOST", "rwt@100.126.171.72")
 REMOTE_DIR = os.environ.get("MIRROR_REMOTE_DIR", "otp-debug-logs")
 LOCAL_DIR = pathlib.Path(os.environ.get("MIRROR_LOCAL_DIR", str(pathlib.Path.home() / "otp-debug-logs")))
 POLL_S = float(os.environ.get("MIRROR_POLL_S", "5"))
+# The in-app feedback screenshots (backlog 9.3) land on the Linode too; they are
+# small and few, so an rsync once a minute keeps the daemon's report agent able
+# to open them locally (backlog 11.5). --ignore-existing: an image is never
+# rewritten, so this can never clobber one already mirrored.
+FEEDBACK_EVERY_S = float(os.environ.get("MIRROR_FEEDBACK_EVERY_S", "60"))
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", HOST]
 
 
@@ -57,10 +62,33 @@ def fetch(date, offset):
     return out.stdout
 
 
+def mirror_feedback():
+    """rsync the remote feedback/ images into the local sink, if the dir exists."""
+    local = LOCAL_DIR / "feedback"
+    local.mkdir(parents=True, exist_ok=True)
+    cmd = ["rsync", "-a", "--ignore-existing", "-e", " ".join(SSH[:-1]),
+           f"{HOST}:{REMOTE_DIR}/feedback/", str(local) + "/"]
+    res = subprocess.run(cmd, capture_output=True, timeout=120)
+    if res.returncode == 0:
+        return
+    err = res.stderr.decode(errors="replace").strip()
+    # A remote dir that does not exist yet is not an error worth a line per minute.
+    if "No such file or directory" in err:
+        return
+    print(f"{time.strftime('%H:%M:%S')} feedback rsync rc={res.returncode}: {err[:200]}", flush=True)
+
+
 def main():
     LOCAL_DIR.mkdir(parents=True, exist_ok=True)
     print(f"mirror: {HOST}:{REMOTE_DIR} -> {LOCAL_DIR}", flush=True)
+    last_feedback = 0.0
     while True:
+        if time.monotonic() - last_feedback >= FEEDBACK_EVERY_S:
+            last_feedback = time.monotonic()
+            try:
+                mirror_feedback()
+            except Exception as exc:  # noqa: BLE001
+                print(f"{time.strftime('%H:%M:%S')} feedback rsync error: {exc}", flush=True)
         local_date = today()
         base = datetime.date.fromisoformat(local_date)
         for delta in (-1, 0, 1):
