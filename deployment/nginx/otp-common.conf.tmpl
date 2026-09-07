@@ -284,11 +284,23 @@
     # /api/debug-log) and again in Flask (RIDE_NOTE_RATE_LIMIT_PER_MIN); the
     # body cap is the 1536k rung of the 2.1 ladder. The READ, /api/ride-status,
     # keeps the tailnet gate below: that one hands out the rider's location.
+    #
+    # UPSTREAM 127.0.0.1, NOT __RIDE_UPSTREAM__ (2026-09-06, second half of
+    # 9.10): a note is a WRITE into the day file, and the day file has exactly
+    # one writer — this host's Flask — with rwtpc4 a read-only mirror of it
+    # (scripts/pull-debug-logs.sh, rsync --append-verify). Proxying the write
+    # to the desktop made the desktop's Flask append the note to the MIRRORED
+    # file, and the next rsync, finding a tail the source did not have,
+    # re-transferred the whole file and erased the note: both of the rider's
+    # 09-06 19:04 CDT reports were read once by the daemon and then vanished.
+    # Written here, the note lands in stream order with the telemetry and is
+    # mirrored down like everything else; the image goes to this host's
+    # feedback/, which the same sync pulls.
     location /api/ride-note {
         auth_basic off;
         limit_req zone=otp_log burst=20 nodelay;
 
-        proxy_pass http://__RIDE_UPSTREAM__:8092;
+        proxy_pass http://127.0.0.1:8092;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

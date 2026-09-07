@@ -30,6 +30,12 @@ while true; do
        --include='debug-*.jsonl' --include='debug-*.jsonl.gz' --exclude='*' \
        "$REMOTE:$REMOTE_DIR" "$LOCAL_DIR" 2>/dev/null; then
     fails=0
+    # The in-app feedback images (9.3) live beside the day files on the server
+    # since /api/ride-note is answered there (9.10); the note record names the
+    # same ~/otp-debug-logs/feedback/<file> path on both boxes, so the report
+    # agent can open it here. Small, append-only, never deleted.
+    rsync -az --timeout=30 -e "ssh $SSH_OPTS" \
+      "$REMOTE:${REMOTE_DIR%/}/feedback/" "${LOCAL_DIR%/}/feedback/" 2>/dev/null || true
   else
     fails=$((fails + 1))
     # Quiet about blips; loud once it is clearly not transient. A dead sync
