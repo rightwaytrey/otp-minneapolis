@@ -47,6 +47,8 @@ map $otp_from_tailnet $otp_auth_realm {
 limit_req_zone $binary_remote_addr zone=otp_api:10m rate=10r/s;   # /otp, /pelias
 limit_req_zone $binary_remote_addr zone=otp_ai:1m   rate=30r/m;   # /api/preferences (Flask enforces 5/min on top)
 limit_req_zone $binary_remote_addr zone=otp_log:1m  rate=2r/s;    # /api/debug-log (client flushes every ~3s)
+limit_req_zone $binary_remote_addr zone=carpool:10m rate=10r/s;       # /api/carpool/ (carpool app; Trip screen polls /live every 5 s)
+limit_req_zone $binary_remote_addr zone=carpool_auth:10m rate=6r/m;   # /api/carpool/auth/request-link (magic links)
 
 
 # --- TLS: three names, three certs, one shared body -------------------------

@@ -340,6 +340,46 @@
         add_header Cache-Control "no-cache";
     }
 
+    # --- Carpool API (2026-09-08): the carpool app's FastAPI on :8095 -----------
+    # A separate app (~/projects/carpool, its own TestFlight build) that shares
+    # this site because api.transit-nav.com is the one public host with TLS.
+    # The service is a `systemctl --user` unit owned by that project's
+    # deploy; nginx tolerates it being down (502). Called cross-origin from
+    # capacitor://localhost with a bearer token, so Basic Auth is off and CORS
+    # is left to the upstream like every other /api/ block here; a limit_req
+    # rejection is answered by @cors429 above. The snippet this mirrors is
+    # carpool/server/deploy/nginx-carpool.conf — change both together.
+    location /api/carpool/ {
+        auth_basic off;
+        limit_req zone=carpool burst=20 nodelay;
+
+        proxy_pass http://127.0.0.1:8095;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 30s;
+        proxy_connect_timeout 5s;
+        client_max_body_size 256k;
+    }
+
+    # Magic links are the carpool app's one unauthenticated write: limited
+    # harder (6/min) so a leaked link cannot spray a company's inboxes.
+    location = /api/carpool/auth/request-link {
+        auth_basic off;
+        limit_req zone=carpool_auth burst=4 nodelay;
+
+        proxy_pass http://127.0.0.1:8095;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+    }
+
     # --- Geocoding: the desktop's Pelias, BOTH HOSTS ---------------------------
     # 2026-09-05: the Stadia Professional trial ends 2026-09-08 and the free tier
     # keeps neither forward nor reverse geocoding (backlog 9.9), so the geocoder

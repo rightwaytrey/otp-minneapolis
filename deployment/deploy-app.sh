@@ -63,7 +63,7 @@ source "$SCRIPT_DIR/.env"
 # but it is a separate knob, because the house render points it at 127.0.0.1 and
 # a future staging box may point it somewhere else again. Empty here means the
 # renderer fails closed on a leftover placeholder, so catch it before the ssh.
-for v in APP_USER DOMAIN APP_PORT STADIA_API_KEY HOME_TAILSCALE_IP UNLOCK_SECRET RIDE_UPSTREAM; do
+for v in APP_USER DOMAIN APP_PORT STADIA_API_KEY HOME_TAILSCALE_IP UNLOCK_SECRET RIDE_UPSTREAM PELIAS_UPSTREAM; do
   [ -n "${!v:-}" ] || { echo "${RED}Error: $v is empty in .env${NC}"; exit 1; }
 done
 
@@ -338,7 +338,11 @@ elif [ "$NGINX_CHECK_RC" -ne 0 ]; then
   echo "${RED}Error: rendered house/prod configs are not in parity; run deployment/render-nginx.py --check${NC}"
   exit 1
 fi
-RIDE_UPSTREAM="$RIDE_UPSTREAM" STADIA_API_KEY="$STADIA_API_KEY" UNLOCK_SECRET="$UNLOCK_SECRET" \
+# Every name env/prod.env declares SECRET must be passed here by name: .env is
+# sourced, not exported, so the renderer sees only what this line hands it.
+# PELIAS_UPSTREAM was missed when it became SECRET on 2026-09-05 (backlog 9.9)
+# and every `--only nginx` after that failed closed on its placeholder (12.19).
+RIDE_UPSTREAM="$RIDE_UPSTREAM" STADIA_API_KEY="$STADIA_API_KEY" UNLOCK_SECRET="$UNLOCK_SECRET" PELIAS_UPSTREAM="$PELIAS_UPSTREAM" \
   python3 "$SCRIPT_DIR/render-nginx.py" --env prod --out "$TMP" >/dev/null \
   || { echo "${RED}Error: rendering the prod nginx config failed${NC}"; exit 1; }
 
