@@ -32,6 +32,8 @@ Notes grounded in the real telemetry (verified against debug-2026-07-29.jsonl):
 import argparse
 import collections
 import datetime
+import glob
+import hashlib
 import json
 import math
 import os
@@ -136,9 +138,48 @@ def _source_mtime():
         return None
 
 
+# The files that decide how this daemon behaves. Everything else in the repo —
+# the graph, the nginx templates, the deployment env files, even this repo's
+# CLAUDE.md — can move without changing a single thing the running process
+# does, and on 2026-09-08 that is exactly what happened: twelve commits, none
+# of them touching ride-watch/, and every artifact the daemon wrote carried
+# "STALE ... findings may come from code that no longer exists". Two rides
+# spent their opening line telling the rider about it. The tree moving is not
+# the question; THESE files moving is.
+DAEMON_SOURCE_FILES = (
+    "ride-watch/ride_watch.py",
+    "ride-watch/ride-thread-run.sh",
+    "ride-watch/ride-thread-sysprompt.md",
+    "ride-watch/ride-thread-settings.json",
+)
+
+
+def _source_digests():
+    """Content digest of each daemon file, as it is on disk right now.
+
+    Content, not `git rev-parse HEAD:<path>`: the process loaded the WORKING
+    TREE, so an uncommitted edit is every bit as much a drift as a commit —
+    and this needs no git at all, which means it still answers in a checkout
+    where another agent holds the index lock. A file that is missing is
+    recorded as None rather than skipped, so deleting one is a change too.
+    """
+    out = {}
+    for rel in DAEMON_SOURCE_FILES:
+        path = os.path.join(REPO_DIR, rel)
+        try:
+            with open(path, "rb") as f:
+                out[rel] = hashlib.sha1(f.read()).hexdigest()
+        except OSError:
+            out[rel] = None
+    return out
+
+
 DAEMON_GIT_SHA = _resolve_daemon_sha()
 DAEMON_STARTED_MS = int(time.time() * 1000)
 DAEMON_SOURCE_MTIME = _source_mtime()
+# What the daemon's own files looked like when this process read them. The
+# STALE banner compares against THIS, not against HEAD.
+DAEMON_SOURCE_DIGESTS = _source_digests()
 # How often the *running* SHA may be compared against the repo's HEAD for the
 # "you are stale" line. Only `rev-parse` is re-run (read-only, takes no index
 # lock, so it cannot collide with another agent's git in this shared worktree),
@@ -270,6 +311,29 @@ DEST_CLIENT_GRACE_REPLANS = 1
 # logged in the same second. Counting both would retire a converging trip on
 # half the evidence the client used.
 DEST_REPLAN_COLLAPSE_MS = 10 * 1000
+# unreachable-but-routable (2026-09-09 09:41:35). The app raised
+# DESTINATION_UNREACHABLE — "Still 1670m from 2345 Old Shakopee Road West and
+# re-planning isn't closing the gap" — while every REROUTE_SNAPSHOT it had
+# taken that ride came back with itineraries ending ON the address: all 27 of
+# them at (44.81655, -93.30986), 0.5 m from the requested `toPlace`. The graph
+# could reach it the whole time. That is a different defect from 8/28's
+# Fairgrounds interior, where the snapshots genuinely stopped at the fence,
+# and the snapshots are what tell them apart.
+#
+# Three minutes: the capture runs on a ~90 s cadence (measured 80-101 s across
+# 53 captures on 2026-09-09), so three minutes is "the last two captures" and
+# never "something from the other end of the ride".
+UNREACHABLE_SNAPSHOT_WINDOW_MS = 3 * 60 * 1000
+UNREACHABLE_GAP_M = 100.0                  # a plan ending this close arrived
+REROUTE_SNAP_RING = 8                      # ~12 min of captures, all we read
+# early-leg-transition (13.4). The app advanced onto a transit leg while it
+# still had no idea the rider was aboard anything and the leg they were on was
+# nowhere near finished. On 2026-09-09 08:24:55 it stepped to leg 1 (METRO
+# Orange Line) with the bike leg at 71.88 % and riderSpeedMps 5.9 — the rider
+# was still riding to the station — and SET_RIDING did not arrive for another
+# 2m36s. Ride 2 the same morning is the control: leg 0 read 100 % at the
+# transition and SET_RIDING landed 2 s later.
+EARLY_TRANSITION_PROGRESS_PCT = 90.0
 
 # Nothing pages when the wrap-up never appears (8/28). The ride thread spawned
 # fine, took the wrap-up line, and then sat at a permission prompt for about
@@ -520,6 +584,35 @@ THREAD_TMUX_SIZE = (200, 50)               # wide enough that the TUI wraps sane
 THREAD_READY_TIMEOUT_S = 30                # TUI is usually up in 10-12s
 THREAD_READY_POLL_S = 1.0
 THREAD_READY_MARKER = "❯"             # the ❯ prompt = accepting input
+# ...but the ❯ box is drawn while the TUI is thinking too, and it is drawn
+# under a permission dialog as well, so the marker alone is not "listening".
+# Five consecutive rides lost their wrap-up to this (backlog 12.4): the line
+# was typed into a pane that was not at the prompt and the keystrokes went
+# somewhere else. On 2026-09-08 12:09 a `capture-pane` caught it in the act —
+# the pane was sitting on "Compound command contains `cd` with a relative file
+# read while a `Read()` deny rule exists — Do you want to proceed?" and the
+# Enter that followed answered THAT, taking the wrap-up with it.
+#
+# BUSY is survivable: the tty buffers keystrokes and the TUI reads them when
+# the turn ends, which is exactly what the spawn path already relies on. So a
+# busy pane is waited for and then typed into anyway. BLOCKED is not: typing
+# into a permission dialog answers the dialog. A blocked pane is waited for
+# and never typed into.
+THREAD_BUSY_MARKERS = ("esc to interrupt",)
+THREAD_BLOCKED_MARKERS = ("Do you want to proceed?", "Do you want to allow",
+                          "Do you want to make this edit")
+# How long a push waits for a pane that is not listening. The ordinary
+# milestone gives up quickly — a leg transition is worthless ten minutes late.
+THREAD_PUSH_HOLD_MS = 60 * 1000
+# ...and a busy pane is held for much less than that, because typing into one
+# is SAFE. Waiting the full hold on every push while the rider is chatting to
+# the thread would delay every milestone for a minute to avoid a problem that
+# does not exist. Blocked gets the whole hold; busy gets this.
+THREAD_PUSH_BUSY_HOLD_MS = 10 * 1000
+THREAD_PUSH_POLL_S = 2.0
+# The wrap-up is the one line that must land, so it keeps trying right up to
+# a minute before the missing-report page would fire anyway.
+THREAD_PUSH_WRAP_UP_HOLD_MS = 9 * 60 * 1000
 # send-keys of the text and send-keys of Enter must be two calls with a beat
 # between them; combined into one call the line is typed but never submitted.
 THREAD_SUBMIT_DELAY_S = 1.0
@@ -568,6 +661,11 @@ PAGE_RANK = {
     #                        instruction left, and every minute they keep
     #                        waiting for the next plan is spent
     "replan-not-converging": 38,
+    # unreachable-but-routable  the app has just told the rider to give up on
+    #                           getting there, and it is wrong: a plan that
+    #                           ends at the door came back seconds ago. "Ask
+    #                           again" is an instruction, and it expires.
+    "unreachable-but-routable": 37,
     "notification-repeat": 35,
     "aboard-swap": 30,
     "riding-flip": 20,
@@ -898,6 +996,16 @@ class Trip:
         self.notification_repeat_last = {}        # key -> ms of last finding
         self.motion_anchor = None                 # where progress was last real
         self.motion_fired_ms = 0
+        # The span currently being held: {"tMs", "pct", "leg", "fix",
+        # "meters", "ticks"} while currentLegProgress has not changed. What
+        # progress-without-motion used to report was the RELEASE tick alone
+        # (2026-09-09 09:35:12: "moved 3.4 m"), which is the least interesting
+        # second of the episode; the 44 s and 74 m before it are the finding.
+        self.progress_freeze = None
+        # legIndex -> last currentLegProgress seen on it. Read by
+        # early-leg-transition, which needs the leg the rider is LEAVING.
+        self.leg_progress_last = {}
+        self.early_transition_legs = set()        # legs already reported
         self.prev_stops = None
         self.stops_swap_pending = False   # itinerary swapped since last count
         self.collapse_fired_seq = set()
@@ -925,6 +1033,14 @@ class Trip:
         self.dest_last_replan_ms = 0               # collapses one replan logged twice
         self.dest_unreachable_ms = None            # the app said it itself
         self.dest_stall_fired = False
+        # The periodic REROUTE_SNAPSHOT captures, reduced to the one number a
+        # rule can use: how far the best plan in that capture ENDS from the
+        # destination that was asked for. [{"tMs", "gapM", "itineraries"}],
+        # newest last, bounded. This is the only observable in the stream that
+        # says whether the graph can still reach the destination at all.
+        self.reroute_snaps = collections.deque(maxlen=REROUTE_SNAP_RING)
+        self.snapshots_since_gain = 0              # cadence, not re-plans
+        self.unreachable_routable_fired = False
         self.last_rider_action_ms = 0
         # legIndex -> {"polls", "matched", "firstMs", "lastMs", "bestConfidence"}
         # for legs the itinerary calls transit. Read once, at trip end, by
@@ -1075,8 +1191,19 @@ class RideWatch:
         self._thread_wake = threading.Event()
         self._thread_worker = None
         self._thread_status = {}       # tmux name -> True/False once known
+        # Panes the rider has already been paged about for sitting on a
+        # permission prompt, and the count of lines that never got typed
+        # because of one. Both are for the log and the status file; neither
+        # is persisted, because a pane does not outlive the process anyway.
+        self._thread_blocked_paged = set()
+        self._thread_pushes_undelivered = 0
         self._head_cached = (None, None)   # (head, behind), TTL-cached; never the stamp
         self._head_checked_ms = 0
+        # Which of the daemon's OWN files have changed on disk since this
+        # process read them. TTL-cached beside the head check, and the only
+        # thing that may raise STALE.
+        self._source_drift_cached = []
+        self._source_drift_checked_ms = 0
 
     # -- clock ------------------------------------------------------------
 
@@ -1346,6 +1473,8 @@ class RideWatch:
                 self._on_notification(trip, t, obj.get("payload") or {})
             elif typ == "START_REROUTE":
                 self._on_start_reroute(trip, t, obj.get("payload") or {})
+            elif typ == "REROUTE_SNAPSHOT":
+                self._on_reroute_snapshot(trip, t, obj.get("payload") or {})
             elif typ in ("REMEMBER_SEARCH", "ROUTING_REQUEST"):
                 self._note_search(trip, t, typ, obj.get("payload"))
             elif typ == "ROUTING_RESPONSE":
@@ -2097,7 +2226,12 @@ class RideWatch:
         if req_path:
             line += " — wrap-up now; request: %s" % req_path
         self._thread_event(trip, t, line)
-        self._thread_push(trip, line)
+        # The one line that must land. Everything else is a milestone the
+        # digest repeats anyway; this one is the whole wrap-up, so it waits
+        # for the pane rather than being typed over whatever is on it.
+        self._thread_push(trip, line,
+                          hold_ms=(THREAD_PUSH_WRAP_UP_HOLD_MS if req_path
+                                   else None))
         # Fallback: findings with nobody to write them up. Same push the report
         # agent's failure used to send — it is still exactly the right sentence.
         if n > 0 and self._thread_missing(trip):
@@ -2368,6 +2502,14 @@ class RideWatch:
             "tMs": t,
         }
         self._note_destination_distance(trip, p.get("distanceToDestination"))
+        # Per-leg last progress. early-leg-transition asks about the leg the
+        # rider is LEAVING, and by the time TRANSITION_LEG arrives
+        # trip.progress has already been overwritten by the new leg's first
+        # tick on some streams — so the answer has to be kept per leg.
+        if isinstance(p.get("currentLegProgress"), (int, float)) and \
+                isinstance(p.get("currentLegIndex"), int):
+            trip.leg_progress_last[p["currentLegIndex"]] = \
+                p["currentLegProgress"]
         self._mark_dirty()
 
         # The app's own verdict on its own trip, restated every tick. It is
@@ -2487,11 +2629,20 @@ class RideWatch:
           on the Orange Line the bar went 35% -> 71% in ONE second while the
           bus covered 6.7m, i.e. the app teleported the rider a kilometre up
           the leg. Nothing else in the engine noticed.
+
+        The finding reports the FROZEN SPAN, not the release tick. On
+        2026-09-09 09:35:12 it said "moved 3.4 m" — true of that one second
+        and useless: the episode was 09:34:27 to 09:35:11, 45 ticks pinned at
+        0 %, 74 m of GPS travel, and then one tick of +8.36 points. The 3.4 m
+        is the release; the span is the defect (12.17's fourth sighting, where
+        the continuity gate in position-matching.ts held the old projection
+        verbatim until the jump budget let go).
         """
         prog = p.get("currentLegProgress")
         leg = p.get("currentLegIndex")
         if not isinstance(prog, (int, float)) or trip.last_fix is None:
             return
+        span = self._note_progress_freeze(trip, t, leg, prog)
         anchor = trip.motion_anchor
         fresh = {"fix": trip.last_fix, "progress": prog, "leg": leg, "tMs": t}
         if anchor is None or anchor["leg"] != leg:
@@ -2506,15 +2657,57 @@ class RideWatch:
         if trip.motion_fired_ms and t - trip.motion_fired_ms <= MOTION_COOLDOWN_MS:
             return
         trip.motion_fired_ms = t
-        self._finding(
-            trip, t, "progress-without-motion", "warn",
-            "leg progress %s -> %s while the fix moved %.0fm" % (
-                fmt_pct(anchor["progress"]), fmt_pct(prog), moved),
-            {"fromPct": anchor["progress"], "toPct": prog,
-             "movedMeters": round(moved, 1), "legIndex": leg,
-             "sinceMs": anchor["tMs"]})
+        summary = "leg progress %s -> %s while the fix moved %.0fm" % (
+            fmt_pct(anchor["progress"]), fmt_pct(prog), moved)
+        context = {"fromPct": anchor["progress"], "toPct": prog,
+                   "movedMeters": round(moved, 1), "legIndex": leg,
+                   "sinceMs": anchor["tMs"]}
+        if span:
+            summary += " (frozen at %s for %ds, %.0fm travelled, %d ticks)" % (
+                fmt_pct(span["atPct"]), span["seconds"], span["meters"],
+                span["ticks"])
+            context["frozenSpan"] = span
+        self._finding(trip, t, "progress-without-motion", "warn",
+                      summary, context)
         # Re-anchor: a drift that keeps drifting is one finding, not a stream.
         trip.motion_anchor = fresh
+
+    @staticmethod
+    def _note_progress_freeze(trip, t, leg, prog):
+        """Hold the span over which currentLegProgress did not move.
+
+        Returns the span that THIS tick released, or None. A span is the
+        interval between two distinct progress values on one leg, plus the
+        GPS path length the rider actually covered inside it — which is the
+        number the report wants and the release tick can never supply.
+
+        Exact equality is the right test: a frozen projection repeats the
+        float bit for bit (09-09: `progressAlongLeg` pinned at 0.2426 for 19
+        ticks, `distanceFromRoute` at 31.24200447554046 for 14). Ordinary
+        motion never does.
+        """
+        freeze = trip.progress_freeze
+        if freeze is not None and freeze["leg"] == leg and \
+                freeze["pct"] == prog:
+            if trip.last_fix is not None:
+                if freeze["fix"] is not None:
+                    freeze["meters"] += meters_between(freeze["fix"],
+                                                       trip.last_fix)
+                freeze["fix"] = trip.last_fix
+            freeze["ticks"] += 1
+            freeze["lastMs"] = t
+            return None
+        released = None
+        if freeze is not None and freeze["leg"] == leg and freeze["ticks"] > 1:
+            released = {"fromMs": freeze["tMs"], "toMs": t,
+                        "atPct": freeze["pct"],
+                        "meters": round(freeze["meters"], 1),
+                        "seconds": max(0, (t - freeze["tMs"]) // 1000),
+                        "ticks": freeze["ticks"]}
+        trip.progress_freeze = {"tMs": t, "lastMs": t, "pct": prog, "leg": leg,
+                                "fix": trip.last_fix, "meters": 0.0,
+                                "ticks": 1}
+        return released
 
     def _check_deviated_streak(self, trip, now):
         # A rider who has arrived and walked off across the campus is not deviating
@@ -2805,6 +2998,9 @@ class RideWatch:
         leg_index = p.get("legIndex")
         if not isinstance(leg_index, int):
             return
+        # Before the alight-clear, because the rule is about the case this
+        # method returns on: riding is None, so there is nothing to clear.
+        self._rule_early_leg_transition(trip, t, leg_index)
         riding = trip.riding
         if riding is None:
             return
@@ -2817,6 +3013,64 @@ class RideWatch:
                 "riding cleared on alight: session=%s leg %s -> %s"
                 % (trip.session, ridden_leg, leg_index))
             self._mark_dirty()
+
+    def _leg_is_transit(self, trip, idx):
+        """Does the itinerary call leg `idx` a transit leg? None = cannot tell.
+
+        Deliberately not `current_leg_transit()`: that one answers "is the
+        rider on a transit leg NOW" and falls back to stopsRemaining and the
+        riding fact, both of which are the very things early-leg-transition is
+        asking about. This reads the itinerary or admits it cannot.
+        """
+        legs = (trip.itinerary or {}).get("legs") or []
+        if not isinstance(idx, int) or not (0 <= idx < len(legs)):
+            return None
+        return bool(legs[idx].get("transit"))
+
+    def _rule_early_leg_transition(self, trip, t, leg_index):
+        """The app stepped onto the bus leg before the rider got to the bus.
+
+        2026-09-09 08:24:55: TRANSITION_LEG to leg 1 (METRO Orange Line) with
+        the bike leg it was leaving at 71.88 % and riderSpeedMps 5.9 — the
+        rider was still riding to the station, and SET_RIDING did not arrive
+        for another 2m36s. From that moment the trip sheet, the banner and the
+        stop count were all describing a bus the rider was not on, and no rule
+        in this engine watched leg transitions at all: 13.1 reached the
+        backlog because the rider typed it in by hand, 97 s later.
+
+        Ride 2 of the same morning is the control and the reason the threshold
+        is on the leg being LEFT rather than on SET_RIDING's absence: at
+        09:14:39 leg 0 read 100 %, the transition was correct, and SET_RIDING
+        landed 2 s afterwards. A rule keyed on "riding is unset" alone would
+        have fired on both.
+
+        warn, not page. It is real, but the rider is looking at the screen it
+        is about — they are on a bike approaching a station — and a ride has
+        two interrupts to spend on things they cannot already see. The finding
+        reaches the thread and the report, which is where the fix comes from.
+        """
+        if trip.arrived_ms is not None:
+            return
+        if trip.riding is not None:
+            return                        # aboard already: an ordinary advance
+        if leg_index in trip.early_transition_legs:
+            return
+        if self._leg_is_transit(trip, leg_index) is not True:
+            return
+        prior = trip.leg_progress_last.get(leg_index - 1)
+        if not isinstance(prior, (int, float)):
+            return                        # never saw the leg being left
+        if prior >= EARLY_TRANSITION_PROGRESS_PCT:
+            return
+        trip.early_transition_legs.add(leg_index)
+        self._finding(
+            trip, t, "early-leg-transition", "warn",
+            "advanced to transit leg %d with leg %d at %s and no riding fact"
+            % (leg_index, leg_index - 1, fmt_pct(prior)),
+            {"legIndex": leg_index, "priorLegIndex": leg_index - 1,
+             "priorLegProgressPct": prior,
+             "thresholdPct": EARLY_TRANSITION_PROGRESS_PCT,
+             "leg": self._leg_label(trip, leg_index)})
 
     def _rule_aboard_swap(self, trip, t):
         if trip.riding is None:
@@ -2960,6 +3214,7 @@ class RideWatch:
             # A real gain clears everything, retirement included — whatever
             # changed, the rider is moving again and gets the machinery back.
             trip.dest_replans_since_gain = 0
+            trip.snapshots_since_gain = 0
             trip.dest_stall_fired = False
 
     def _note_replan(self, trip, t, why):
@@ -2976,6 +3231,114 @@ class RideWatch:
         trip.dest_last_replan_ms = t
         trip.dest_replans_since_gain += 1
         self._rule_replan_not_converging(trip, t, why)
+
+    def _on_reroute_snapshot(self, trip, t, p):
+        """Fold in the periodic "alternatives to finish the trip" capture.
+
+        REROUTE_SNAPSHOT is a RECORDING, on a fixed ~90 s cadence
+        (REROUTE_SNAPSHOT_INTERVAL_MS in otprr actions/go-mode.ts; measured
+        80-101 s across 53 captures on 2026-09-09). It is emphatically NOT a
+        re-plan and must never be counted as one — a rider who waits fifteen
+        minutes for a bus produces ten of them and has re-planned nothing.
+
+        What it IS is the only observable in this stream that says whether the
+        graph can still reach the destination: each capture holds a full
+        request/response pair from the rider's position to the trip's
+        destination. Reduced here to one number — how far the best itinerary
+        ENDS from the `toPlace` that was asked for — which is what
+        unreachable-but-routable reads.
+        """
+        if not isinstance(p, dict) or p.get("__summary"):
+            return
+        req = p.get("request") if isinstance(p.get("request"), dict) else {}
+        to = req.get("to") if isinstance(req.get("to"), dict) else {}
+        lat, lon = to.get("lat"), to.get("lon")
+        # The cadence is worth counting even when the payload cannot be read:
+        # it is the evidence that the client was still planning at all.
+        trip.snapshots_since_gain += 1
+        if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
+            return
+        ends = self._snapshot_plan_ends(p.get("response"))
+        if not ends:
+            return
+        gap = min(meters_between((lat, lon), end) for end in ends)
+        trip.reroute_snaps.append({
+            "tMs": int(t), "gapM": round(gap, 1),
+            "itineraries": len(ends),
+            "toName": to.get("name")})
+
+    @staticmethod
+    def _snapshot_plan_ends(response):
+        """Where each itinerary in a snapshot response actually ends.
+
+        The raw OTP2 payload, exactly as the reroute path's responseAction
+        consumes it: `data.plan.itineraries[].legs[-1].to`. A summarised or
+        errored capture yields nothing, which is a different fact from "the
+        plans stopped short" and is why this returns a list rather than a
+        distance.
+        """
+        if not isinstance(response, dict):
+            return []
+        plan = ((response.get("data") or {}).get("plan")
+                if isinstance(response.get("data"), dict) else None)
+        itineraries = (plan or {}).get("itineraries")
+        if not isinstance(itineraries, list):
+            return []
+        ends = []
+        for itin in itineraries:
+            legs = itin.get("legs") if isinstance(itin, dict) else None
+            if not isinstance(legs, list) or not legs:
+                continue
+            last = legs[-1].get("to") if isinstance(legs[-1], dict) else None
+            if not isinstance(last, dict):
+                continue
+            lat, lon = last.get("lat"), last.get("lon")
+            if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                ends.append((lat, lon))
+        return ends
+
+    def _rule_unreachable_but_routable(self, trip, t, p):
+        """The app gave up on a destination its own plans were reaching.
+
+        2026-09-09 09:41:35: DESTINATION_UNREACHABLE, "Still 1670m from 2345
+        Old Shakopee Road West and re-planning isn't closing the gap" — while
+        the two REROUTE_SNAPSHOTs of the preceding three minutes (09:38:43 and
+        09:40:13, and all 27 of the ride) came back with itineraries ending
+        0.5 m from that exact address. The graph could reach it throughout;
+        what had stalled was the rider's own approach, not the routing.
+
+        This is the inverse of the 8/28 Fairgrounds ride the client's guard
+        was built for, where the snapshots genuinely stopped at the fence —
+        and the snapshots are the whole discriminator, which is why the daemon
+        now reads them. A page, because "ask for it again" is an instruction
+        the rider can act on in the next minute and the notification they are
+        looking at says the opposite.
+        """
+        if trip.unreachable_routable_fired:
+            return
+        recent = [s for s in trip.reroute_snaps
+                  if 0 <= t - s["tMs"] <= UNREACHABLE_SNAPSHOT_WINDOW_MS]
+        arriving = [s for s in recent if s["gapM"] <= UNREACHABLE_GAP_M]
+        if not arriving:
+            return
+        trip.unreachable_routable_fired = True
+        best = min(arriving, key=lambda s: s["gapM"])
+        self._finding(
+            trip, t, "unreachable-but-routable", "page",
+            "app gave up, but %d of %d plan(s) in the last %dm end %.0fm from"
+            " the destination"
+            % (len(arriving), len(recent),
+               UNREACHABLE_SNAPSHOT_WINDOW_MS // 60000, best["gapM"]),
+            {"notificationId": p.get("id"),
+             "bestGapM": best["gapM"],
+             "snapshotMs": best["tMs"],
+             "snapshotsInWindow": len(recent),
+             "snapshotsArriving": len(arriving),
+             "gapMaxM": UNREACHABLE_GAP_M,
+             "bestDistanceM": trip.dest_best_m,
+             "toName": best.get("toName")},
+            push_body="App says it cannot reach the destination, but its own"
+                      " plan gets there. Ask for the route again.")
 
     def _rule_replan_not_converging(self, trip, t, why):
         """Re-planning that is not getting the rider any closer, unannounced.
@@ -3008,6 +3371,20 @@ class RideWatch:
             "%d re-plans with no %dm gain; still %dm from the destination"
             % (trip.dest_replans_since_gain, int(DEST_GAIN_MIN_M), far),
             {"replansSinceGain": trip.dest_replans_since_gain,
+             # The count above is a LOWER BOUND and this is why: the client's
+             # quiet access re-plans go through fetchOnboardCandidatePlan,
+             # which dispatches nothing unless it produces a swap. Measured on
+             # 2026-09-09 ride 2 (09:05:18-09:46:38), the two candidate
+             # signals both come up empty — ZERO ROUTING_REQUEST records in
+             # the whole ride (the isolated fetch bypasses the shared search
+             # machinery by design) and console.log is not forwarded at all
+             # (debug-log.js wraps error and warn only). What IS observable is
+             # the snapshot cadence: how many ~90 s REROUTE_SNAPSHOTs have
+             # gone by since the distance last improved. It is NOT a re-plan
+             # count and is never used as one — it does not move the firing
+             # threshold, it goes in the evidence so a report can see how long
+             # the client has been planning without getting anywhere.
+             "snapshotsSinceGain": trip.snapshots_since_gain,
              "bestDistanceM": trip.dest_best_m,
              "gainMinM": DEST_GAIN_MIN_M,
              "lastReplanReason": why,
@@ -3164,7 +3541,14 @@ class RideWatch:
             % one_line(p.get("message") or "", 120),
             {"notificationId": p.get("id"),
              "replansSinceGain": trip.dest_replans_since_gain,
+             # A lower bound, and now labelled as one — see
+             # _rule_replan_not_converging. The snapshot count is the
+             # observable beside it.
+             "snapshotsSinceGain": trip.snapshots_since_gain,
              "bestDistanceM": trip.dest_best_m})
+        # ...and then ask whether the app was right to give up. It is the
+        # cheapest question in the file and nothing was asking it.
+        self._rule_unreachable_but_routable(trip, t, p)
 
     def _rule_console(self, trip, t, obj):
         if obj.get("level") != "error":
@@ -3687,14 +4071,60 @@ class RideWatch:
         So the daemon picks the name — it is the only party that can see the
         earlier ride's file — and the suffix is the convention that was already
         being improvised. Existing single-ride reports keep their names.
+
+        The suffix is keyed on the RIDE, not on the earlier report existing.
+        It was the other way round until 2026-09-09, and 12.4 walked straight
+        through the hole: ride 1 of `mtssjvee-mtc2dx` never got its report
+        written (the thread stalled on a permission prompt), so forty minutes
+        later ride 2 found no file, was handed ride 1's name, and both request
+        files carried `2026-09-08-mtc2dx.md`. Had both threads worked the
+        second would have silently overwritten the first — the exact 08-27 /
+        08-28 failure this method was built to end, re-entered through the
+        back door. `_report_request_path` writes one file per ride and is the
+        only per-ride artifact that survives a daemon restart, so counting
+        those is how the daemon knows which ride this is.
+
+        The "does the file already exist" walk stays, one step below, as a
+        backstop: a report written by hand (and 2026-09-09's ride 2 was) has
+        no request file behind it, and nothing here may ever hand back a name
+        that is already somebody's report.
         """
         base = os.path.join(self.report_dir, self._ride_slug(trip))
-        if not os.path.exists(base + ".md"):
-            return base + ".md"
-        n = 2
-        while os.path.exists("%s-ride%d.md" % (base, n)):
-            n += 1
-        return "%s-ride%d.md" % (base, n)
+        n = self._ride_ordinal(trip)
+        candidate = base + ".md" if n < 2 else "%s-ride%d.md" % (base, n)
+        while os.path.exists(candidate):
+            n = max(n, 1) + 1
+            candidate = "%s-ride%d.md" % (base, n)
+        return candidate
+
+    def _ride_ordinal(self, trip):
+        """Which ride of this session, on this date, this is — 1-based.
+
+        Counted off the per-ride request files, which are written at the end
+        of every ride that had anything to report. A clean ride writes none
+        and so does not consume an ordinal: it also wrote no report, so there
+        is nothing for the next ride to collide with.
+
+        The date filter matters because the request file's name carries only
+        `HHMM` and the phone keeps one session id overnight; the ride slug is
+        dated, so only the same date's rides can collide.
+        """
+        date = fmt_date(trip.start_ms)
+        earlier = 0
+        pattern = os.path.join(
+            self.watch_dir, "report-request-%s-*.json" % trip.session)
+        for path in glob.glob(pattern):
+            try:
+                with open(path) as f:
+                    req = json.load(f)
+            except (OSError, ValueError):
+                continue
+            start = req.get("startMs")
+            if not isinstance(start, (int, float)):
+                continue
+            if req.get("date") == date and start < trip.start_ms:
+                earlier += 1
+        return earlier + 1
 
     def _report_request_path(self, trip):
         """One request file per ride, not per session.
@@ -3878,8 +4308,14 @@ class RideWatch:
             del trip.thread_events[:drop]
             trip.thread_cursor = max(0, trip.thread_cursor - drop)
 
-    def _thread_push(self, trip, line):
-        """Rewrite the digest, then type one line into the thread."""
+    def _thread_push(self, trip, line, hold_ms=None):
+        """Rewrite the digest, then type one line into the thread.
+
+        `hold_ms` is how long the pusher may wait for a pane that is mid-turn
+        or sitting on a permission prompt. It reaches only the real tmux
+        pusher — the test stubs take (name, line) and a ride must not depend
+        on a stub growing a third parameter.
+        """
         if not self._thread_ok(trip):
             return False
         try:
@@ -3898,7 +4334,10 @@ class RideWatch:
                 return False
             push = self._tmux_push
         try:
-            push(trip.thread["tmux"], text)
+            if hold_ms is not None and push is self._tmux_push:
+                push(trip.thread["tmux"], text, hold_ms=hold_ms)
+            else:
+                push(trip.thread["tmux"], text)
         except Exception as exc:
             self.log.error("ride thread push failed: %r" % exc)
             return False
@@ -3979,6 +4418,29 @@ class RideWatch:
         self._head_cached = (head, behind)
         return self._head_cached
 
+    def _daemon_source_drift(self):
+        """Which of DAEMON_SOURCE_FILES no longer match what is running.
+
+        The half of the version question that _repo_head_now cannot answer.
+        A commit to `deployment/nginx/otp-common.conf.tmpl` moves HEAD and
+        changes nothing this process does; an edit to `ride_watch.py` changes
+        everything and need not be committed at all. Comparing content
+        digests answers the second question and ignores the first.
+
+        Same TTL as the head check, and no subprocess at all — this is the
+        one provenance question that still works when git is unavailable.
+        """
+        now = int(time.time() * 1000)
+        if (self._source_drift_checked_ms
+                and now - self._source_drift_checked_ms < HEAD_RECHECK_MS):
+            return self._source_drift_cached
+        self._source_drift_checked_ms = now
+        current = _source_digests()
+        self._source_drift_cached = [
+            rel for rel in DAEMON_SOURCE_FILES
+            if current.get(rel) != DAEMON_SOURCE_DIGESTS.get(rel)]
+        return self._source_drift_cached
+
     def _daemon_lines(self):
         """Who is running, in two lines, at the top of everything a human reads.
 
@@ -3987,6 +4449,15 @@ class RideWatch:
         overwrote a report — and no artifact it wrote said which version it
         was. The ride thread sat reading source on disk that the process in
         memory had never loaded.
+
+        STALE is now keyed on the daemon's OWN files, not on HEAD. Keying it
+        on HEAD made it fire for every commit anywhere in this repo: on
+        2026-09-08 the running daemon was twelve commits "behind" with an
+        empty `git diff` over ride-watch/, and two rides opened by telling the
+        rider their watcher might be reporting code that no longer exists.
+        The 8/28 daemon still trips it — that one's own source HAD changed —
+        and a tree that moved without touching ride-watch/ now gets a plain
+        statement of fact with no claim about the findings.
         """
         started = datetime.datetime.fromtimestamp(
             DAEMON_STARTED_MS / 1000).strftime("%Y-%m-%d %H:%M:%S")
@@ -3999,13 +4470,24 @@ class RideWatch:
         out = [line]
         head, behind = self._repo_head_now()
         base = DAEMON_GIT_SHA.split("-", 1)[0]
-        if head and base != "unknown" and head != base:
+        drift = self._daemon_source_drift()
+        moved = bool(head and base != "unknown" and head != base)
+        if drift:
             out.append(
-                "Tree now: %s  ** STALE — this daemon is running %s%s."
-                " Findings may come from code that no longer exists. Restart:"
+                "Tree now: %s  ** STALE — this daemon's own source has changed"
+                " since it started (%s). Findings may come from code that no"
+                " longer exists. Restart:"
                 " `systemctl --user restart ride-watch` **"
-                % (head, base,
-                   ", %d commit(s) behind" % behind if behind else ""))
+                % (head or "unknown",
+                   ", ".join(os.path.basename(r) for r in drift)))
+        elif moved:
+            # Not a warning. The tree moving is the ordinary state of a repo
+            # four agents commit into; it says nothing about this process.
+            out.append(
+                "Tree now: %s (%sthis daemon is %s) — the tree moved, this"
+                " daemon did not: none of ride-watch/ changed."
+                % (head, "%d commit(s) back, " % behind if behind else "",
+                   base))
         if self.duplicate_records:
             out.append("Duplicate (re-POSTed) records dropped: %d"
                        % self.duplicate_records)
@@ -4097,8 +4579,10 @@ class RideWatch:
         self._thread_enqueue(("spawn", name, display))
         return None
 
-    def _tmux_push(self, name, line):
-        self._thread_enqueue(("push", name, line))
+    def _tmux_push(self, name, line, hold_ms=None):
+        self._thread_enqueue(("push", name, line,
+                              THREAD_PUSH_HOLD_MS if hold_ms is None
+                              else hold_ms))
         return True
 
     def _tmux_kill(self, name):
@@ -4134,7 +4618,9 @@ class RideWatch:
                     elif job[0] == "kill":
                         self._tmux_kill_blocking(job[1])
                     else:
-                        self._tmux_push_blocking(job[1], job[2])
+                        self._tmux_push_blocking(
+                            job[1], job[2],
+                            job[3] if len(job) > 3 else THREAD_PUSH_HOLD_MS)
                 except Exception as exc:
                     self.log.error("ride thread worker job %s failed: %r"
                                    % (job[0], exc))
@@ -4170,7 +4656,86 @@ class RideWatch:
         self.log.warn("ride thread %s not ready after %ds (session alive=%s)"
                       % (name, THREAD_READY_TIMEOUT_S, alive))
 
-    def _tmux_push_blocking(self, name, line):
+    def _pane_state(self, name):
+        """What the pane is doing, from its own screen: the check 12.4 wanted.
+
+        "ready"   at the ❯ prompt, nothing pending — safe to type.
+        "busy"    running a turn. The tty buffers; safe to type, better to wait.
+        "blocked" a permission dialog is up. Typing answers the DIALOG and the
+                  line is lost, which is how ride-1040's wrap-up became the
+                  answer to a 418-second-old prompt.
+        "unknown" capture failed or the screen says nothing we recognise —
+                  type, exactly as this did before there was a check at all.
+        """
+        res = self._tmux(["capture-pane", "-p", "-t", name])
+        if res.returncode != 0:
+            return "unknown"
+        pane = res.stdout or ""
+        if any(m in pane for m in THREAD_BLOCKED_MARKERS):
+            return "blocked"
+        if any(m in pane for m in THREAD_BUSY_MARKERS):
+            return "busy"
+        if THREAD_READY_MARKER in pane:
+            return "ready"
+        return "unknown"
+
+    def _wait_for_pane(self, name, hold_ms):
+        """Hold the push until the pane is listening, or the hold runs out.
+
+        Returns the state it gave up in. Serialising this on the worker thread
+        is deliberate: a pane that cannot take this line cannot take the next
+        one either, and letting a heartbeat overtake a wrap-up is the ordering
+        bug _thread_worker_loop exists to prevent.
+        """
+        now = time.time()
+        hold = max(0, hold_ms) / 1000.0
+        deadlines = {"blocked": now + hold,
+                     "busy": now + min(hold, THREAD_PUSH_BUSY_HOLD_MS / 1000.0)}
+        state = self._pane_state(name)
+        logged = False
+        while state in deadlines and time.time() < deadlines[state]:
+            if not logged:
+                self.log.info("ride thread %s is %s; holding the push"
+                              % (name, state))
+                logged = True
+            time.sleep(THREAD_PUSH_POLL_S)
+            state = self._pane_state(name)
+        return state
+
+    def _page_blocked_thread(self, name):
+        """The rider can clear this one themselves, and only they can.
+
+        A pane stuck on a permission prompt is not a daemon problem: the
+        dialog is sitting in the rider's Claude app waiting for a tap. Paged
+        off the ride budget, like the missing-report fallback, and once per
+        pane — a second buzz about the same dialog tells them nothing new.
+        """
+        if name in self._thread_blocked_paged:
+            return
+        self._thread_blocked_paged.add(name)
+        self._send_push(
+            "Ride watch",
+            "Ride thread is waiting on a permission prompt — open Claude and"
+            " answer it.",
+            kind="thread-blocked")
+
+    def _tmux_push_blocking(self, name, line, hold_ms=THREAD_PUSH_HOLD_MS):
+        # Is the pane actually listening? Before this it was never asked, and
+        # five consecutive rides lost their wrap-up to the answer (12.4).
+        state = self._wait_for_pane(name, hold_ms)
+        if state == "blocked":
+            # Never type. Enter here answers the dialog and the line is gone.
+            self.log.error("ride thread %s still blocked on a permission"
+                           " prompt after %ds; push NOT delivered: %s"
+                           % (name, hold_ms // 1000, one_line(line, 120)))
+            self._thread_pushes_undelivered += 1
+            self._page_blocked_thread(name)
+            return
+        if state == "busy":
+            # The tty buffers it. Say so, so the log shows a late line rather
+            # than a lost one.
+            self.log.warn("ride thread %s still busy after %ds; typing anyway"
+                          % (name, hold_ms // 1000))
         # -l types the line literally: a note containing `;` or `C-c` must
         # never be interpreted as a tmux key name.
         res = self._tmux(["send-keys", "-t", name, "-l", line])

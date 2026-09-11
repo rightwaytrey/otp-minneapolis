@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 import unittest
 
@@ -271,6 +272,43 @@ class StreamBuilder:
         """The app advancing to a new leg. Its reducer — not any action —
         is what clears the riding fact on alighting."""
         return self.action("TRANSITION_LEG", {"legIndex": leg})
+
+    # The destination of the synthetic trips below, and a point a comfortable
+    # 2 km away for a plan that stops short of it.
+    DEST = (44.81655, -93.30986)
+
+    def reroute_snapshot(self, ends=None, to=None, itineraries=1):
+        """The periodic alternatives capture, in the shape the real one has.
+
+        `request.to` is what was asked for; each itinerary's last leg's `to`
+        is where that plan actually ends. Those two points are the whole
+        content of the record as far as this daemon is concerned.
+        """
+        to = to or self.DEST
+        ends = ends or [to]
+        legs_for = lambda end: [{"mode": "BICYCLE",
+                                 "to": {"lat": end[0], "lon": end[1],
+                                        "name": "Destination"}}]
+        return self.action("REROUTE_SNAPSHOT", {
+            "tMs": self.t,
+            "request": {"departArrive": "NOW",
+                        "from": {"lat": self.LAT, "lon": self.LON,
+                                 "name": "Current location"},
+                        "modes": [{"mode": "TRANSIT"}, {"mode": "BICYCLE"}],
+                        "to": {"lat": to[0], "lon": to[1],
+                               "name": "2345 Old Shakopee Road West"}},
+            "response": {"data": {"plan": {"itineraries": [
+                {"legs": legs_for(end)}
+                for end in (ends * itineraries)[:max(1, itineraries)]]}}}})
+
+    def destination_unreachable(self, message="Still 1670m from 2345 Old "
+                                              "Shakopee Road West and re-"
+                                              "planning isn't closing the gap."):
+        """The client's own give-up notification (DESTINATION_UNREACHABLE)."""
+        return self.notification(
+            title="This is as close as routing gets", message=message,
+            ntype="DESTINATION_UNREACHABLE",
+            nid="DESTINATION_UNREACHABLE_destination_%d" % self.t)
 
     def route_match(self, dist, leg=1, on_route=True):
         return self.action("UPDATE_ROUTE_MATCH", {
@@ -910,6 +948,60 @@ class TestRules(RuleTestCase):
         self.assertEqual(hits[0]["context"]["toPct"], 25.0)
         self.assertLess(hits[0]["context"]["movedMeters"], 15.0)
 
+    def test_l_the_finding_reports_the_frozen_span_not_the_release_tick(self):
+        """13.8. "moved 3.4 m" was true of the release second and useless.
+
+        2026-09-09 09:34:27-09:35:11: 45 ticks pinned at 0 %, 74 m of GPS
+        travel, then one tick of +8.36 points. The span is the defect; the
+        release is where it happens to become visible.
+        """
+        b = StreamBuilder().start().advance(1000)
+        # Thirteen ticks frozen at 10 %, the fix walking 6 m at a time. The
+        # motion anchor re-arms every third tick (18 m > 15 m), which is why
+        # the release tick below sees almost no movement.
+        for i in range(13):
+            b.advance(1000).position_metres_north(6.0 * i)
+            b.progress(leg=1, prog=10.0, stops=5)
+        b.advance(1000).position_metres_north(73.0)
+        b.progress(leg=1, prog=25.0, stops=5)
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "progress-without-motion")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        span = hits[0]["context"]["frozenSpan"]
+        self.assertEqual(span["atPct"], 10.0)
+        self.assertEqual(span["ticks"], 13)
+        self.assertAlmostEqual(span["meters"], 72.0, delta=1.0)
+        self.assertEqual(span["seconds"], 13)
+        # The release tick is still reported — it is just no longer the whole
+        # story.
+        self.assertLess(hits[0]["context"]["movedMeters"], 2.0)
+        self.assertIn("frozen at 10%", hits[0]["summary"])
+
+    def test_l_a_single_tick_of_stale_progress_is_not_a_span(self):
+        """Two consecutive ticks with different values have no span between
+        them, and a finding that invented one would be reporting noise."""
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=1, prog=10.0, stops=5)
+        for _ in range(6):
+            b.advance(10 * 1000).position_metres_north(1.0)
+        b.advance(1000).progress(leg=1, prog=25.0, stops=5)
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "progress-without-motion")
+        self.assertEqual(len(hits), 1)
+        self.assertNotIn("frozenSpan", hits[0]["context"])
+
+    def test_l_a_leg_change_starts_a_new_span(self):
+        """A span is a fact about one leg. 09-09's freeze began at the swap
+        that installed the new leg, not before it."""
+        b = StreamBuilder().start().advance(1000).position()
+        for _ in range(4):
+            b.advance(1000).progress(leg=0, prog=10.0)
+        b.advance(1000).progress(leg=1, prog=10.0, stops=5)
+        watch = self.run_stream(b, finalize=False)
+        freeze = watch.trips[SESSION].progress_freeze
+        self.assertEqual(freeze["leg"], 1)
+        self.assertEqual(freeze["ticks"], 1)
+
     def test_l_progress_with_real_motion_is_just_travel(self):
         b = StreamBuilder().start().advance(1000).position()
         b.advance(1000).progress(leg=1, prog=10.0, stops=5)
@@ -1210,14 +1302,14 @@ class TestPageRanking(RuleTestCase):
         """A page rule with no rank would silently fall back to mid-pack."""
         page_rules = {"stop-count-collapse", "itinerary-backwards",
                       "missed-bus-while-riding", "replan-not-converging",
-                      "notification-repeat", "aboard-swap", "riding-flip",
-                      "deviated-streak"}
+                      "unreachable-but-routable", "notification-repeat",
+                      "aboard-swap", "riding-flip", "deviated-streak"}
         self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
         self.assertEqual(
             ["stop-count-collapse", "itinerary-backwards",
              "missed-bus-while-riding", "replan-not-converging",
-             "notification-repeat", "aboard-swap", "riding-flip",
-             "deviated-streak"],
+             "unreachable-but-routable", "notification-repeat", "aboard-swap",
+             "riding-flip", "deviated-streak"],
             sorted(ride_watch.PAGE_RANK, key=ride_watch.PAGE_RANK.get,
                    reverse=True))
 
@@ -1398,6 +1490,67 @@ class TestSurfaces(RuleTestCase):
         # inputs before anyone has read them.
         self.assertNotEqual(watch._report_request_path(first),
                             watch._report_request_path(second))
+
+    def test_a_missed_wrap_up_does_not_hand_ride_2_ride_1s_name(self):
+        """12.6. The suffix used to be keyed on ride 1's REPORT existing, and
+        2026-09-08 walked straight through the hole: ride 1's thread stalled
+        on a permission prompt (12.4) so no report was ever written, and forty
+        minutes later ride 2 was handed
+        `report-request-mtssjvee-mtc2dx-1040.json` carrying ride 1's
+        `2026-09-08-mtc2dx.md`. Had both threads worked, the second would have
+        overwritten the first. The suffix is keyed on the RIDE now — the
+        per-ride request file — so a missing report changes nothing.
+        """
+        watch = quiet_watch(self.tmp)
+        session = "mtssjvee-mtc2dx"
+        first = Trip(session, 1788000000000, None)
+        second = Trip(session, first.start_ms + 40 * 60 * 1000, None)
+
+        p1 = watch._report_path(first)
+        self.assertTrue(p1.endswith("-mtc2dx.md"), p1)
+        # Ride 1 ends: the request file lands, the report never does.
+        first.end_ms = first.start_ms + 1000
+        watch._write_report_request(first)
+        self.assertFalse(os.path.exists(p1))
+
+        p2 = watch._report_path(second)
+        self.assertTrue(p2.endswith("-mtc2dx-ride2.md"), p2)
+        self.assertEqual(watch._ride_ordinal(second), 2)
+
+    def test_a_clean_first_ride_does_not_spend_an_ordinal(self):
+        """A ride with nothing to report writes no request file — and no
+        report either, so there is nothing for the next ride to collide with
+        and no reason to push it to `-ride2`."""
+        watch = quiet_watch(self.tmp)
+        session = "mtu45mqw-co4i61"
+        first = Trip(session, 1788000000000, None)
+        second = Trip(session, first.start_ms + 40 * 60 * 1000, None)
+        self.assertEqual(watch._ride_ordinal(second), 1)
+        self.assertTrue(watch._report_path(second).endswith("-co4i61.md"))
+
+    def test_yesterdays_ride_on_the_same_session_is_not_this_evenings_ride_1(self):
+        """The phone keeps one session id overnight and the request file's
+        name carries only HHMM. The ride slug is dated, so only the same
+        date's rides can collide."""
+        watch = quiet_watch(self.tmp)
+        session = "mtu45mqw-co4i61"
+        yesterday = Trip(session, 1788000000000, None)
+        yesterday.end_ms = yesterday.start_ms + 1000
+        watch._write_report_request(yesterday)
+        today = Trip(session, yesterday.start_ms + 24 * 3600 * 1000, None)
+        self.assertEqual(watch._ride_ordinal(today), 1)
+
+    def test_a_report_written_by_hand_is_never_overwritten(self):
+        """The backstop below the ordinal: 2026-09-09's ride 2 report was
+        written by hand and has no request file behind it. Nothing here may
+        hand back a name that is already somebody's report."""
+        watch = quiet_watch(self.tmp)
+        trip = Trip("mtu45mqw-co4i61", 1788000000000, None)
+        taken = watch._report_path(trip)
+        with open(taken, "w") as f:
+            f.write("# written by hand\n")
+        self.assertTrue(watch._report_path(trip).endswith("-ride2.md"))
+        self.assertEqual(read_text(taken), "# written by hand\n")
 
     def test_clean_ride_requests_no_report(self):
         b = StreamBuilder().start()
@@ -2560,6 +2713,185 @@ class TestReplanNotConverging(RuleTestCase):
         self.assertIn("Finish from here", body)
 
 
+class TestEarlyLegTransition(RuleTestCase):
+    """13.4. Nothing in this engine watched leg transitions, so 13.1 — the app
+    stepping onto the bus leg while the rider was still biking to the stop —
+    reached the backlog only because the rider typed it in, 97 s later.
+    """
+
+    def approaching(self, prior_pct=71.88, riding=False, leg=1):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=0, prog=prior_pct)
+        if riding:
+            b.advance(1000).riding(leg=leg)
+        b.advance(1000).transition_leg(leg)
+        return self.run_stream(b, finalize=False)
+
+    def test_advancing_onto_the_bus_leg_too_early_warns(self):
+        watch = self.approaching()
+        hits = self.find(watch, "early-leg-transition")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        self.assertEqual(hits[0]["severity"], "warn")
+        ctx = hits[0]["context"]
+        self.assertEqual(ctx["legIndex"], 1)
+        self.assertEqual(ctx["priorLegIndex"], 0)
+        self.assertAlmostEqual(ctx["priorLegProgressPct"], 71.88)
+
+    def test_a_finished_access_leg_is_an_ordinary_transition(self):
+        """Ride 2 of 2026-09-09: leg 0 read 100 % at 09:14:39 and SET_RIDING
+        landed 2 s later. A rule keyed on "riding is unset" alone fires on
+        this one too, which is why the threshold is on the leg being left."""
+        self.assertNotIn("early-leg-transition",
+                         self.rules(self.approaching(prior_pct=100.0)))
+
+    def test_a_rider_already_aboard_is_never_reported(self):
+        self.assertNotIn("early-leg-transition",
+                         self.rules(self.approaching(riding=True)))
+
+    def test_a_street_leg_is_none_of_this_rules_business(self):
+        """Leg 2 of the fixture is a walk. Advancing onto it early is what
+        arriving somewhere looks like."""
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=1, prog=40.0, stops=3)
+        b.advance(1000).transition_leg(2)
+        self.assertNotIn("early-leg-transition",
+                         self.rules(self.run_stream(b, finalize=False)))
+
+    def test_a_leg_we_never_saw_progress_on_says_nothing(self):
+        """No measurement, no finding — the same guard replan-not-converging
+        uses for a distance nobody measured."""
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).transition_leg(1)
+        self.assertNotIn("early-leg-transition",
+                         self.rules(self.run_stream(b, finalize=False)))
+
+    def test_it_is_reported_once_per_leg(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=0, prog=60.0)
+        b.advance(1000).transition_leg(1)
+        b.advance(1000).transition_leg(1)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "early-leg-transition")), 1)
+
+    def test_it_never_costs_the_rider_a_page(self):
+        watch = self.approaching()
+        self.assertEqual([p for p in watch.push_log if p["sent"]], [])
+
+    def test_the_transition_still_clears_the_riding_fact_on_alight(self):
+        """The rule runs first in _on_transition_leg; the alight-clear below
+        it must be untouched."""
+        b = StreamBuilder().start().advance(1000).riding(leg=1)
+        b.advance(1000).transition_leg(2)
+        watch = self.run_stream(b, finalize=False)
+        self.assertIsNone(watch.trips[SESSION].riding)
+
+
+class TestUnreachableButRoutable(RuleTestCase):
+    """13.8. 2026-09-09 09:41:35: the app raised DESTINATION_UNREACHABLE while
+    every REROUTE_SNAPSHOT it had taken came back with plans ending 0.5 m from
+    the address. The 8/28 Fairgrounds ride — the case the client's guard was
+    built for — is the control: there the snapshots genuinely stopped short.
+    """
+
+    def gave_up(self, ends=None, snapshot_age_ms=60 * 1000):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=2, dest=1670.0)
+        b.advance(1000).reroute_snapshot(ends=ends)
+        b.advance(snapshot_age_ms).destination_unreachable()
+        return self.run_stream(b, finalize=False)
+
+    # ~2 km north-west of DEST: a plan that stops well short of the address.
+    SHORT = (44.83455, -93.30986)
+
+    def test_a_give_up_contradicted_by_its_own_plan_pages(self):
+        watch = self.gave_up()
+        hits = self.find(watch, "unreachable-but-routable")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        self.assertEqual(hits[0]["severity"], "page")
+        self.assertLess(hits[0]["context"]["bestGapM"], 1.0)
+        self.assertEqual(hits[0]["context"]["snapshotsArriving"], 1)
+
+    def test_plans_that_really_do_stop_short_are_the_app_behaving(self):
+        """8/28's destination was inside the State Fairgrounds fence."""
+        watch = self.gave_up(ends=[self.SHORT])
+        self.assertNotIn("unreachable-but-routable", self.rules(watch))
+        self.assertIn("destination-unreachable", self.rules(watch))
+
+    def test_a_stale_snapshot_does_not_count(self):
+        """Three minutes is two captures at the 90 s cadence. A plan from the
+        other end of the ride says nothing about now."""
+        watch = self.gave_up(
+            snapshot_age_ms=ride_watch.UNREACHABLE_SNAPSHOT_WINDOW_MS + 60000)
+        self.assertNotIn("unreachable-but-routable", self.rules(watch))
+
+    def test_the_app_still_gets_its_own_info_finding(self):
+        watch = self.gave_up()
+        info = self.find(watch, "destination-unreachable")
+        self.assertEqual(len(info), 1)
+        self.assertEqual(info[0]["severity"], "info")
+
+    def test_it_is_reported_once(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=2, dest=1670.0)
+        b.advance(1000).reroute_snapshot()
+        b.advance(30000).destination_unreachable()
+        b.advance(30000).destination_unreachable()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "unreachable-but-routable")), 1)
+
+    def test_the_page_copy_follows_the_rider_rules(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=2, dest=1670.0)
+        b.advance(1000).reroute_snapshot()
+        b.advance(60000).destination_unreachable()
+        # Past the coalescing window, so the page has actually gone out.
+        b.advance(ride_watch.PAGE_COALESCE_MS + 1000).progress(leg=2)
+        watch = self.run_stream(b, finalize=False)
+        body = [p for p in watch.push_log
+                if "cannot reach" in p["body"]][0]["body"]
+        self.assertLess(len(body), 120, body)
+        self.assertNotIn("!", body)
+
+    def test_a_summarised_snapshot_is_not_evidence_either_way(self):
+        """The recorder stubs big payloads. "Could not look" is not "the plans
+        stopped short"."""
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(1000).progress(leg=2, dest=1670.0)
+        b.advance(1000).action("REROUTE_SNAPSHOT",
+                               {"__summary": True, "chars": 461450})
+        b.advance(30000).destination_unreachable()
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("unreachable-but-routable", self.rules(watch))
+
+    def test_the_snapshot_cadence_is_never_counted_as_a_replan(self):
+        """The README's standing warning, now enforced: REROUTE_SNAPSHOT is a
+        90 s recording. Ten of them are a rider waiting for a bus, not ten
+        re-plans, and replan-not-converging must stay silent through them."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, dest=430.0)
+        for _ in range(10):
+            b.advance(90 * 1000).reroute_snapshot()
+            b.advance(1000).progress(leg=2, dest=430.0)
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("replan-not-converging", self.rules(watch))
+        trip = watch.trips[SESSION]
+        self.assertEqual(trip.dest_replans_since_gain, 0)
+        self.assertEqual(trip.snapshots_since_gain, 10)
+
+    def test_the_replan_count_carries_the_observable_beside_it(self):
+        """The re-plan count is a lower bound — the client's quiet access
+        re-plans dispatch nothing — so the finding says how many snapshot
+        cycles have gone by without a gain as well."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, dest=430.0)
+        for _ in range(4):
+            b.advance(90 * 1000).reroute_snapshot()
+            b.advance(60 * 1000).start()
+            b.advance(30 * 1000).progress(leg=2, dest=430.0)
+        watch = self.run_stream(b, finalize=False)
+        hits = self.find(watch, "replan-not-converging")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        self.assertEqual(hits[0]["context"]["snapshotsSinceGain"], 4)
+
+
 class TestReportDeadline(RuleTestCase):
     """8/28: a wrap-up that never appeared paged nobody, ever.
 
@@ -3024,6 +3356,179 @@ class TestWrapUpPaneOutlivesTheNextRide(RuleTestCase):
                                 watch.clock_ms + ride_watch.REPORT_DEADLINE_MS)
 
 
+class ScriptedTmux:
+    """A tmux whose `capture-pane` answers from a script, in order.
+
+    The last screen repeats once the script runs out, so a test can say "busy
+    for two polls, then ready" without counting polls.
+    """
+
+    def __init__(self, screens):
+        self.screens = list(screens)
+        self.calls = []
+
+    def __call__(self, args, timeout=20):
+        self.calls.append(args)
+        if args[0] == "capture-pane":
+            screen = (self.screens.pop(0) if len(self.screens) > 1
+                      else self.screens[0])
+            return TmuxResult(0, screen)
+        return TmuxResult(0, "")
+
+    def typed(self):
+        return [a[4] for a in self.calls
+                if a[0] == "send-keys" and "-l" in a]
+
+    def submits(self):
+        return [a for a in self.calls
+                if a[0] == "send-keys" and a[-1] == "Enter"]
+
+
+READY_PANE = "  some output\n\n ❯ \n  ? for shortcuts"
+BUSY_PANE = "  Herding… (14s · esc to interrupt)\n\n ❯ \n"
+# The screen `tmux capture-pane -t ride-1122` showed at 2026-09-08 12:09.
+BLOCKED_PANE = (
+    "  Bash(cd ~/.claude/plans && grep -n foo bar.md)\n"
+    "  Compound command contains `cd` with a relative file read while a\n"
+    "  Read() deny rule exists\n\n"
+    "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n")
+
+
+class TestThreadPushWaitsForThePane(RuleTestCase):
+    """12.4(a). Five consecutive rides lost their wrap-up to a line typed into
+    a pane nobody had asked whether it was listening.
+
+    ride-1040 is the clearest: its `last-prompt` is the 10:42:42 finding push,
+    not the 10:49:44 wrap-up, and the tool_use of 10:42:48 got its result at
+    10:49:46 — two seconds after the daemon typed. The keystrokes answered a
+    418-second-old permission dialog and the wrap-up went with them.
+    """
+
+    def setUp(self):
+        RuleTestCase.setUp(self)
+        self.watch = quiet_watch(self.tmp)
+        # The poll is 2 s in the daemon; a test must not sleep through it.
+        original = ride_watch.THREAD_PUSH_POLL_S
+        ride_watch.THREAD_PUSH_POLL_S = 0
+        self.addCleanup(setattr, ride_watch, "THREAD_PUSH_POLL_S", original)
+        # ...nor through the beat between the text and the Enter.
+        submit = ride_watch.THREAD_SUBMIT_DELAY_S
+        ride_watch.THREAD_SUBMIT_DELAY_S = 0
+        self.addCleanup(setattr, ride_watch, "THREAD_SUBMIT_DELAY_S", submit)
+
+    def push(self, screens, hold_ms=50):
+        fake = ScriptedTmux(screens)
+        self.watch._tmux = fake
+        self.watch._tmux_push_blocking("ride-1040", "[ride-watch] wrap-up now",
+                                       hold_ms)
+        return fake
+
+    def test_a_ready_pane_is_typed_into_at_once(self):
+        fake = self.push([READY_PANE])
+        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
+        self.assertEqual(len(fake.submits()), 1)
+
+    def test_a_blocked_pane_is_never_typed_into(self):
+        """Enter here answers the dialog, not the thread. This is the whole
+        bug: the line is lost AND a permission decision is made by accident.
+        """
+        fake = self.push([BLOCKED_PANE])
+        self.assertEqual(fake.typed(), [])
+        self.assertEqual(fake.submits(), [])
+        self.assertEqual(self.watch._thread_pushes_undelivered, 1)
+
+    def test_a_pane_that_clears_its_prompt_gets_the_line(self):
+        fake = self.push([BLOCKED_PANE, BLOCKED_PANE, READY_PANE],
+                         hold_ms=5000)
+        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
+        self.assertEqual(self.watch._thread_pushes_undelivered, 0)
+
+    def test_a_busy_pane_is_waited_for_then_typed_into_anyway(self):
+        """A tty buffers keystrokes and the TUI reads them when the turn ends
+        — which is what the spawn path has always relied on. Busy is late,
+        not lost."""
+        fake = self.push([BUSY_PANE])
+        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
+
+    def test_a_busy_pane_that_settles_is_not_waited_out(self):
+        fake = self.push([BUSY_PANE, READY_PANE], hold_ms=5000)
+        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
+
+    def test_a_pane_we_cannot_read_is_typed_into_as_before(self):
+        """capture-pane failing is not evidence of anything, and a daemon that
+        went quiet on it would be worse than the bug."""
+        fake = self.push(["  nothing recognisable here\n"])
+        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
+
+    def test_the_rider_is_paged_once_per_blocked_pane(self):
+        """The dialog is sitting in their Claude app waiting for a tap, and
+        only they can clear it. A second buzz about the same pane says
+        nothing new."""
+        self.push([BLOCKED_PANE])
+        self.push([BLOCKED_PANE])
+        pages = [p for p in self.watch.push_log
+                 if p["kind"] == "thread-blocked"]
+        self.assertEqual(len(pages), 1, self.watch.push_log)
+        self.assertIn("permission prompt", pages[0]["body"])
+
+    def test_a_busy_pane_is_not_held_for_the_whole_wrap_up_window(self):
+        """Typing into a busy pane is safe, so waiting nine minutes for one
+        would delay every milestone to avoid a problem that does not exist.
+        Blocked gets the whole hold; busy gets ten seconds of it."""
+        self.assertLess(ride_watch.THREAD_PUSH_BUSY_HOLD_MS,
+                        ride_watch.THREAD_PUSH_HOLD_MS)
+        original = ride_watch.THREAD_PUSH_BUSY_HOLD_MS
+        ride_watch.THREAD_PUSH_BUSY_HOLD_MS = 50
+        self.addCleanup(setattr, ride_watch, "THREAD_PUSH_BUSY_HOLD_MS",
+                        original)
+        started = time.time()
+        fake = self.push([BUSY_PANE],
+                         hold_ms=ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS)
+        # The line still lands, and the loop gave up on the BUSY deadline
+        # rather than on the nine-minute one it was handed.
+        self.assertLess(time.time() - started, 5.0)
+        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
+
+    def test_the_wrap_up_is_the_line_that_keeps_trying(self):
+        """A leg transition is worthless ten minutes late; the wrap-up is the
+        one line that must land, so it holds right up to a minute before the
+        missing-report page would fire anyway."""
+        self.assertGreater(ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS,
+                           ride_watch.THREAD_PUSH_HOLD_MS)
+        self.assertLess(ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS,
+                        ride_watch.REPORT_DEADLINE_MS)
+
+    def test_the_pane_state_reader_names_the_three_cases(self):
+        for screen, expected in ((READY_PANE, "ready"), (BUSY_PANE, "busy"),
+                                 (BLOCKED_PANE, "blocked"),
+                                 ("", "unknown")):
+            self.watch._tmux = ScriptedTmux([screen])
+            self.assertEqual(self.watch._pane_state("ride-1040"), expected)
+
+    def test_a_wrap_up_push_asks_for_the_long_hold(self):
+        """The hold reaches the real pusher only: the stubs take (name, line)
+        and a ride must not depend on a stub growing a parameter."""
+        holds = []
+
+        def fake_tmux_push(name, line, hold_ms=None):
+            holds.append(hold_ms)
+            return True
+
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        trip = watch.ended_trips[0]
+        watch.push_line = None
+        watch.replay = False
+        watch._tmux_push = fake_tmux_push
+        watch._thread_push(trip, "trip ended — wrap-up now",
+                           hold_ms=ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS)
+        watch._thread_push(trip, "leg 1 -> 2")
+        self.assertEqual(holds, [ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS, None])
+
+
 class TestDaemonProvenance(RuleTestCase):
     """8/28: a five-day-stale daemon, and nothing it wrote said so.
 
@@ -3062,19 +3567,76 @@ class TestDaemonProvenance(RuleTestCase):
         self.assertIn(stamped, lines[0])
         self.assertNotIn("deadbee", lines[0])
 
-    def test_a_head_that_moves_surfaces_the_stale_marker(self):
-        """The feature. Printing one SHA still relies on somebody noticing it
-        is old, and on 8/28 nobody did — for five days."""
+    def drifted_source(self, *names):
+        """Pretend the daemon's own files changed under the running process."""
+        original = ride_watch.DAEMON_SOURCE_DIGESTS
+        changed = dict(original)
+        for rel in (names or ride_watch.DAEMON_SOURCE_FILES):
+            changed[rel] = "0" * 40
+        ride_watch.DAEMON_SOURCE_DIGESTS = changed
+        self.addCleanup(setattr, ride_watch, "DAEMON_SOURCE_DIGESTS", original)
+
+    def test_a_head_that_moves_without_touching_ride_watch_is_not_stale(self):
+        """12.5. The banner used to key on HEAD, so every commit anywhere in
+        this repo cried wolf: on 2026-09-08 the daemon was 12 commits "behind"
+        with an empty diff over ride-watch/, and two rides opened by telling
+        the rider their watcher might be reporting code that no longer exists.
+        """
         calls = self.moved_head()
         lines = quiet_watch(self.tmp)._daemon_lines()
-        stale = [ln for ln in lines[1:] if "STALE" in ln]
-        self.assertEqual(len(stale), 1, lines)
-        self.assertIn("deadbee", stale[0])
-        self.assertIn("7 commit(s) behind", stale[0])
+        self.assertFalse([ln for ln in lines if "STALE" in ln], lines)
+        moved = [ln for ln in lines[1:] if "Tree now" in ln]
+        self.assertEqual(len(moved), 1, lines)
+        self.assertIn("deadbee", moved[0])
+        self.assertIn("7 commit(s) back", moved[0])
+        # The fact, without the claim about the findings.
+        self.assertIn("the tree moved, this daemon did not", moved[0])
+        self.assertNotIn("no longer exists", moved[0])
         # Read-only git only: no `status`, which can take the index lock other
         # agents in this shared worktree are using.
         self.assertTrue(all(a[0] in ("rev-parse", "rev-list") for a in calls),
                         calls)
+
+    def test_the_daemons_own_source_moving_is_what_raises_stale(self):
+        """The 8/28 case, which must keep firing: that daemon's own source HAD
+        changed — five days of it — which is exactly what this now asks."""
+        self.moved_head()
+        self.drifted_source("ride-watch/ride_watch.py")
+        lines = quiet_watch(self.tmp)._daemon_lines()
+        stale = [ln for ln in lines[1:] if "STALE" in ln]
+        self.assertEqual(len(stale), 1, lines)
+        self.assertIn("ride_watch.py", stale[0])
+        self.assertIn("no longer exists", stale[0])
+        self.assertIn("systemctl --user restart ride-watch", stale[0])
+
+    def test_a_sysprompt_edit_is_a_drift_too(self):
+        """The pane's behaviour comes from files this process read at start,
+        not from ride_watch.py alone: an edited sysprompt or settings file is
+        running-code drift by exactly the same argument."""
+        self.drifted_source("ride-watch/ride-thread-sysprompt.md")
+        lines = quiet_watch(self.tmp)._daemon_lines()
+        stale = [ln for ln in lines[1:] if "STALE" in ln]
+        self.assertEqual(len(stale), 1, lines)
+        self.assertIn("ride-thread-sysprompt.md", stale[0])
+
+    def test_the_drift_check_shells_out_to_nothing(self):
+        """Deliberately not `git rev-parse HEAD:<path>`: the process loaded the
+        working tree, and this has to answer while another agent holds the
+        index lock."""
+        watch = quiet_watch(self.tmp)
+        with NoProcesses():
+            self.assertEqual(watch._daemon_source_drift(), [])
+
+    def test_an_uncommitted_edit_is_a_drift_even_with_a_still_head(self):
+        """A commit is not the event. The 8/28 daemon's source changed on
+        disk; whether anyone had committed it is beside the point."""
+        original = ride_watch._git_out
+        ride_watch._git_out = lambda args, **kw: (
+            ride_watch.DAEMON_GIT_SHA.split("-", 1)[0])
+        self.addCleanup(setattr, ride_watch, "_git_out", original)
+        self.drifted_source("ride-watch/ride_watch.py")
+        lines = quiet_watch(self.tmp)._daemon_lines()
+        self.assertTrue([ln for ln in lines if "STALE" in ln], lines)
 
     def test_a_head_that_has_not_moved_raises_nothing(self):
         original = ride_watch._git_out
@@ -3453,6 +4015,108 @@ class TestVehicleMatchNeverOnTheRecordedRide(unittest.TestCase):
         watch = self.replay_window(self.RIDE3)
         self.assertEqual([f for f in watch.all_findings
                           if f["rule"] == "vehicle-match-never"], [])
+
+
+REAL_LOG_0909 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-09.jsonl")
+
+
+class TestRide0909(unittest.TestCase):
+    """The 2026-09-09 rides, replayed: 13.4 and 13.8 against real telemetry.
+
+    Session `mtu45mqw-co4i61`, two Orange Line trips. Ride 1 advanced onto the
+    bus leg at 08:24:55 with the bike leg at 71.88 % and SET_RIDING 2m36s
+    away; ride 2 is the control, 100 % and 2 s. At 09:41:35 the app gave up on
+    a destination its own snapshots were reaching, and at 09:35:12 a 45-tick
+    frozen projection released in one tick.
+    """
+
+    SESSION = "mtu45mqw-co4i61"
+    RIDE1_BOARDING = (1788959854000, 1788960600000)   # 08:17:34-08:30:00
+    RIDE2_BOARDING = (1788962718000, 1788963360000)   # 09:05:18-09:16:00
+    GAVE_UP = (1788964440000, 1788964920000)          # 09:34:00-09:42:00
+    FROZEN = (1788964440000, 1788964560000)           # 09:34:00-09:36:00
+
+    BOARDING_TYPES = {"START_GO_MODE", "STOP_GO_MODE", "UPDATE_PROGRESS",
+                      "TRANSITION_LEG", "SET_RIDING", "SET_ARRIVED"}
+    GAVE_UP_TYPES = {"START_GO_MODE", "STOP_GO_MODE", "REROUTE_SNAPSHOT",
+                     "ADD_NOTIFICATION", "UPDATE_PROGRESS"}
+    FROZEN_TYPES = {"START_GO_MODE", "STOP_GO_MODE", "UPDATE_POSITION",
+                    "UPDATE_PROGRESS"}
+
+    def replay_window(self, window, types):
+        tmp = tempfile.mkdtemp(prefix="ride-watch-0909-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        for obj in log_slice(REAL_LOG_0909, window[0], window[1], types):
+            watch.process(obj)
+        watch.finalize_replay()
+        return watch
+
+    def hits(self, watch, rule):
+        return [f for f in watch.all_findings if f["rule"] == rule]
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0909),
+                         "%s not present" % REAL_LOG_0909)
+    def test_ride_1_reports_the_early_transition(self):
+        watch = self.replay_window(self.RIDE1_BOARDING, self.BOARDING_TYPES)
+        found = self.hits(watch, "early-leg-transition")
+        self.assertEqual(len(found), 1,
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["time"], "08:24:55")
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["legIndex"], 1)
+        self.assertAlmostEqual(ctx["priorLegProgressPct"], 71.88, places=2)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0909),
+                         "%s not present" % REAL_LOG_0909)
+    def test_ride_2_boards_cleanly_and_says_nothing(self):
+        """09:14:39, leg 0 at 100 %, SET_RIDING at 09:14:41."""
+        watch = self.replay_window(self.RIDE2_BOARDING, self.BOARDING_TYPES)
+        self.assertEqual(self.hits(watch, "early-leg-transition"), [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0909),
+                         "%s not present" % REAL_LOG_0909)
+    def test_the_give_up_at_09_41_35_is_contradicted_by_the_snapshots(self):
+        watch = self.replay_window(self.GAVE_UP, self.GAVE_UP_TYPES)
+        found = self.hits(watch, "unreachable-but-routable")
+        self.assertEqual(len(found), 1,
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["time"], "09:41:35")
+        self.assertEqual(found[0]["severity"], "page")
+        ctx = found[0]["context"]
+        # 09:38:43 and 09:40:13, both ending 0.5 m from the address.
+        self.assertEqual(ctx["snapshotsInWindow"], 2)
+        self.assertEqual(ctx["snapshotsArriving"], 2)
+        self.assertLess(ctx["bestGapM"], 1.0)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0909),
+                         "%s not present" % REAL_LOG_0909)
+    def test_the_snapshots_are_not_counted_as_replans(self):
+        """Eleven captures in this window on a 90 s cadence, and the app's own
+        give-up notification. The daemon's convergence rule must stay out of
+        it — it is the second line, and the app spoke first."""
+        watch = self.replay_window(self.GAVE_UP, self.GAVE_UP_TYPES)
+        self.assertEqual(self.hits(watch, "replan-not-converging"), [])
+        self.assertEqual(len(self.hits(watch, "destination-unreachable")), 1)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0909),
+                         "%s not present" % REAL_LOG_0909)
+    def test_the_09_35_12_release_reports_the_span_it_released(self):
+        """45 ticks pinned at 0 % from the 09:34:27 swap, then one tick of
+        +8.36 points on a 3 m step. The release is what used to be reported."""
+        watch = self.replay_window(self.FROZEN, self.FROZEN_TYPES)
+        found = self.hits(watch, "progress-without-motion")
+        self.assertEqual(len(found), 1,
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["time"], "09:35:12")
+        self.assertLess(found[0]["context"]["movedMeters"], 5.0)
+        span = found[0]["context"]["frozenSpan"]
+        self.assertEqual(span["atPct"], 0)
+        self.assertEqual(span["ticks"], 45)
+        self.assertEqual(span["seconds"], 44)   # 09:34:27.x -> 09:35:12.y
+        # 74 m of GPS travel while the bar said the rider had not started.
+        self.assertAlmostEqual(span["meters"], 74.2, delta=2.0)
 
 
 class TestResumedTrip(RuleTestCase):

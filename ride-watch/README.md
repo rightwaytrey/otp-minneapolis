@@ -76,6 +76,8 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `reroute-storm` | more than 3 `START_REROUTE` in 5 minutes | warn |
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
 | `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
+| `unreachable-but-routable` | ...and a `REROUTE_SNAPSHOT` in the last 3 min ends within 100m of the destination it gave up on | page |
+| `early-leg-transition` | `TRANSITION_LEG` onto a transit leg with no riding fact and the previous leg below 90% | warn |
 | `console-error` | a `console.error` line (deduped by message, minus `CONSOLE_ERROR_IGNORE`) | info |
 | `wake-lock-denied` | the screen wake lock was refused during a trip (one finding per launch/resume, with the count) | warn |
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
@@ -171,11 +173,38 @@ typed the complaint out by hand on a bike.
   daemon records it as `destination-unreachable` (info) and stays quiet — the
   rider already has a high-priority push about it. **This rule is the second
   line: it exists for the ride where the app's own guard failed or never ran.**
-  Caveat worth knowing: the daemon can only see re-plans that were *applied*
-  (an itinerary swap or a `START_REROUTE`), not the client's attempts, so its
-  count is a lower bound. `REROUTE_SNAPSHOT` is **not** a re-plan — it is a
-  periodic recording-only alternatives capture, every 90s, and counting it
-  would page every rider who ever waited fifteen minutes for a bus.
+  Caveat worth knowing, and now measured: the daemon can only see re-plans that
+  were *applied* (an itinerary swap or a `START_REROUTE`), not the client's
+  attempts, so **`replansSinceGain` is a lower bound**. On 2026-09-09 at
+  09:41:35 the daemon recorded `replansSinceGain: 0` where the client had 3,
+  while matching the client's threshold to the metre (`dest_best_m` =
+  1670.2396900513465). Both of the signals proposed for closing that gap were
+  measured against ride 2 (09:05:18–09:46:38) and **neither exists**:
+
+  * **`ROUTING_REQUEST` carrying the Go Mode plan signature** — there are
+    **zero** `ROUTING_REQUEST` records in the whole ride. The quiet access
+    re-plan runs through `fetchOnboardCandidatePlan` (otprr
+    `actions/apiV2.js:1525`), which is isolated *by design*: no shared
+    `currentQuery`, no URL change, no `state.otp.searches`, and so no action
+    at all. A re-plan that produces a swap dispatches `beginGoMode` and is
+    already counted; one that is rejected (`autoReplanRejected`) or finds
+    nothing returns silently.
+  * **a `console.info` the daemon could read** — `debug-log.js:512` wraps
+    `error` and `warn` only. `console.log` / `console.info` never leave the
+    phone.
+
+  So the quiet re-plans are genuinely unobservable in today's stream, and
+  **the honest fix is client-side** (an action, or a `console.warn`, from the
+  quiet path — otprr). What the daemon does instead is record the cheapest
+  thing it *can* see beside the lower bound: **`snapshotsSinceGain`**, the
+  number of ~90s `REROUTE_SNAPSHOT` captures since the destination distance
+  last improved. It is evidence, not a trigger — it does not move the firing
+  threshold and never will, because `REROUTE_SNAPSHOT` is **not** a re-plan:
+  it is a periodic recording-only alternatives capture on a fixed cadence
+  (`REROUTE_SNAPSHOT_INTERVAL_MS`, 90s; measured 80–101s across 53 captures on
+  2026-09-09), and counting it as one would page every rider who ever waited
+  fifteen minutes for a bus. What the captures *are* good for is
+  `unreachable-but-routable`, below.
 - **`progress-without-motion`** asks a physical question: did the progress bar
   gain more than 5 points in the time it took the rider to cover 15m? The
   anchor resets when they genuinely travel, so the window is *adaptive* — it is
@@ -183,6 +212,52 @@ typed the complaint out by hand on a bike.
   couple of seconds for a moving one. Both ends are real: on the 7/29 Orange
   Line ride it caught the bar jumping 35% → 71% **in one second** while the bus
   covered 6.7m, twice, which nothing else in the engine noticed.
+  Since 2026-09-09 the finding reports the **frozen span**, not the release
+  tick. "leg progress 0% → 8% while the fix moved 3m" was true of that one
+  second and useless; the episode was **09:34:27 → 09:35:11, 45 ticks pinned
+  at 0%, 74m of GPS travel**, and then one tick. `context.frozenSpan` carries
+  `{fromMs, toMs, atPct, meters, seconds, ticks}` — the interval over which
+  `currentLegProgress` did not change *at all* (exact equality: a frozen
+  projection repeats the float bit for bit — 09-09 had `distanceFromRoute`
+  pinned at `31.24200447554046` for fourteen ticks — while ordinary motion
+  never does), and the GPS path length the rider covered inside it. A span of
+  one tick is not a span and is not reported.
+
+- **`early-leg-transition`** (2026-09-09, backlog 13.4) watches the one thing
+  no rule here watched: the app advancing to the next leg. On 09-09 at
+  **08:24:55** it stepped onto leg 1 — METRO Orange Line — with the bike leg
+  it was leaving at **71.88%** and `riderSpeedMps` 5.9: the rider was still
+  riding to the station, and `SET_RIDING` did not arrive for another **2m36s**.
+  From that moment the trip sheet, the banner and the stop count all described
+  a bus nobody was on, and the defect reached the backlog only because the
+  rider typed it in 97 seconds later.
+  The threshold is on the leg being **left**, not on `SET_RIDING` being
+  absent, and ride 2 of the same morning is why: at 09:14:39 leg 0 read 100%,
+  the transition was correct, and `SET_RIDING` landed 2s afterwards — a rule
+  keyed on "riding is unset" alone fires on both. `_leg_is_transit()` reads
+  the itinerary and admits when it cannot tell, deliberately *not* falling
+  back on `stopsRemaining` or the riding fact the way `current_leg_transit()`
+  does: those are the facts under suspicion.
+  **warn, not page**, though it is page-worthy in principle. The rider is
+  looking at the screen it is about — they are on a bike approaching a station
+  — and a ride has two interrupts to spend on things they *cannot* already
+  see. One finding per leg.
+
+- **`unreachable-but-routable`** (2026-09-09, backlog 13.8) is the audit of
+  the app's own give-up. At **09:41:35** the client raised
+  `DESTINATION_UNREACHABLE` — *"Still 1670m from 2345 Old Shakopee Road West
+  and re-planning isn't closing the gap"* — while **all 27** `REROUTE_SNAPSHOT`
+  captures of that ride, the two inside the previous three minutes included,
+  came back with itineraries ending at (44.81655, −93.30986): **0.5m** from
+  the requested `toPlace`. The graph could reach it the whole time; what had
+  stalled was the rider's approach, not the routing. This is the exact inverse
+  of the 8/28 Fairgrounds ride the client's guard was built for, where the
+  snapshots genuinely stopped at the fence — and the snapshots are the whole
+  discriminator, which is why the daemon now reads them at all. A **page**:
+  "ask for the route again" is an instruction the rider can act on in the next
+  minute, and the notification in front of them says the opposite. Three
+  minutes is "the last two captures" at the 90s cadence and never something
+  from the other end of the ride.
 
 ## The three surfaces
 
@@ -403,6 +478,24 @@ earlier ride's file. The request file is per-ride for the same reason
 (`report-request-<session>-<HHMM>.json`), so ride 2 cannot destroy ride 1's
 inputs before anyone has read them.
 
+**The suffix is keyed on the ride ordinal, not on the earlier report
+existing** (backlog 12.6). It was the other way round until 2026-09-09, and
+12.4 walked straight through the hole: ride 1 of `mtssjvee-mtc2dx` never got
+its report written — the thread stalled on a permission prompt — so forty
+minutes later ride 2 found no file on disk, was handed ride 1's name, and
+`report-request-mtssjvee-mtc2dx-0957.json` and
+`report-request-mtssjvee-mtc2dx-1040.json` **both carried
+`2026-09-08-mtc2dx.md`**. Had both threads worked, the second would have
+overwritten the first: the exact failure `_report_path` was built to end,
+re-entered through the back door. `_ride_ordinal()` now counts the per-ride
+request files of the same session and date whose `startMs` precedes this
+ride's — the only per-ride artifact that survives a daemon restart — and a
+clean ride, which writes no request file and no report, does not spend an
+ordinal. The "does this file already exist" walk stays underneath as a
+backstop: 2026-09-09's ride 2 report was written by hand and has no request
+file behind it, and nothing here may ever hand back a name that is already
+somebody's report.
+
 The findings ledger stays per-day-per-session and therefore holds both rides;
 the request carries `findingsFrom` (the ride's start) and the thread triages
 only records at or after it. The report triages every
@@ -423,7 +516,7 @@ prohibitions (`systemctl`, `docker`, `git commit/push`, `*deploy*`, edits under
 `~/projects`) and beats the broad project `.claude/settings.json` this session
 also loads.
 
-Two gotchas worth keeping, both found empirically:
+Three gotchas worth keeping, all found empirically:
 
 - **`Write(path)` rules match nothing.** The CLI warns about it. Only
   `Edit(path)` rules govern file writes, and they cover every file-editing tool.
@@ -431,9 +524,30 @@ Two gotchas worth keeping, both found empirically:
   in — the first test thread came up in *auto* mode despite the file saying
   `manual`. The mode is therefore pinned on the command line in the runner
   (`--permission-mode manual`).
+- **One unlisted command stops the thread dead**, and it took five consecutive
+  wrap-ups to notice. `ride-0957` issued `… | awk 'NR<4 || NR%12==0'` at
+  10:10:16 and emitted nothing at all for the eleven minutes until its pane was
+  retired; `awk` was not on the list. `awk`, `sed -n`, `echo` and `tr` are now
+  listed — they are the shapes a telemetry slice actually takes — and `sed -i`
+  is denied, because this thread never edits.
 
-Verified end to end: Read, Grep, `python3`, `git log`, `cd … && node
-build-fixture.js` and a vault write all ran with **zero prompts**.
+**The half that is not expressible as an allow-list entry.** The deny rules
+`Read(**/secrets/**)` and `Read(//home/rwt/.config/pushover/**)` make any
+*relative* file read unresolvable, so a compound `cd X && grep -n foo bar.md`
+raises *"Compound command contains `cd` with a relative file read while a
+`Read()` deny rule exists — Do you want to proceed?"* **however many commands
+are allowed**. That prompt was caught live at 2026-09-08 12:09 (`tmux
+capture-pane -t ride-1122`, frozen mid-wrap-up; the deadline expired at
+12:13:10) and again on 09-09 at 09:46:48, where the thread's first and only
+command was `cd /home/rwt/otp-debug-logs/ride-watch && wc -l … && python3 -c
+"…"` and nothing followed it for twelve minutes. The fix is in
+`ride-thread-sysprompt.md`: **absolute paths, never `cd`, one command per
+call** — including the fixture build, which is now given in its absolute form
+(`build-fixture.js` resolves its own paths off `__dirname` and needs no working
+directory).
+
+Verified end to end: Read, Grep, `python3`, `git log`, `node
+/home/rwt/…/build-fixture.js` and a vault write all ran with **zero prompts**.
 
 ### Failure and the fallback page
 
@@ -467,6 +581,40 @@ minutes in the past, so a deadline armed from it was already expired. On
 2026-08-31 at 18:00:34 the daemon logged "wrap-up expected … by 17:55:33" and
 paged about the missing report in the same second, before the thread had even
 been handed the request.
+
+**And the push now asks the pane whether it is listening** (backlog 12.4).
+`_tmux_push_blocking` used to `send-keys -l <text>`, sleep, `send-keys Enter`,
+with no check of any kind; `THREAD_READY_MARKER` was polled exactly once, at
+spawn. On `ride-1040` the consequence is legible in the transcript: its
+`last-prompt` is the **10:42:42 finding push**, not the 10:49:44 wrap-up, and
+the `tool_use` of 10:42:48 got its `tool_result` at **10:49:46** — two seconds
+after the daemon typed. The keystrokes answered a 418-second-old permission
+dialog and the wrap-up went with them. (Whole-session `totalToolDuration`:
+286 ms. Those 418 seconds were waiting, not working.)
+
+`_pane_state()` now reads the screen with `capture-pane` before every push and
+returns one of four answers:
+
+| state | screen says | what the pusher does |
+| --- | --- | --- |
+| `ready` | the `❯` prompt, nothing pending | type it |
+| `busy` | `esc to interrupt` | wait, then type anyway — a tty buffers, so busy is *late*, not lost |
+| `blocked` | `Do you want to proceed?` | **never type**; wait, and page the rider once per pane |
+| `unknown` | capture failed, or nothing recognisable | type, exactly as before there was a check |
+
+The hold is `THREAD_PUSH_HOLD_MS` (60s) for an ordinary milestone — a leg
+transition is worthless ten minutes late — and
+`THREAD_PUSH_WRAP_UP_HOLD_MS` (9 min) for the trip-end line, which is the one
+line that must land and so keeps trying until a minute before the
+missing-report page would fire anyway. A **busy** pane is capped much lower
+(`THREAD_PUSH_BUSY_HOLD_MS`, 10s) whatever the hold says: typing into one is
+safe, so waiting nine minutes for a thread that is simply mid-answer would
+delay every milestone to avoid a problem that does not exist. A blocked pane costs the rider one
+push, *"Ride thread is waiting on a permission prompt — open Claude and answer
+it"*: the dialog is sitting in their app waiting for a tap and nobody else can
+clear it. Holding on the worker thread is deliberate — a pane that cannot take
+this line cannot take the next one, and letting a heartbeat overtake a wrap-up
+is the ordering bug `_thread_worker_loop` exists to prevent.
 
 The deadline also records **which tmux pane** was asked, and
 `_kill_previous_threads` spares that pane. The next ride's thread used to kill
@@ -616,11 +764,41 @@ So the digest and every status file now open with:
 Daemon: ride_watch.py @ a1b2c3d-dirty (started 2026-08-31 09:12:03, source mtime 2026-08-28 21:54:11)
 ```
 
-and, when the repo has moved on:
+and, when the **daemon's own source** has moved on:
 
 ```
-Tree now: e4f5g6h  ** STALE — this daemon is running a1b2c3d, 7 commit(s) behind.
-Findings may come from code that no longer exists. Restart: `systemctl --user restart ride-watch` **
+Tree now: e4f5g6h  ** STALE — this daemon's own source has changed since it started
+(ride_watch.py). Findings may come from code that no longer exists.
+Restart: `systemctl --user restart ride-watch` **
+```
+
+**STALE is keyed on `DAEMON_SOURCE_FILES`, not on HEAD.** It was keyed on HEAD
+until 2026-09-09, which meant every commit anywhere in this repo cried wolf:
+on 2026-09-08 the running daemon was *twelve commits behind* with an
+**empty** `git diff` over `ride-watch/` — the six changed files were
+`CLAUDE.md`, two deployment env files, an nginx template, `report-prompt.md`
+and `scripts/pull-debug-logs.sh` — and the process was running exactly current
+code. The cost was measurable: `ride-1040` opened its first reply to the rider
+with *"Daemon is 12 commits stale — findings from it need checking against
+current source"*, and `ride-1959` with *"Note: daemon is 6 commits stale."*
+Two rides spent their opening line on a false alarm.
+
+What is compared now is a **content digest of the four files that decide how
+this daemon behaves** — `ride_watch.py`, `ride-thread-run.sh`,
+`ride-thread-sysprompt.md`, `ride-thread-settings.json` — taken at import and
+again on the same 5-minute TTL. Content, not `git rev-parse HEAD:<path>`,
+because the process loaded the *working tree*: an uncommitted edit is every
+bit as much a drift as a commit, and comparing bytes needs no git at all, so
+the answer still comes while another agent holds the index lock. The 8/28
+five-day-stale daemon still trips it — that one's own source *had* changed,
+which is the whole point.
+
+A tree that moved without touching `ride-watch/` now gets a statement of fact
+and no claim about the findings:
+
+```
+Tree now: e4f5g6h (12 commit(s) back, this daemon is a1b2c3d) — the tree moved,
+this daemon did not: none of ride-watch/ changed.
 ```
 
 Note this is the *opposite* of what a build script wants. A build proves the
@@ -645,7 +823,9 @@ introspect itself.
 The *comparison* against the repo's current HEAD is a separate, TTL-cached read
 (`HEAD_RECHECK_MS`, 5 min) of `rev-parse` only — read-only, takes no index
 lock, and so cannot collide with another agent's git in this shared worktree.
-It never touches the stamp.
+It never touches the stamp, and since 2026-09-09 it no longer decides anything
+either: it supplies the "Tree now" number, and `_daemon_source_drift()` decides
+whether that is a warning.
 
 **Restart on change (optional, not installed).** `ride-watch-restart.path` and
 `ride-watch-restart.service` sit next to `ride-watch.service` in this
@@ -733,7 +913,7 @@ states the convention outright.
 python3 ride-watch/test_ride_watch.py
 ```
 
-309 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
+358 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
 (both the firing case and the case that must stay quiet), the state machine, and
 page ranking (supersession inside the window, tie-breaking, flush on a quiet log,
 flush on trip end).
@@ -754,6 +934,19 @@ data does not work:
 - `TestThreadCadenceOnRealRides` (both) — every push is a milestone, one thread
   and one kickoff per ride, a push per finding and nothing extra, heartbeats
   bounded by the length of the ride, and a whole ride fits in a handful of lines.
+- `TestRide0909` (9/9, session `mtu45mqw-co4i61`) — `early-leg-transition`
+  fires at **08:24:55** with `priorLegProgressPct` 71.88 and stays silent on
+  ride 2's clean 09:14:39 boarding; `unreachable-but-routable` fires at
+  **09:41:35** with both in-window snapshots ending 0.5 m from the address,
+  while `replan-not-converging` correctly stays out of it; and the
+  `progress-without-motion` at **09:35:12** carries the span it released —
+  45 ticks, 44 s, 74 m.
+
+`TestThreadPushWaitsForThePane` covers 12.4's pusher against a scripted
+`capture-pane`: a ready pane is typed into at once, a **blocked** one never is
+(and costs one page per pane), a busy one is waited for and then typed into
+anyway, and an unreadable one behaves exactly as it did before the check
+existed.
 
 `TestRideThread` covers the conversation itself against stubs: spawn on trip
 start (and on mid-stream adoption), the kill switch, spawn and push failures
@@ -764,7 +957,10 @@ and the fallback page. `NoProcesses` asserts the thing this design exists for �
 
 `TestDuplicateRecords`, `TestStalledProgressContext`,
 `TestReplanNotConverging`, `TestReportDeadline` and `TestDaemonProvenance` cover
-the 2026-08-31 work. Two of those are worth calling out because the naive
+the 2026-08-31 work. `TestDaemonProvenance` also pins 12.5 from both sides: a
+HEAD that moved without touching `ride-watch/` raises **no** STALE (it says
+"the tree moved, this daemon did not"), while a digest change to any of
+`DAEMON_SOURCE_FILES` — committed or not — does. Two of those are worth calling out because the naive
 implementation passes them by accident:
 `test_a_head_that_moves_does_not_change_the_reported_running_sha` pins that the
 stamp is a startup constant and not a write-time `rev-parse` (which would make

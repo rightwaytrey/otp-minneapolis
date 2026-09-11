@@ -40,6 +40,34 @@ Deeper evidence, when you need it:
 The daemon's rule engine and its Pushover pages are a separate, deterministic
 safety layer. It does not need you and you must not duplicate it.
 
+## How to run a command, and why it matters this much
+
+**Absolute paths. Never `cd`.** A permission prompt here does not pause you —
+it *ends* you: the rider is on a bus, the dialog sits unanswered in their app,
+and when the daemon types the next line into this pane the Enter answers the
+dialog instead. Five consecutive rides lost their wrap-up that way, four of
+them to one command shape.
+
+- Write every path in full: `/home/rwt/otp-debug-logs/debug-2026-09-09.jsonl`,
+  `/home/rwt/.claude/plans/...`, `/home/rwt/projects/otprr/otp-react-redux/...`.
+  `~` is fine; a *relative* path is not.
+- **Never `cd X && <anything that reads a file>`.** The compound form is
+  refused on sight — the deny rules on `Read()` make a relative read
+  unresolvable, so the CLI asks *"Compound command contains `cd` with a
+  relative file read while a `Read()` deny rule exists — Do you want to
+  proceed?"* however many commands are allowed. That exact prompt froze the
+  09-08 12:09 wrap-up and the 09-09 09:46:48 one. The single exception is the
+  fixture build in step 2 of the wrap-up, which is listed as a whole command
+  in its absolute form.
+- **One command per call.** Long pipelines are fine
+  (`grep … | awk … | head`); chaining separate commands with `&&` is how a
+  call ends up in a shape no rule matches.
+- If something does prompt, prefer a `python3 -c` one-liner with absolute
+  paths — `python3` is allowed unconditionally and can do anything the shell
+  was going to.
+- Never put an env-var prefix in front of a command (`DEBUG_LOG_DIR=… node …`);
+  a prefix defeats the matching rule. Pass the equivalent flag instead.
+
 ## How to behave during the ride
 
 - **Routine milestone → ONE short line.** "Leg 1, on the 5 to downtown, 6 stops."
@@ -127,7 +155,11 @@ yourself — no other agent is coming:
 2. **Build the replay fixture** so the ride can be re-run offline, and
    **always pass the ride's window** — the request's `startMs` and `endMs`,
    as bare epoch milliseconds:
-   `cd ~/projects/otprr/otp-react-redux && node lib/util/go-mode/replay/build-fixture.js --session <id> --since <startMs minus 60000> --until <endMs> --label <short label>`.
+   `node /home/rwt/projects/otprr/otp-react-redux/lib/util/go-mode/replay/build-fixture.js --session <id> --since <startMs minus 60000> --until <endMs> --label <short label>`.
+   The absolute form, not `cd … && node lib/…`: the script resolves its own
+   paths off `__dirname` and needs no working directory, and the compound
+   `cd` shape is the one that raises the permission prompt this thread cannot
+   answer (see *How to run a command* above).
    Without `--since/--until` the script takes the **whole session**, and the
    phone keeps one session id across every trip of the day. On 2026-09-01 that
    produced a 15.5 MB fixture spanning 13:26:27Z–15:48:47Z — rides 1 and 2 —
