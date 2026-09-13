@@ -52,6 +52,7 @@
       "TodoWrite",
       "Edit(//home/rwt/obsidian-vault/Claude/**)",
       "Edit(//home/rwt/otp-debug-logs/ride-watch/**)",
+      "Edit(//home/rwt/.claude/plans/**)",
       "Bash(python3:*)",
       "Bash(tail:*)",
       "Bash(head:*)",
