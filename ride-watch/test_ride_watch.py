@@ -102,8 +102,13 @@ def transit_itinerary():
             "legs": [
                 {"mode": "WALK", "transitLeg": False,
                  "from": {"name": "Home"}, "to": {"name": "Stop A"}},
+                # routeId/tripId as the real payload carries them: since
+                # same-route-transfer (15.4) the summary keeps both, and the
+                # builder's riding()/vehicle_match() already speak these ids.
                 {"mode": "BUS", "transitLeg": True,
-                 "route": {"shortName": "5", "longName": "Route 5"},
+                 "route": {"shortName": "5", "longName": "Route 5",
+                           "gtfsId": "1:5"},
+                 "routeId": "1:5", "tripId": "1:100",
                  "headsign": "Downtown",
                  "from": {"name": "Stop A"}, "to": {"name": "Stop B"}},
                 {"mode": "WALK", "transitLeg": False,
@@ -208,9 +213,14 @@ class StreamBuilder:
         return self.action("STOP_GO_MODE")
 
     def progress(self, leg=1, prog=10.0, status="on_track", stops=None,
-                 next_stop="Stop B", dest=None):
+                 next_stop="Stop B", dest=None, speed=None):
         p = {"currentLegIndex": leg, "currentLegProgress": prog,
              "status": status, "nextStopName": next_stop}
+        if speed is not None:
+            # The client's smoothed ground speed, in the stream since long
+            # before the daemon read it. access-leg-transit-speed is entirely
+            # about this number on a leg that cannot produce it.
+            p["riderSpeedMps"] = speed
         if stops is not None:
             p["stopsRemaining"] = stops
         if dest is not None:
@@ -330,6 +340,43 @@ class StreamBuilder:
 
     def query_param(self, payload):
         return self.action("SET_QUERY_PARAM", payload)
+
+    def boarding_prompt(self):
+        """The rider tapping "I'm on the bus" (TripSheet.tsx:397). The real
+        record carries no payload at all — only the action and its state."""
+        return self.action("SHOW_BOARDING_PROMPT")
+
+    def nearby_vehicles(self, vehicles=None):
+        """The matcher's only output. Its ABSENCE is the signal."""
+        return self.action("UPDATE_NEARBY_VEHICLES", vehicles or [])
+
+    def vehicle_feed(self, route="1:5", metres=600.0, vehicle="1:900",
+                     label="32141", trip_id="1:879781"):
+        """A REALTIME_VEHICLE_POSITIONS_RESPONSE: the feed the trip sheet
+        polls every ~20 s while the boarding prompt says it found nothing."""
+        return self.action("REALTIME_VEHICLE_POSITIONS_RESPONSE", {
+            "routeId": route,
+            "vehicles": [{"vehicleId": vehicle, "tripId": trip_id,
+                          "label": label, "routeId": route,
+                          "lat": self.LAT + metres * 9.0e-6, "lon": self.LON,
+                          "seconds": int(self.t / 1000)}]})
+
+    def onboard_optimize(self, stops):
+        """START_ONBOARD_OPTIMIZE. `stops` is [(stopId, name, epoch)] — no
+        coordinates, exactly like the real payload."""
+        return self.action("START_ONBOARD_OPTIMIZE", {"candidates": [
+            {"stopId": sid, "stopName": name, "busArrivalEpoch": epoch,
+             "realtime": False} for (sid, name, epoch) in stops]})
+
+    def candidate_snapshot(self, name, epoch, metres=0.0):
+        """The per-candidate plan request, which is the only record that
+        says where a candidate stop actually is (`request.from`)."""
+        return self.action("ONBOARD_CANDIDATE_SNAPSHOT", {
+            "request": {"busArrivalEpoch": epoch,
+                        "from": {"lat": self.LAT + metres * 9.0e-6,
+                                 "lon": self.LON, "name": name},
+                        "query": "query Plan(...)"},
+            "response": {"data": {"plan": {"itineraries": []}}}})
 
     def note(self, text, session=None, source=None, image=None, **extra):
         """A rider note exactly as the Flask sidecar writes it to the JSONL."""
@@ -5132,6 +5179,678 @@ class TestPanelTornDown(RuleTestCase):
         # ...and it cost the rider none of their two interrupts.
         self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
 
+
+
+# --- the 2026-09-13 Green Line ride (15.7) -----------------------------------
+# Four rules and a ride window, all from one hour in which the rider was on a
+# train the app never noticed. The synthetic cases below fix the thresholds;
+# TestRide0913 replays the hour itself.
+
+
+class TestAccessLegTransitSpeed(RuleTestCase):
+    """A bike leg doing 15 m/s means the rider is on something.
+
+    2026-09-13 11:35:50-11:36:11: leg 0 of a BICYCLE > Green Line > BICYCLE
+    itinerary, riderSpeedMps 13.69 rising to 21.05, riding null the whole
+    time. The app went on re-planning the bike leg back east to the station
+    the rider's train had already left.
+    """
+
+    def ride(self, speeds, leg=0, riding=False, swap_at=None):
+        b = StreamBuilder().start()
+        if riding:
+            b.advance(500).riding(leg=leg)
+        for i, mps in enumerate(speeds):
+            b.advance(1000).progress(leg=leg, prog=1.0 + i, speed=mps)
+            if swap_at is not None and i == swap_at:
+                b.advance(1).start()
+        return self.run_stream(b, finalize=False)
+
+    def test_twenty_seconds_of_transit_speed_on_a_walk_leg_is_a_finding(self):
+        watch = self.ride([15.5] * 25)
+        found = self.find(watch, "access-leg-transit-speed")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["legIndex"], 0)
+        self.assertEqual(ctx["legMode"], "WALK")
+        self.assertGreaterEqual(ctx["heldMs"], ride_watch.ACCESS_TRANSIT_SPEED_MS)
+        self.assertEqual(ctx["maxMps"], 15.5)
+
+    def test_it_fires_on_the_first_tick_twenty_seconds_in(self):
+        """The span is milliseconds from the first fast tick, not a count of
+        ticks: on the real ride the ticks are ~1 s but not exactly, so the
+        11:36:10.039 tick held only 19.988 s and the rule waited for
+        11:36:11.049."""
+        watch = self.ride([15.5] * 25)
+        found = self.find(watch, "access-leg-transit-speed")[0]
+        first = T0 + 1000  # the first progress tick
+        self.assertEqual(found["tsMs"] - first,
+                         ride_watch.ACCESS_TRANSIT_SPEED_MS)
+
+    def test_a_short_burst_says_nothing(self):
+        """One absurd fix is not a ride. The daemon has seen 1414 m accuracy."""
+        watch = self.ride([15.5] * 8)
+        self.assertEqual(self.find(watch, "access-leg-transit-speed"), [])
+
+    def test_a_bike_doing_bike_speed_says_nothing(self):
+        """5.9 m/s is the 09-09 rider sprinting for the Orange Line stop —
+        the control early-leg-transition was written against."""
+        watch = self.ride([5.9] * 30)
+        self.assertEqual(self.find(watch, "access-leg-transit-speed"), [])
+
+    def test_a_held_riding_fact_says_nothing(self):
+        """The rider is aboard and the app knows: nothing to report."""
+        watch = self.ride([15.5] * 30, leg=1, riding=True)
+        self.assertEqual(self.find(watch, "access-leg-transit-speed"), [])
+
+    def test_a_transit_leg_at_transit_speed_says_nothing(self):
+        watch = self.ride([15.5] * 30, leg=1)
+        self.assertEqual(self.find(watch, "access-leg-transit-speed"), [])
+
+    def test_one_slow_tick_restarts_the_clock(self):
+        watch = self.ride([15.5] * 10 + [3.0] + [15.5] * 10)
+        self.assertEqual(self.find(watch, "access-leg-transit-speed"), [])
+
+    def test_an_itinerary_swap_mid_streak_does_not_reset_it(self):
+        """The 09-13 ride swapped three times inside the run of speed
+        (11:35:52, 11:36:18, 11:36:44), each time re-planning the same bike
+        leg. A streak reset on swap would have watched 21 m/s and said
+        nothing."""
+        watch = self.ride([15.5] * 25, swap_at=12)
+        self.assertEqual(len(self.find(watch, "access-leg-transit-speed")), 1)
+
+    def test_one_finding_per_leg(self):
+        watch = self.ride([15.5] * 60)
+        self.assertEqual(len(self.find(watch, "access-leg-transit-speed")), 1)
+
+    def test_it_never_costs_the_rider_a_page(self):
+        watch = self.ride([15.5] * 25)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+
+class TestBoardingPromptEmpty(RuleTestCase):
+    """"I'm on the bus" searched nothing while the feed held the bus.
+
+    2026-09-13 11:36:24.799: no UPDATE_NEARBY_VEHICLES had ever been emitted
+    on that ride, the last route poll was 15 s old, the rider was doing
+    15.2 m/s (radius 885 m) and train 32141 was 634.8 m away.
+    """
+
+    def ride(self, metres=600.0, speed=15.0, nearby_before=False,
+             feed_age_s=5, prompts=1, route="1:5"):
+        b = StreamBuilder().start().advance(1000).progress(leg=0, prog=1.0,
+                                                           speed=speed)
+        b.advance(1000).position()
+        b.advance(1000).vehicle_feed(route=route, metres=metres)
+        if nearby_before:
+            b.advance(1000).nearby_vehicles([{"vehicleId": "1:900"}])
+        b.advance(feed_age_s * 1000)
+        for _ in range(prompts):
+            b.boarding_prompt().advance(2000)
+        return self.run_stream(b, finalize=False)
+
+    def test_a_prompt_with_no_search_and_a_bus_in_range_is_reported(self):
+        watch = self.ride()
+        found = self.find(watch, "boarding-prompt-empty")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "info")
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["routeId"], "1:5")
+        self.assertEqual(ctx["vehicleId"], "1:900")
+        self.assertAlmostEqual(ctx["distanceM"], 600.0, delta=2.0)
+        self.assertAlmostEqual(ctx["radiusM"], 875.0, delta=1.0)
+        self.assertIsNone(ctx["lastNearbyMs"])
+
+    def test_a_search_that_did_run_is_none_of_this_rules_business(self):
+        """UPDATE_NEARBY_VEHICLES inside the window means the prompt showed
+        the result of a search, whatever that result was. On 09-13 the
+        11:37:38 and 11:39:44 prompts are both this case — the onboard flow
+        runs its own search."""
+        watch = self.ride(nearby_before=True)
+        self.assertEqual(self.find(watch, "boarding-prompt-empty"), [])
+
+    def test_an_empty_road_is_an_honest_empty_prompt(self):
+        """The 11:36:37 control: the rider had slowed to 4.0 m/s (radius
+        378 m) and the train had pulled 748.5 m ahead."""
+        watch = self.ride(metres=1200.0)
+        self.assertEqual(self.find(watch, "boarding-prompt-empty"), [])
+
+    def test_the_radius_follows_the_rider_speed(self):
+        """speedAdjustedRadius: 200 m + 45 s of travel. A standing rider gets
+        200 m, so the same bus 600 m away is out of range."""
+        self.assertEqual(self.find(self.ride(speed=0.0),
+                                   "boarding-prompt-empty"), [])
+        self.assertEqual(len(self.find(self.ride(speed=15.0),
+                                       "boarding-prompt-empty")), 1)
+
+    def test_the_radius_is_built_from_the_fix_the_app_itself_read(self):
+        """The client passes `userPos.coords.speed` (go-mode.ts:6102), so the
+        fix's own speed outranks the progress tick's republished copy."""
+        b = StreamBuilder().start().advance(1000).progress(leg=0, prog=1.0,
+                                                           speed=0.0)
+        b.advance(1000).action("UPDATE_POSITION", {
+            "coords": {"latitude": StreamBuilder.LAT,
+                       "longitude": StreamBuilder.LON,
+                       "accuracy": 5.0, "speed": 15.0},
+            "timestamp": b.t})
+        b.advance(1000).vehicle_feed(metres=600.0)
+        b.advance(5000).boarding_prompt()
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "boarding-prompt-empty")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertAlmostEqual(found[0]["context"]["radiusM"], 875.0, delta=1.0)
+
+    def test_a_stale_feed_accuses_nobody(self):
+        watch = self.ride(feed_age_s=200)
+        self.assertEqual(self.find(watch, "boarding-prompt-empty"), [])
+
+    def test_a_feed_for_another_route_is_not_evidence(self):
+        """The itinerary's route is the only one the prompt is about."""
+        watch = self.ride(route="1:902")
+        self.assertEqual(self.find(watch, "boarding-prompt-empty"), [])
+
+    def test_one_finding_per_ride(self):
+        """The rider taps the button repeatedly when it does not work — 09-13
+        had four prompts in four minutes."""
+        watch = self.ride(prompts=4)
+        self.assertEqual(len(self.find(watch, "boarding-prompt-empty")), 1)
+
+    def test_it_never_costs_the_rider_a_page(self):
+        watch = self.ride()
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+
+class TestOnboardAnchorBehindRider(RuleTestCase):
+    """The alight list built from the wrong end of the line (15.5).
+
+    2026-09-13: STOP_GO_MODE 11:38:36.664 wiped the client's last position,
+    BEGIN_ONBOARD_FLOW 11:38:38.013 ran before the next fix (11:38:39.035),
+    and the candidates came back anchored at Union Depot — 4760 m east of the
+    rider at Lexington.
+    """
+
+    FAR = ("1:56026", "Union Depot Station", T0 + 60000)
+    NEAR = ("1:56034", "Lexington Pkwy Station", T0 + 60000)
+
+    def flow(self, stop, metres, in_trip=True, snapshot=True, fix_age_s=3):
+        b = StreamBuilder()
+        if in_trip:
+            b.start().advance(1000).progress(leg=1, prog=10.0)
+        b.advance(1000).position()
+        b.advance(fix_age_s * 1000).onboard_optimize([stop])
+        if snapshot:
+            b.advance(7000).candidate_snapshot(stop[1], stop[2], metres=metres)
+        if not in_trip:
+            # The flow runs between rides; the trip that follows is what the
+            # held finding is filed on.
+            b.advance(2000).start()
+        return self.run_stream(b, finalize=False)
+
+    def test_an_anchor_kilometres_behind_the_rider_is_reported(self):
+        watch = self.flow(self.FAR, 4760.0)
+        found = self.find(watch, "onboard-anchor-behind-rider")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["stopName"], "Union Depot Station")
+        self.assertAlmostEqual(ctx["distanceM"], 4760.0, delta=5.0)
+        self.assertEqual(ctx["fixAgeMs"], 3000)
+
+    def test_the_finding_is_stamped_at_the_optimize_not_the_snapshot(self):
+        """The defect is the list the rider was shown. The snapshot only
+        happens to be the record that carries the coordinates — 6.9 s later on
+        the real ride — so it goes in the context, not on the clock."""
+        watch = self.flow(self.FAR, 4760.0)
+        found = self.find(watch, "onboard-anchor-behind-rider")[0]
+        self.assertEqual(found["context"]["optimizeMs"], found["tsMs"])
+        self.assertEqual(found["context"]["detectedMs"], found["tsMs"] + 7000)
+
+    def test_an_anchor_at_the_rider_says_nothing(self):
+        """The three correct flows that hour anchored 380 m, 97 m and 39 m
+        from the last fix."""
+        watch = self.flow(self.NEAR, 380.0)
+        self.assertEqual(self.find(watch, "onboard-anchor-behind-rider"), [])
+
+    def test_a_candidate_nobody_placed_accuses_nobody(self):
+        """No snapshot came back for the anchor: the stop has no coordinates
+        anywhere in the stream and the rule stays quiet rather than guessing."""
+        watch = self.flow(self.FAR, 4760.0, snapshot=False)
+        self.assertEqual(self.find(watch, "onboard-anchor-behind-rider"), [])
+
+    def test_a_fix_too_old_to_convict_is_not_used(self):
+        """If the rider has not been seen for minutes, an anchor far from the
+        last fix says the daemon is behind, not the app."""
+        watch = self.flow(self.FAR, 4760.0, fix_age_s=400)
+        self.assertEqual(self.find(watch, "onboard-anchor-behind-rider"), [])
+
+    def test_a_flow_between_rides_is_held_for_the_trip_that_follows(self):
+        """Every onboard flow on 09-13 ran with no trip open."""
+        watch = self.flow(self.FAR, 4760.0, in_trip=False)
+        found = self.find(watch, "onboard-anchor-behind-rider")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+
+    def test_a_held_anchor_does_not_crowd_out_a_held_stale_candidate(self):
+        """pending_onboard used to keep exactly one finding per session, so a
+        second trip-less onboard rule would have been silently dropped."""
+        b = StreamBuilder()
+        b.advance(1000).position()
+        # A candidate dated ten minutes in the past AND anchored 4.8 km away.
+        stop = ("1:56026", "Union Depot Station", T0 - 600000)
+        b.advance(3000).onboard_optimize([stop])
+        b.advance(7000).candidate_snapshot(stop[1], stop[2], metres=4760.0)
+        b.advance(2000).start()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(
+            sorted(set(self.rules(watch)) & {"onboard-anchor-behind-rider",
+                                             "stale-alight-candidate"}),
+            ["onboard-anchor-behind-rider", "stale-alight-candidate"])
+
+
+class TestSameRouteTransfer(RuleTestCase):
+    """Green to Green (15.4): get off your own train, wait for the next one.
+
+    2026-09-13 11:40:00 installed METRO Green Line trip 1:879781
+    Lexington->Snelling, then METRO Green Line trip 1:902233 Snelling
+    11:59->Raymond: sixteen minutes on a platform for the train behind the one
+    the rider was already sitting on.
+    """
+
+    @staticmethod
+    def itinerary(pairs, modes=None):
+        """`pairs` is [(routeId, tripId)] for the transit legs, in order."""
+        legs = []
+        for i, (route, trip_id) in enumerate(pairs):
+            legs.append({
+                "mode": (modes or ["TRAM"] * len(pairs))[i],
+                "transitLeg": True, "routeId": route, "tripId": trip_id,
+                "route": {"gtfsId": route, "shortName": None,
+                          "longName": "METRO Green Line"},
+                "from": {"name": "Stop %d" % i},
+                "to": {"name": "Stop %d" % (i + 1)},
+                "startTime": T0 + i * 1200000,
+                "endTime": T0 + i * 1200000 + 180000})
+        legs.append({"mode": "BICYCLE", "transitLeg": False,
+                     "from": {"name": "Stop %d" % len(pairs)},
+                     "to": {"name": "Home"}})
+        return {"itinerary": {"startTime": T0, "endTime": T0 + 3600000,
+                              "duration": 3600, "legs": legs}}
+
+    def ride(self, pairs, **kw):
+        b = StreamBuilder().start(self.itinerary(pairs, **kw))
+        b.advance(1000).progress(leg=0, prog=5.0)
+        return self.run_stream(b, finalize=False)
+
+    def test_one_route_two_trips_is_reported(self):
+        watch = self.ride([("1:902", "1:879781"), ("1:902", "1:902233")])
+        found = self.find(watch, "same-route-transfer")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["routeId"], "1:902")
+        self.assertEqual(ctx["fromTripId"], "1:879781")
+        self.assertEqual(ctx["toTripId"], "1:902233")
+        self.assertEqual(ctx["legIndex"], 0)
+        # 20 min between leg starts, 3 min of riding: 17 min on the platform.
+        self.assertEqual(ctx["waitMs"], 1020000)
+
+    def test_a_real_transfer_says_nothing(self):
+        watch = self.ride([("1:902", "1:879781"), ("1:921", "1:400001")])
+        self.assertEqual(self.find(watch, "same-route-transfer"), [])
+
+    def test_one_trip_split_across_two_legs_is_not_a_transfer(self):
+        """The app splitting one ride is a different animal entirely."""
+        watch = self.ride([("1:902", "1:879781"), ("1:902", "1:879781")])
+        self.assertEqual(self.find(watch, "same-route-transfer"), [])
+
+    def test_a_missing_trip_id_is_not_evidence(self):
+        watch = self.ride([("1:902", None), ("1:902", "1:902233")])
+        self.assertEqual(self.find(watch, "same-route-transfer"), [])
+
+    def test_the_same_pair_reinstalled_is_still_one_finding(self):
+        """Three of the 09-13 installs were quiet re-plans of the same
+        itinerary seconds apart."""
+        b = StreamBuilder().start(self.itinerary(
+            [("1:902", "1:879781"), ("1:902", "1:902233")]))
+        b.advance(1000).progress(leg=0, prog=5.0)
+        b.advance(1000).start(self.itinerary(
+            [("1:902", "1:879781"), ("1:902", "1:902233")]))
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "same-route-transfer")), 1)
+
+    def test_a_swap_that_installs_a_new_same_route_pair_is_reported(self):
+        """The rider re-ran the onboard flow and got a different bad pair."""
+        b = StreamBuilder().start(self.itinerary(
+            [("1:902", "1:879781"), ("1:902", "1:905008")]))
+        b.advance(1000).progress(leg=0, prog=5.0)
+        b.advance(1000).start(self.itinerary(
+            [("1:902", "1:879781"), ("1:902", "1:902233")]))
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "same-route-transfer")), 2)
+
+    def test_it_never_costs_the_rider_a_page(self):
+        watch = self.ride([("1:902", "1:879781"), ("1:902", "1:902233")])
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+
+class TestNoteAfterTheRide(RuleTestCase):
+    """A note typed in the minutes after a ride is about that ride.
+
+    2026-09-09 09:03:42: "We should finish a trip on auto if within x distance
+    for x time" — a sentence about the trip that had closed 53 s earlier at
+    09:02:49 — reached the daemon log as "rider note outside any trip" and
+    nothing else: no ledger, no digest, no report request, so the wrap-up that
+    was written six minutes later never saw it.
+    """
+
+    def ride_then_note(self, gap_ms, session=None, text="the bus never came"):
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        # One finding during the ride, so the ride ends with a report request
+        # to refresh (a ride with nothing to report does not grow a wrap-up
+        # because a note arrived after it).
+        b.advance(1000).note("during the ride")
+        b.advance(1000).stop()
+        b.advance(gap_ms).note(text, session=session)
+        return self.run_stream(b, finalize=False)
+
+    def notes(self, watch):
+        return [n["text"] for n in watch.ended_trips[0].notes]
+
+    def test_a_note_a_minute_after_the_ride_lands_on_that_ride(self):
+        watch = self.ride_then_note(60000)
+        self.assertEqual(self.notes(watch),
+                         ["during the ride", "the bus never came"])
+        late = [f for f in self.find(watch, "rider-note")
+                if f["context"]["text"] == "the bus never came"]
+        self.assertEqual(len(late), 1, self.rules(watch))
+        self.assertEqual(late[0]["severity"], "info")
+        self.assertEqual(late[0]["session"], SESSION)
+
+    def test_the_wrap_up_request_is_rewritten_so_the_note_reaches_it(self):
+        """The whole point: the report request is the wrap-up's input, and it
+        was written when the ride closed."""
+        watch = self.ride_then_note(60000)
+        paths = report_requests(self.tmp)
+        self.assertEqual(len(paths), 1)
+        with open(paths[0]) as f:
+            req = json.load(f)
+        self.assertEqual(req["notesCount"], 2)
+        self.assertEqual([n["text"] for n in req["riderNotes"]],
+                         ["during the ride", "the bus never came"])
+
+    def test_a_note_long_after_the_ride_is_still_only_logged(self):
+        """Five minutes, not "some time later": a note an hour on is about the
+        rider's evening, not about the trip."""
+        watch = self.ride_then_note(ride_watch.NOTE_ATTACH_GRACE_MS + 60000)
+        self.assertEqual(self.notes(watch), ["during the ride"])
+        self.assertEqual(len(self.find(watch, "rider-note")), 1)
+
+    def test_a_note_from_another_session_does_not_reach_this_ride(self):
+        """The session id is the evidence that it was this rider's ride. A
+        note from some other app mount is not."""
+        watch = self.ride_then_note(60000, session="someone-else")
+        self.assertEqual(self.notes(watch), ["during the ride"])
+
+    def test_a_note_during_a_live_ride_still_goes_to_the_live_ride(self):
+        """The window must not outrank an open trip: the 12.x path is the one
+        that matters on a normal ride."""
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).stop()
+        b.advance(30000).start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).note("about the ride I am on")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.ended_trips[0].notes, [])
+        self.assertEqual([n["text"] for n in watch.trips[SESSION].notes],
+                         ["about the ride I am on"])
+
+
+class TestSessionCachesAreBounded(RuleTestCase):
+    """The 09-13 rules keep per-session state, and the app mints a session id
+    on every mount while this daemon runs for days."""
+
+    def test_a_hundred_mounts_do_not_grow_the_caches_without_limit(self):
+        watch = quiet_watch(self.tmp)
+        for i in range(100):
+            b = StreamBuilder(session="mount-%03d" % i, t=T0 + i * 1000)
+            b.position().vehicle_feed().nearby_vehicles()
+            for ev in b.events:
+                watch.process(ev)
+        self.assertLessEqual(len(watch.session_fix),
+                             ride_watch.SESSION_CACHE_MAX + 1)
+        # The newest mount is always one of the survivors: the pruning keeps
+        # the most recent fixes, and a rule only ever asks about those.
+        self.assertIn("mount-099", watch.session_fix)
+        self.assertIn("mount-099", watch.route_vehicles)
+        self.assertLessEqual(len(watch.route_vehicles),
+                             ride_watch.SESSION_CACHE_MAX + 1)
+        self.assertLessEqual(len(watch.nearby_vehicles_ms),
+                             ride_watch.SESSION_CACHE_MAX + 1)
+
+
+
+# --- recorded slices: the 2026-09-13 ride ------------------------------------
+
+REAL_LOG_0913 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-13.jsonl")
+
+
+def log_records(path, start_ms, end_ms, types=(), kinds=()):
+    """log_slice, plus the records that carry no `type` at all.
+
+    A rider note is `{"kind": "rider-note", "event": "RIDER_NOTE", ...}`, and
+    log_slice filters on `"type":` being in the line — which is exactly the
+    shape trap the daemon's own _process has (see the README).
+    """
+    out = []
+    with open(path) as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") not in types and obj.get("kind") not in kinds:
+                continue
+            t = obj.get("t") or 0
+            if start_ms <= t <= end_ms:
+                out.append(obj)
+    return out
+
+
+class TestRide0913(unittest.TestCase):
+    """The four rules of 15.7, replayed against the hour they were written from.
+
+    Session `mu01c0py-nrwza6`, 11:35:20-11:40:47. The rider boarded westbound
+    Green Line train 32141 at Dale St before Go Mode started; the app spent
+    the next five minutes re-planning a bike leg back to the station behind
+    them, told them "No buses detected nearby" while its own feed held the
+    train, and then — across three onboard flows — anchored the alight list at
+    the far end of the line and installed Green Line to Green Line as a
+    transfer.
+    """
+
+    SESSION = "mu01c0py-nrwza6"
+    BOARDING = (1789317340000, 1789317460000)      # 11:35:40-11:37:40
+    ONBOARD = (1789317450000, 1789317610000)       # 11:37:30-11:40:10
+    TYPES = {"START_GO_MODE", "STOP_GO_MODE", "UPDATE_PROGRESS",
+             "UPDATE_POSITION", "SET_RIDING", "CLEAR_RIDING",
+             "SHOW_BOARDING_PROMPT", "UPDATE_NEARBY_VEHICLES",
+             "REALTIME_VEHICLE_POSITIONS_RESPONSE", "START_ONBOARD_OPTIMIZE",
+             "ONBOARD_CANDIDATE_SNAPSHOT", "SET_ONBOARD_RESULT",
+             "TRANSITION_LEG", "SET_ARRIVED"}
+
+    def replay_window(self, window):
+        tmp = tempfile.mkdtemp(prefix="ride-watch-0913-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        for obj in log_records(REAL_LOG_0913, window[0], window[1],
+                               types=self.TYPES):
+            watch.process(obj)
+        watch.finalize_replay()
+        return watch
+
+    def hits(self, watch, rule):
+        return [f for f in watch.all_findings if f["rule"] == rule]
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0913),
+                         "%s not present" % REAL_LOG_0913)
+    def test_the_bike_leg_at_train_speed_is_caught_before_the_rider_types(self):
+        """11:36:11.049, 21.0 s of >= 12 m/s on leg 0 — 60 s before the
+        rider's own note at 11:37:11."""
+        watch = self.replay_window(self.BOARDING)
+        found = self.hits(watch, "access-leg-transit-speed")
+        self.assertEqual(len(found), 1,
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["tsMs"], 1789317371049)
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["legIndex"], 0)
+        self.assertEqual(ctx["legMode"], "BICYCLE")
+        self.assertEqual(ctx["sinceMs"], 1789317350051)   # 11:35:50.051
+        self.assertEqual(ctx["minMps"], 13.69)
+        self.assertEqual(ctx["maxMps"], 21.05)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0913),
+                         "%s not present" % REAL_LOG_0913)
+    def test_the_boarding_prompt_that_searched_nothing_is_caught(self):
+        """11:36:24.799. Two prompts fired in this window; the second
+        (11:36:37) is the honest one — the rider had slowed to 4.0 m/s and the
+        train was 748.5 m ahead, outside the 378 m the matcher would have
+        used — and the rule files one finding per ride regardless."""
+        watch = self.replay_window(self.BOARDING)
+        found = self.hits(watch, "boarding-prompt-empty")
+        self.assertEqual(len(found), 1,
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["tsMs"], 1789317384799)
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["routeId"], "1:902")
+        self.assertEqual(ctx["vehicleId"], "1:32141")
+        self.assertEqual(ctx["vehicleTripId"], "1:879781")
+        self.assertEqual(ctx["distanceM"], 634.8)
+        self.assertEqual(ctx["radiusM"], 884.7)
+        self.assertEqual(ctx["riderSpeedMps"], 15.22)
+        self.assertEqual(ctx["feedAgeMs"], 15024)         # last poll 11:36:09
+        self.assertIsNone(ctx["lastNearbyMs"])            # the matcher never ran
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0913),
+                         "%s not present" % REAL_LOG_0913)
+    def test_the_boarding_window_says_nothing_else(self):
+        """The whole ledger for those two minutes, before and after: one note
+        the rider typed by hand. These two findings are the entire machine
+        record the 09-13 report had to work with."""
+        watch = self.replay_window(self.BOARDING)
+        self.assertEqual(sorted(f["rule"] for f in watch.all_findings),
+                         ["access-leg-transit-speed", "boarding-prompt-empty"])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0913),
+                         "%s not present" % REAL_LOG_0913)
+    def test_the_union_depot_anchor_is_caught(self):
+        """11:38:38.346, first candidate Union Depot, 4760 m east of a fix
+        3.3 s old. The other three flows that hour anchored at 380 m, 97 m and
+        39 m and say nothing."""
+        watch = self.replay_window(self.ONBOARD)
+        found = self.hits(watch, "onboard-anchor-behind-rider")
+        self.assertEqual(len(found), 1,
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["tsMs"], 1789317518346)
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["stopName"], "Union Depot Station")
+        self.assertEqual(ctx["stopId"], "1:56026")
+        self.assertEqual(ctx["distanceM"], 4760.4)
+        self.assertEqual(ctx["fixAgeMs"], 3313)
+        self.assertFalse(ctx["realtime"])
+        # Resolved by the candidate snapshot 6.9 s after the optimize it is
+        # stamped at, and filed on the trip that opened at 11:40:00 — every
+        # onboard flow on this ride ran with no trip open.
+        self.assertEqual(ctx["detectedMs"], 1789317525234)
+        self.assertEqual(found[0]["session"], self.SESSION)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0913),
+                         "%s not present" % REAL_LOG_0913)
+    def test_both_green_to_green_installs_are_caught(self):
+        """11:37:59.227 (1:879781 then 1:905008, 12 min) and 11:40:00.336
+        (1:879781 then 1:902233, 16 min): two rides, two findings."""
+        watch = self.replay_window(self.ONBOARD)
+        found = self.hits(watch, "same-route-transfer")
+        self.assertEqual([f["tsMs"] for f in found],
+                         [1789317479227, 1789317600336],
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual([f["context"]["toTripId"] for f in found],
+                         ["1:905008", "1:902233"])
+        self.assertEqual([f["context"]["routeId"] for f in found],
+                         ["1:902", "1:902"])
+        self.assertEqual([f["context"]["waitMs"] for f in found],
+                         [720000, 960000])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0913),
+                         "%s not present" % REAL_LOG_0913)
+    def test_the_onboard_window_pages_nobody(self):
+        """All four rules are warn or info by design: the rider is looking at
+        the screen each of them is about, and a ride has two interrupts."""
+        watch = self.replay_window(self.ONBOARD)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+        self.assertEqual(sorted(set(f["severity"]
+                                    for f in watch.all_findings)), ["warn"])
+
+
+class TestRide0909LateNote(unittest.TestCase):
+    """The 2026-09-09 note that fell between the rides, replayed.
+
+    Ride 1 (08:17:34-09:02:49, ended `arrived` five minutes after the app
+    said `completed`), then at 09:03:42 the rider typed "We should finish a
+    trip on auto if within x distance for x time" and the daemon logged it as
+    outside any trip. The `SET_GO_MODE_BACKGROUNDED` at 09:03:19 is what
+    advances the replay clock past the arrival close, exactly as the live
+    daemon's own timer tick did at 09:02:49.
+    """
+
+    SESSION = "mtu45mqw-co4i61"
+    WINDOW = (1788962100000, 1788962700000)        # 08:55:00-09:05:00
+    NOTE_MS = 1788962622253                        # 09:03:42.253
+    TYPES = {"START_GO_MODE", "STOP_GO_MODE", "UPDATE_PROGRESS",
+             "SET_ARRIVED", "TRANSITION_LEG", "SET_GO_MODE_BACKGROUNDED"}
+
+    def replay(self):
+        tmp = tempfile.mkdtemp(prefix="ride-watch-0909-note-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        for obj in log_records(REAL_LOG_0909, self.WINDOW[0], self.WINDOW[1],
+                               types=self.TYPES, kinds=("rider-note",)):
+            watch.process(obj)
+        watch.finalize_replay()
+        return tmp, watch
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0909),
+                         "%s not present" % REAL_LOG_0909)
+    def test_the_note_lands_on_the_ride_that_had_just_ended(self):
+        tmp, watch = self.replay()
+        self.assertEqual(len(watch.ended_trips), 1)
+        trip = watch.ended_trips[0]
+        self.assertEqual(trip.end_reason, "arrived")
+        # Closed at 09:03:19 in the replay (the last record before the note);
+        # the live daemon closed it at 09:02:49 on its own tick. Either way
+        # the note arrives after the ride is over and inside the window.
+        self.assertLess(trip.end_ms, self.NOTE_MS)
+        self.assertLessEqual(self.NOTE_MS - trip.end_ms,
+                             ride_watch.NOTE_ATTACH_GRACE_MS)
+        self.assertEqual([n["tsMs"] for n in trip.notes], [self.NOTE_MS])
+        self.assertIn("finish a trip on auto", trip.notes[0]["text"])
+        notes = [f for f in watch.all_findings if f["rule"] == "rider-note"]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["session"], self.SESSION)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0909),
+                         "%s not present" % REAL_LOG_0909)
+    def test_the_wrap_up_request_carries_it(self):
+        tmp, watch = self.replay()
+        paths = sorted(glob.glob(os.path.join(
+            tmp, "report-request-%s-*.json" % self.SESSION)))
+        self.assertEqual(len(paths), 1, paths)
+        with open(paths[0]) as f:
+            req = json.load(f)
+        self.assertEqual(req["notesCount"], 1)
+        self.assertIn("finish a trip on auto", req["riderNotes"][0]["text"])
 
 
 if __name__ == "__main__":

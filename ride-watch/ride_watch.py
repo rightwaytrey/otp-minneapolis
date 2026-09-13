@@ -335,6 +335,74 @@ REROUTE_SNAP_RING = 8                      # ~12 min of captures, all we read
 # transition and SET_RIDING landed 2 s later.
 EARLY_TRANSITION_PROGRESS_PCT = 90.0
 
+# --- the 2026-09-13 Green Line ride (15.7) ----------------------------------
+#
+# Four rules, all of them warn or info, all of them about the same hour: the
+# rider was aboard a train the app had no idea they were on. None of them is a
+# page and none belongs in PAGE_RANK — the rider was already looking at the
+# screen each is about, and a ride has two interrupts to spend on things they
+# cannot see. What they are for is the ledger and the report: on 09-13 the
+# daemon's whole machine record of the ride was one rider note.
+#
+# access-leg-transit-speed. A WALK/BICYCLE leg does not travel at 15 m/s. On
+# 09-13 the speed was >= 12 m/s continuously from 11:35:50 (13.69) and peaked
+# at 21.05 at 11:36:11, all on leg 0 (BICYCLE) with no riding fact — the rider
+# had boarded at Dale St before Go Mode even started. 12 m/s is 27 mph: above
+# any bicycle and above the 5.9 m/s that early-leg-transition measured on a
+# rider genuinely sprinting for a station, and below a freeway. 20 s so a
+# single absurd fix cannot fire it (the daemon has seen 1414 m accuracy).
+ACCESS_TRANSIT_SPEED_MPS = 12.0
+ACCESS_TRANSIT_SPEED_MS = 20 * 1000
+#
+# boarding-prompt-empty. "I'm on the bus" renders `vehicleMatch.nearbyVehicles`
+# (otprr BoardingPrompt.tsx:82), which only the transit-leg matcher writes, so
+# on an access leg the button searches nothing and says "No buses detected
+# nearby" (15.2). The daemon cannot see the screen, but it can see the two
+# halves: no UPDATE_NEARBY_VEHICLES in the 30 s before the prompt (the matcher
+# did not run) while the route feed the trip sheet *was* polling held a vehicle
+# inside the radius the matcher itself would have used. That radius is the
+# client's own speedAdjustedRadius: 200 m plus 45 s of travel at the rider's
+# speed. At 11:36:24.799 the last poll was 15 s old, the rider was doing
+# 15.2 m/s (radius 885 m) and train 32141 was 634.8 m away: the search would
+# have found it. The 11:36:37 prompt is the control — the rider had slowed to
+# 4.0 m/s (radius 378 m) and 32141 had pulled 748.5 m ahead, so a matcher that
+# ran would have come back empty and the prompt was telling the truth.
+BOARDING_PROMPT_NEARBY_WINDOW_MS = 30 * 1000
+BOARDING_PROMPT_BASE_RADIUS_M = 200.0      # == client speedAdjustedRadius base
+BOARDING_PROMPT_SPEED_SECONDS = 45.0       # ...and its seconds-of-travel term
+# A feed reading older than this says nothing about where a train is now; the
+# trip sheet polls every ~20 s, so this is several missed polls.
+BOARDING_PROMPT_MAX_RADIUS_M = 2500.0      # ...and its cap
+BOARDING_PROMPT_FEED_MAX_AGE_MS = 2 * 60 * 1000
+#
+# onboard-anchor-behind-rider. STOP_GO_MODE wipes the client's
+# `tracking.lastPosition`; an onboard flow begun before the next fix lands
+# falls to `findAnchorIndex` index 0 and builds the alight list from the FIRST
+# stop of the line (15.5). On 09-13: STOP 11:38:36.664, BEGIN_ONBOARD_FLOW
+# 11:38:38.013, START_ONBOARD_OPTIMIZE 11:38:38.346 with first candidate Union
+# Depot — 4760 m east of the last fix (11:38:35.033) — and the next fix landed
+# 11:38:39.035, 689 ms too late. The three correct flows that hour anchored at
+# 380 m, 97 m and 39 m, so 2 km is nowhere near either population.
+#
+# The candidates carry `stopId`/`stopName`/`busArrivalEpoch` and NO
+# coordinates, so this cannot be answered at the optimize. The coordinates
+# arrive with the per-candidate ONBOARD_CANDIDATE_SNAPSHOT (`request.from`,
+# keyed back to the candidate by `busArrivalEpoch`) — 11:38:45.234 for Union
+# Depot, 6.9 s later. The finding is therefore stamped at the optimize it is
+# about and carries `detectedMs` for the snapshot that resolved it.
+ONBOARD_ANCHOR_FAR_M = 2000.0
+# A fix this old cannot convict an anchor: the rider may have moved. The real
+# one was 3.3 s old.
+ONBOARD_ANCHOR_FIX_MAX_AGE_MS = 3 * 60 * 1000
+#
+# same-route-transfer. Two consecutive transit legs on the same routeId with
+# different tripIds is the rider getting off their own vehicle to wait for the
+# next one of the same route — never a transfer, always a defect in the alight
+# ranking (15.4). On 09-13 the 11:40:00 START_GO_MODE installed Green Line
+# 1:879781 Lexington->Snelling then Green Line 1:902233 Snelling 11:59->Raymond:
+# sixteen minutes on a platform to board the train behind the one they were on.
+# The 11:37:59 install had the same shape (1:879781 then 1:905008).
+
 # Nothing pages when the wrap-up never appears (8/28). The ride thread spawned
 # fine, took the wrap-up line, and then sat at a permission prompt for about
 # three hours; _thread_missing was false the whole time, so the one fallback
@@ -557,6 +625,22 @@ RECORD_DEDUP_RING = 4096
 STATUS_DEBOUNCE_MS = 2000
 STOP_INCREASE_COOLDOWN_MS = 60 * 1000
 RIDER_NOTE_MAX_CHARS = 500                 # matches the sidecar's own cap
+# A note the rider types in the minutes after a ride ends is about that ride.
+# The daemon used to drop it ("rider note outside any trip"): on 2026-09-09 the
+# 09:03:42 note "We should finish a trip on auto if within x distance for x
+# time" — a sentence about the trip that had just ended — landed 53 s after the
+# 09:02:49 arrival close and reached no ledger, no digest and no report. Five
+# minutes, and only for a trip this same session id ran: the rider is still
+# holding the phone that finished the ride, and a note from some other session
+# is not evidence about this one.
+NOTE_ATTACH_GRACE_MS = 5 * 60 * 1000
+
+# The per-session caches the 09-13 rules read (last fix, route feeds, last
+# vehicle search, pending onboard anchor) are keyed by a session id the app
+# mints on every mount, and this daemon is meant to run for days. Bound them.
+SESSION_CACHE_MAX = 64
+SESSION_CACHE_KEEP = 16
+ROUTE_FEED_KEEP = 8
 
 # The ride thread. One remote-control Claude conversation per ride, spawned in
 # tmux at trip start, visible in the rider's phone app, fed one line per
@@ -927,6 +1011,13 @@ def summarize_itinerary(payload):
             "mode": leg.get("mode"),
             "transit": leg_is_transit(leg),
             "route": route,
+            # The ids, not just the label. "METRO Green Line > METRO Green
+            # Line" is two legs of the same route and reads like a transfer
+            # only because the shortName is null on the Green Line; what says
+            # it is a defect is routeId equal and tripId different (15.4).
+            "routeId": (leg.get("routeId")
+                        or (r.get("gtfsId") if isinstance(r, dict) else None)),
+            "tripId": leg.get("tripId"),
             "headsign": leg.get("headsign"),
             "from": ((leg.get("from") or {}).get("name")),
             "to": ((leg.get("to") or {}).get("name")),
@@ -1006,6 +1097,16 @@ class Trip:
         # early-leg-transition, which needs the leg the rider is LEAVING.
         self.leg_progress_last = {}
         self.early_transition_legs = set()        # legs already reported
+        # The open run of transit-grade speed on an access leg, or None:
+        # {"fromMs", "leg", "minMps", "maxMps"}. See ACCESS_TRANSIT_SPEED_MPS.
+        self.fast_access = None
+        self.fast_access_legs = set()             # legs already reported
+        # (routeId, tripId, tripId) signatures already reported by
+        # same-route-transfer. Keyed on the pair, not the trip: the 09-13
+        # session installed two different same-route pairs within three
+        # minutes and both are worth one line each.
+        self.same_route_pairs = set()
+        self.boarding_prompt_fired = False
         self.prev_stops = None
         self.stops_swap_pending = False   # itinerary swapped since last count
         self.collapse_fired_seq = set()
@@ -1120,7 +1221,27 @@ class RideWatch:
         # Onboard-flow anomalies seen BEFORE a trip exists. The "I'm already on
         # a bus" flow runs entirely pre-START_GO_MODE, so its findings have no
         # trip to hang on yet; they are flushed when the trip opens.
-        self.pending_onboard = {}     # session -> [(t, rule, summary, ctx, push)]
+        self.pending_onboard = {}     # session -> [(t, rule, severity, summary, ctx)]
+        # The last position fix per SESSION, not per trip. The onboard flow
+        # runs between rides by definition — on 09-13 the bad anchor was built
+        # 1.7 s after a STOP_GO_MODE — so a rule that asks "where was the
+        # rider" cannot reach for trip.last_fix. {session: (lat, lon, tMs)}.
+        self.session_fix = {}
+        # session -> {routeId: {"tMs", "vehicles": [(lat, lon, vehicleId,
+        # tripId, label)]}}: the last REALTIME_VEHICLE_POSITIONS_RESPONSE the
+        # trip sheet polled for a route. This is the feed the app HAD while
+        # its boarding prompt said "No buses detected nearby" (15.2), and the
+        # only way the daemon can tell an empty search from an empty road.
+        self.route_vehicles = {}
+        # session -> ms of the last UPDATE_NEARBY_VEHICLES. The matcher's only
+        # output; its absence is what says the search never ran.
+        self.nearby_vehicles_ms = {}
+        # session -> the anchor candidate of the last START_ONBOARD_OPTIMIZE,
+        # waiting for the snapshot that carries its coordinates.
+        self.onboard_anchor = {}
+        # stopId -> (lat, lon), learned from ONBOARD_CANDIDATE_SNAPSHOT
+        # requests. The optimize payload names stops and never places them.
+        self.stop_coords = {}
         # Wrap-ups that have been asked for and not yet appeared. Deliberately
         # NOT keyed off self.trips: _end_trip deletes the Trip, which is how
         # the missing-report case escaped every timer in this file. Restored
@@ -1420,6 +1541,20 @@ class RideWatch:
             # one of these fell through and the daemon saw none of it.
             self._rule_stale_alight_candidate(session, t, typ,
                                               obj.get("payload"), trip)
+            if typ == "START_ONBOARD_OPTIMIZE":
+                self._note_onboard_anchor(session, t, obj.get("payload"))
+        elif typ == "ONBOARD_CANDIDATE_SNAPSHOT":
+            # The only record in the stream that places a candidate stop on
+            # the map. Same reason it sits here: on 09-13 every one of these
+            # arrived with no trip open.
+            self._on_candidate_snapshot(session, t, obj.get("payload"), trip)
+        elif typ in ("REALTIME_VEHICLE_POSITIONS_RESPONSE",
+                     "UPDATE_NEARBY_VEHICLES", "SHOW_BOARDING_PROMPT"):
+            # Above the trip chain because the boarding prompt and the feed
+            # poll both run outside a ride (the onboard flow taps the same
+            # button); the rule itself does nothing without a trip.
+            self._on_boarding_evidence(session, t, typ, obj.get("payload"),
+                                       trip)
         elif typ == "SET_QUERY_PARAM":
             # Above the `trip is not None` chain for the same reason as the
             # onboard branch: the rider edits the query from the search form
@@ -1434,6 +1569,7 @@ class RideWatch:
                 self._rule_wake_lock_denied(trip, t, obj)
             elif typ == "UPDATE_POSITION":
                 trip.last_pos_ms = max(trip.last_pos_ms, t)
+                self._note_session_fix(session, t, obj.get("payload") or {})
                 # Only a fix that actually closes the gap closes the gap. A
                 # phone coming back onto the network replays its buffered
                 # fixes, each stamped with its own OLD time, and every one of
@@ -1487,6 +1623,12 @@ class RideWatch:
             # (daemon started mid-trip, or the app resumed Go Mode from
             # persisted state, which emits none): consider adopting.
             self._maybe_adopt(session, t, obj)
+        elif typ == "UPDATE_POSITION":
+            # No trip — but the onboard flow runs between rides and asks where
+            # the rider is (onboard-anchor-behind-rider). The fix is recorded
+            # per session either way; only the trip bookkeeping above is
+            # trip-scoped.
+            self._note_session_fix(session, t, obj.get("payload") or {})
 
         # Time-based rules ride on the advancing clock.
         self.check_timers()
@@ -1538,6 +1680,7 @@ class RideWatch:
             self._note_replan(trip, t, "itinerary-swap")
         self._flush_pending_onboard(trip)
         self._rule_itinerary_backwards(trip, t, summary)
+        self._rule_same_route_transfer(trip, t)
         self._mark_dirty()
 
     def _maybe_adopt(self, session, t, obj):
@@ -2066,9 +2209,9 @@ class RideWatch:
 
     def _flush_pending_onboard(self, trip):
         """Emit onboard-flow findings that had no trip to hang on yet."""
-        for (ts, rule, summary, ctx) in self.pending_onboard.pop(
+        for (ts, rule, severity, summary, ctx) in self.pending_onboard.pop(
                 trip.session, []):
-            self._finding(trip, ts, rule, "warn", summary, ctx)
+            self._finding(trip, ts, rule, severity, summary, ctx)
 
     def _rule_itinerary_backwards(self, trip, t, summary):
         """A leg that starts before the previous one ends (8/9).
@@ -2162,12 +2305,380 @@ class RideWatch:
         else:
             # No trip yet — the onboard flow runs before START_GO_MODE. Hold
             # the first one for the trip that is about to open.
-            held = self.pending_onboard.setdefault(session, [])
-            if held:
+            self._hold_onboard_finding(session, None, t,
+                                       "stale-alight-candidate", "warn",
+                                       summary, ctx)
+
+    # -- the 2026-09-13 ride: an app that could not see the train under it ---
+
+    def _note_session_fix(self, session, t, payload):
+        """Remember where the rider was, per session id.
+
+        Called from both sides of the trip chain on purpose: on 09-13 the fix
+        that convicts the Union Depot anchor (11:38:35.033) arrived while a
+        trip was open and was read 3.3 s later with none open.
+        """
+        coords = (payload or {}).get("coords")
+        if not isinstance(coords, dict):
+            return
+        lat, lon = coords.get("latitude"), coords.get("longitude")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return
+        if len(self.session_fix) > SESSION_CACHE_MAX and \
+                session not in self.session_fix:
+            self._prune_session_caches()
+        prev = self.session_fix.get(session)
+        if prev is not None and prev[2] > t:
+            # A phone coming back onto the network replays buffered fixes,
+            # each stamped with its own old time (the 8/27 gps-gap storm).
+            # The newest fix is the one a rule may reason from.
+            return
+        # ...and the fix's own ground speed, which is the number the client
+        # feeds speedAdjustedRadius (`userPos.coords.speed`,
+        # lib/actions/go-mode.ts:6102). It is the same float UPDATE_PROGRESS
+        # republishes as riderSpeedMps — checked tick for tick across the
+        # 09-13 ride — but reading it here means the radius is rebuilt from
+        # the record the app itself used, and works on a stream with no
+        # progress tick beside the fix.
+        speed = coords.get("speed")
+        self.session_fix[session] = (
+            float(lat), float(lon), int(t),
+            float(speed) if isinstance(speed, (int, float)) and speed > 0
+            else None)
+
+    def _prune_session_caches(self):
+        """Keep the per-session boarding caches to the newest few sessions.
+
+        Every one of these is keyed by a session id the app mints fresh on each
+        mount, and the daemon is meant to run for days. The fixes carry their
+        own timestamps, so "newest" is exact; the other three follow the fix,
+        because a session with no fix in memory can be judged by none of them.
+        """
+        keep = set(sorted(self.session_fix,
+                          key=lambda k: self.session_fix[k][2]
+                          )[-SESSION_CACHE_KEEP:])
+        self.session_fix = dict((k, v) for k, v in self.session_fix.items()
+                                if k in keep)
+        for cache in (self.route_vehicles, self.nearby_vehicles_ms,
+                      self.onboard_anchor):
+            for key in [k for k in cache if k not in keep]:
+                del cache[key]
+
+    def _hold_onboard_finding(self, session, trip, ts, rule, severity,
+                              summary, ctx):
+        """File an onboard-flow finding, or hold it for the trip that follows.
+
+        The flow runs between rides — before the first START_GO_MODE (8/9) or,
+        on 09-13, in the seconds after a STOP — so half of these have no trip
+        to hang on. One held finding per rule per session: two identical lines
+        say nothing the first did, but two different rules are two findings.
+        """
+        if trip is not None:
+            self._finding(trip, ts, rule, severity, summary, ctx)
+            return
+        held = self.pending_onboard.setdefault(session, [])
+        if any(h[1] == rule for h in held):
+            return
+        held.append((ts, rule, severity, summary, ctx))
+        self.log.info("held onboard finding for session %s: %s"
+                      % (session, summary))
+
+    def _note_onboard_anchor(self, session, t, payload):
+        """Record the candidate list's anchor and try to place it.
+
+        The anchor is the FIRST candidate, in list order: that is the stop
+        `findAnchorIndex` decided the rider was at. Its coordinates are not in
+        this record, so unless some earlier snapshot has already placed the
+        stop this waits for the one that will.
+        """
+        candidates = (payload or {}).get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return
+        first = candidates[0]
+        if not isinstance(first, dict):
+            return
+        fix = self.session_fix.get(session)
+        self.onboard_anchor[session] = {
+            "tMs": int(t),
+            "stopId": first.get("stopId"),
+            "stopName": first.get("stopName"),
+            "busArrivalEpoch": first.get("busArrivalEpoch"),
+            "realtime": first.get("realtime"),
+            "candidates": len(candidates),
+            "fix": fix,
+        }
+        self._check_onboard_anchor(session, None)
+
+    def _on_candidate_snapshot(self, session, t, payload, trip):
+        """Learn where a candidate stop is, then judge the pending anchor.
+
+        `request.from` is the stop the plan was asked from, and
+        `request.busArrivalEpoch` is the same float the candidate carried, so
+        the two records join exactly. The name is the fallback join for a
+        stream where the epoch was rounded away.
+        """
+        req = (payload or {}).get("request")
+        if not isinstance(req, dict):
+            return
+        frm = req.get("from")
+        if not isinstance(frm, dict):
+            return
+        lat, lon = frm.get("lat"), frm.get("lon")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return
+        pending = self.onboard_anchor.get(session)
+        if not pending:
+            return
+        same = (pending.get("busArrivalEpoch") is not None
+                and req.get("busArrivalEpoch") == pending["busArrivalEpoch"])
+        if not same:
+            same = (bool(pending.get("stopName"))
+                    and frm.get("name") == pending["stopName"])
+        if not same:
+            return
+        if pending.get("stopId"):
+            self.stop_coords[pending["stopId"]] = (float(lat), float(lon))
+        pending["coords"] = (float(lat), float(lon))
+        self._check_onboard_anchor(session, trip, detected_ms=t)
+
+    def _check_onboard_anchor(self, session, trip, detected_ms=None):
+        """onboard-anchor-behind-rider: the alight list built from elsewhere.
+
+        Fires once per optimize, stamped at the optimize it is about rather
+        than at the snapshot that happened to resolve it — the defect is the
+        list the rider was shown, and `detectedMs` in the context says when
+        the daemon could first prove it.
+        """
+        pending = self.onboard_anchor.get(session)
+        if not pending or pending.get("fired"):
+            return
+        coords = pending.get("coords")
+        if coords is None and pending.get("stopId"):
+            coords = self.stop_coords.get(pending["stopId"])
+        fix = pending.get("fix")
+        if coords is None or fix is None:
+            return
+        age = pending["tMs"] - fix[2]
+        if age > ONBOARD_ANCHOR_FIX_MAX_AGE_MS:
+            # Too long since the rider was last seen to say the anchor is
+            # behind them rather than the daemon being behind the rider.
+            pending["fired"] = True
+            return
+        dist = meters_between((fix[0], fix[1]), coords)
+        if dist <= ONBOARD_ANCHOR_FAR_M:
+            return
+        pending["fired"] = True
+        name = pending.get("stopName") or pending.get("stopId") or "a stop"
+        summary = ("onboard alight list anchored at %s, %.1f km from the "
+                   "rider's last fix %s earlier — the candidates are built "
+                   "from the wrong end of the line"
+                   % (name, dist / 1000.0, fmt_ms_span(age)))
+        ctx = {"stopId": pending.get("stopId"), "stopName": name,
+               "distanceM": round(dist, 1),
+               "candidates": pending.get("candidates"),
+               "realtime": pending.get("realtime"),
+               "fixMs": fix[2], "fixAgeMs": int(age),
+               "fix": [fix[0], fix[1]], "anchor": [coords[0], coords[1]],
+               "optimizeMs": pending["tMs"]}
+        if detected_ms is not None:
+            ctx["detectedMs"] = int(detected_ms)
+        self._hold_onboard_finding(session, trip, pending["tMs"],
+                                   "onboard-anchor-behind-rider", "warn",
+                                   summary, ctx)
+
+    def _on_boarding_evidence(self, session, t, typ, payload, trip):
+        """The three records boarding-prompt-empty reads."""
+        if typ == "UPDATE_NEARBY_VEHICLES":
+            self.nearby_vehicles_ms[session] = int(t)
+            return
+        if typ == "REALTIME_VEHICLE_POSITIONS_RESPONSE":
+            route = (payload or {}).get("routeId")
+            vehicles = (payload or {}).get("vehicles")
+            if not route or not isinstance(vehicles, list):
                 return
-            held.append((t, "stale-alight-candidate", summary, ctx))
-            self.log.info("held onboard finding for session %s: %s"
-                          % (session, summary))
+            kept = []
+            for v in vehicles:
+                if not isinstance(v, dict):
+                    continue
+                lat, lon = v.get("lat"), v.get("lon")
+                if not isinstance(lat, (int, float)) or \
+                        not isinstance(lon, (int, float)):
+                    continue
+                kept.append({"lat": float(lat), "lon": float(lon),
+                             "vehicleId": v.get("vehicleId"),
+                             "tripId": v.get("tripId"),
+                             "label": v.get("label")})
+            if not kept:
+                return
+            feeds = self.route_vehicles.setdefault(session, {})
+            feeds[route] = {"tMs": int(t), "vehicles": kept}
+            # One trip sheet polls one or two routes; a session that has seen
+            # more than this has moved on from whatever the oldest was.
+            for stale in sorted(feeds, key=lambda r: feeds[r]["tMs"]
+                                )[:-ROUTE_FEED_KEEP]:
+                del feeds[stale]
+            return
+        self._rule_boarding_prompt_empty(session, t, trip)
+
+    def _rule_boarding_prompt_empty(self, session, t, trip):
+        """"I'm on the bus" searched nothing while the feed held the bus.
+
+        INFO, and once per ride. The rider is looking at the screen — they
+        just tapped the button — so it asks nothing of them in the next
+        minute; what it is for is the report, where on 09-13 the whole machine
+        record of this defect was the rider typing it out by hand at 11:37:11.
+        """
+        if trip is None or trip.boarding_prompt_fired:
+            return
+        last_nearby = self.nearby_vehicles_ms.get(session, 0)
+        if last_nearby and (t - last_nearby) <= BOARDING_PROMPT_NEARBY_WINDOW_MS:
+            # The matcher did run: whatever the prompt showed, it showed the
+            # result of a search. (11:37:38 and 11:39:44 on 09-13, both from
+            # the onboard flow, which runs its own.)
+            return
+        fix = self.session_fix.get(session)
+        if fix is None:
+            return
+        speed = fix[3]
+        if speed is None and trip.progress and isinstance(
+                trip.progress.get("riderSpeedMps"), (int, float)):
+            speed = trip.progress["riderSpeedMps"]
+        speed = max(0.0, float(speed or 0.0))
+        # speedAdjustedRadius(200, speed), cap included (vehicle-matching.ts
+        # :133-139, FEED_LAG_SECONDS 45, MAX_ADJUSTED_RADIUS_METERS 2500).
+        radius = min(BOARDING_PROMPT_BASE_RADIUS_M
+                     + BOARDING_PROMPT_SPEED_SECONDS * speed,
+                     BOARDING_PROMPT_MAX_RADIUS_M)
+        feeds = self.route_vehicles.get(session) or {}
+        best = None
+        for leg in (trip.itinerary or {}).get("legs") or []:
+            if not leg.get("transit"):
+                continue
+            feed = feeds.get(leg.get("routeId"))
+            if not feed or (t - feed["tMs"]) > BOARDING_PROMPT_FEED_MAX_AGE_MS:
+                continue
+            for v in feed["vehicles"]:
+                dist = meters_between((fix[0], fix[1]), (v["lat"], v["lon"]))
+                if best is None or dist < best[0]:
+                    best = (dist, v, leg, feed)
+        if best is None or best[0] > radius:
+            return
+        dist, vehicle, leg, feed = best
+        trip.boarding_prompt_fired = True
+        label = vehicle.get("label") or vehicle.get("vehicleId") or "a vehicle"
+        summary = ("boarding prompt with no vehicle search in the %ds before "
+                   "it, while the %s feed put %s %.0fm away (inside the %.0fm "
+                   "the matcher would have used)"
+                   % (BOARDING_PROMPT_NEARBY_WINDOW_MS / 1000,
+                      leg.get("route") or leg.get("routeId") or "route",
+                      label, dist, radius))
+        self._finding(trip, t, "boarding-prompt-empty", "info", summary, {
+            "routeId": leg.get("routeId"),
+            "route": leg.get("route"),
+            "vehicleId": vehicle.get("vehicleId"),
+            "vehicleTripId": vehicle.get("tripId"),
+            "distanceM": round(dist, 1),
+            "radiusM": round(radius, 1),
+            "riderSpeedMps": round(speed, 2),
+            "feedMs": feed["tMs"],
+            "feedAgeMs": int(t - feed["tMs"]),
+            "fixMs": fix[2],
+            "lastNearbyMs": last_nearby or None,
+        })
+
+    def _rule_access_leg_transit_speed(self, trip, t, p):
+        """A bike leg doing 15 m/s: the rider is on a vehicle, silently.
+
+        WARN, once per leg. The streak is kept on the leg index and the riding
+        fact, not on the itinerary identity — the 09-13 ride swapped its
+        itinerary three times inside the same run of speed (11:35:52,
+        11:36:18, 11:36:44), each time re-planning the same bike leg 0, and a
+        streak reset on swap would have watched the rider do 21 m/s and said
+        nothing.
+        """
+        speed = p.get("riderSpeedMps")
+        leg = p.get("currentLegIndex")
+        if (not isinstance(speed, (int, float))
+                or speed < ACCESS_TRANSIT_SPEED_MPS
+                or trip.riding is not None
+                # False = the itinerary says this leg is WALK/BICYCLE. None is
+                # "cannot tell" (summarized payload, adopted trip) and is not
+                # evidence of anything.
+                or self._leg_is_transit(trip, leg) is not False):
+            trip.fast_access = None
+            return
+        run = trip.fast_access
+        if run is None or run["leg"] != leg:
+            run = trip.fast_access = {"fromMs": int(t), "leg": leg,
+                                      "minMps": float(speed),
+                                      "maxMps": float(speed), "ticks": 1}
+            return
+        run["ticks"] += 1
+        run["minMps"] = min(run["minMps"], float(speed))
+        run["maxMps"] = max(run["maxMps"], float(speed))
+        held = t - run["fromMs"]
+        if held < ACCESS_TRANSIT_SPEED_MS or leg in trip.fast_access_legs:
+            return
+        trip.fast_access_legs.add(leg)
+        legs = (trip.itinerary or {}).get("legs") or []
+        mode = (legs[leg].get("mode")
+                if isinstance(leg, int) and 0 <= leg < len(legs) else None)
+        summary = ("leg %s (%s) has been doing %.1f-%.1f m/s for %s with no "
+                   "riding fact — the rider is on a vehicle the app has not "
+                   "noticed" % (leg, mode or "access", run["minMps"],
+                                run["maxMps"], fmt_ms_span(held)))
+        self._finding(trip, t, "access-leg-transit-speed", "warn", summary, {
+            "legIndex": leg, "legMode": mode,
+            "sinceMs": run["fromMs"], "heldMs": int(held),
+            "ticks": run["ticks"],
+            "minMps": round(run["minMps"], 2),
+            "maxMps": round(run["maxMps"], 2),
+            "thresholdMps": ACCESS_TRANSIT_SPEED_MPS,
+        })
+
+    def _rule_same_route_transfer(self, trip, t):
+        """Two consecutive legs on one route, two different trips.
+
+        The rider is told to get off their own vehicle and wait on the
+        platform for the next one of the same route. It is never a transfer
+        and the ranker cannot see it (15.4). WARN: by the time the itinerary
+        is installed the rider has already chosen it, and the fix is in the
+        app, not in anything they can do in the next minute.
+        """
+        legs = (trip.itinerary or {}).get("legs") or []
+        for i in range(len(legs) - 1):
+            a, b = legs[i], legs[i + 1]
+            if not (a.get("transit") and b.get("transit")):
+                continue
+            route = a.get("routeId")
+            if not route or route != b.get("routeId"):
+                continue
+            if not a.get("tripId") or not b.get("tripId") \
+                    or a["tripId"] == b["tripId"]:
+                # Same trip across two legs is the app splitting one ride, not
+                # a transfer at all.
+                continue
+            key = (route, a["tripId"], b["tripId"])
+            if key in trip.same_route_pairs:
+                continue
+            trip.same_route_pairs.add(key)
+            wait = None
+            if isinstance(a.get("endTime"), (int, float)) and \
+                    isinstance(b.get("startTime"), (int, float)):
+                wait = int(b["startTime"] - a["endTime"])
+            summary = ("itinerary transfers %s to itself at %s: trip %s then "
+                       "trip %s%s" % (a.get("route") or route,
+                                      b.get("from") or "a stop",
+                                      a["tripId"], b["tripId"],
+                                      (" — %s on the platform"
+                                       % fmt_ms_span(wait)) if wait else ""))
+            self._finding(trip, t, "same-route-transfer", "warn", summary, {
+                "routeId": route, "route": a.get("route"),
+                "fromTripId": a["tripId"], "toTripId": b["tripId"],
+                "atStop": b.get("from"), "legIndex": i,
+                "waitMs": wait,
+                "alightMs": a.get("endTime"), "boardMs": b.get("startTime"),
+            })
 
     def _end_trip(self, trip, t, reason):
         # Whole-leg verdicts, before anything counts the findings: a rule whose
@@ -2499,9 +3010,15 @@ class RideWatch:
             # daemon threw it away — which is why the afternoon's 32 minutes
             # of non-convergent re-planning were invisible here.
             "distanceToDestination": p.get("distanceToDestination"),
+            # The client's own smoothed ground speed. Read by
+            # access-leg-transit-speed and by boarding-prompt-empty, which
+            # needs it to rebuild the radius the app's matcher would have
+            # used (speedAdjustedRadius).
+            "riderSpeedMps": p.get("riderSpeedMps"),
             "tMs": t,
         }
         self._note_destination_distance(trip, p.get("distanceToDestination"))
+        self._rule_access_leg_transit_speed(trip, t, p)
         # Per-leg last progress. early-leg-transition asks about the leg the
         # rider is LEAVING, and by the time TRANSITION_LEG arrives
         # trip.progress has already been overwritten by the new leg's first
@@ -3836,6 +4353,14 @@ class RideWatch:
             return
         text = text.strip()[:RIDER_NOTE_MAX_CHARS]
         if trip is None:
+            # This session's ride has just ended. A note typed in the minutes
+            # after a ride is about that ride — on 2026-09-09 the 09:03:42
+            # note was a sentence about the trip that had closed 53 s earlier
+            # — and the session id says whose ride it was, which is stronger
+            # evidence than "only one ride happens to be running". Tried
+            # before the single-active-trip guess for exactly that reason.
+            trip = self._recently_ended_trip(session, t)
+        if trip is None:
             # The sidecar guesses the session from the log tail and can miss.
             # If exactly one trip is running, the note is plainly about it —
             # that is the timestamp correlation the note stream exists for.
@@ -3881,6 +4406,38 @@ class RideWatch:
         self._finding(trip, t, "rider-note", "info",
                       "rider note: %s" % text[:160], context,
                       thread_push=(source != "ride-thread"))
+        if trip.end_ms is not None and trip.report_path:
+            # The wrap-up's inputs were written when the ride closed, and the
+            # note is the half of a ride report that cannot be re-derived from
+            # telemetry. Rewrite the request so the thread reads it. Only when
+            # one was asked for: a ride that ended with nothing to report does
+            # not grow a wrap-up because a note arrived after it.
+            self._write_report_request(trip)
+            self.log.info("report request refreshed with a late note "
+                          "(%s, %s after the ride closed)"
+                          % (trip.session, fmt_ms_span(t - trip.end_ms)))
+
+    def _recently_ended_trip(self, session, t):
+        """The ride this session just finished, if it finished just now.
+
+        Newest first, and only a trip that really is over and really is this
+        session's: `sessions` rather than `session` because a ride the app
+        re-mounted mid-way answers to more than one id (_adopt_continuation),
+        and a note typed under the second one is still about that ride.
+        """
+        for trip in reversed(self.ended_trips):
+            if trip.end_ms is None or session not in trip.sessions:
+                continue
+            if 0 <= t - trip.end_ms <= NOTE_ATTACH_GRACE_MS:
+                self.log.info("note attached to the ride that ended %s "
+                              "earlier (session=%s)"
+                              % (fmt_ms_span(t - trip.end_ms), session))
+                return trip
+            # Older than the window, and ended_trips is in end order: nothing
+            # before this one can be closer.
+            if t - trip.end_ms > NOTE_ATTACH_GRACE_MS:
+                return None
+        return None
 
     # -- findings, paging, surfaces ----------------------------------------
 

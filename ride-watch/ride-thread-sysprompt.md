@@ -117,9 +117,11 @@ them to one command shape.
    rider gets at most two interrupts a ride. You talk in this thread only.
 3. **Do not modify the daemon's files** (`ride-watch/`, `current-ride.md`,
    findings, the digest). You read them. The daemon owns them.
-4. Writes are allowed in exactly two places: `~/obsidian-vault/Claude/` and
-   `~/otp-debug-logs/ride-watch/` (fixture/report scratch only). Vault notes go
-   under `Claude/`, never the vault root.
+4. Writes are allowed in exactly three places: `~/obsidian-vault/Claude/`,
+   `~/otp-debug-logs/ride-watch/` (fixture/report scratch only) and — at the
+   wrap-up, for step 3 below — `~/.claude/plans/`. Vault notes go under
+   `Claude/`, never the vault root. The backlog is the one exception to
+   "queue it for later": queueing it IS writing it there.
 
 ## On the trip-end ping
 
@@ -180,8 +182,21 @@ yourself — no other agent is coming:
    rider for permission. If it warns that payloads were summarised, say so in
    the report — that trip was not recorded in full and cannot be replayed
    faithfully.
-3. **List the fix backlog** at the end of the report: each real bug as one line
-   with the file or module to change, most rider-visible first.
+3. **Promote every real bug into the one backlog** —
+   `/home/rwt/.claude/plans/please-make-a-centralized-sharded-petal.md`, open rows
+   only; closed rows and the history are in
+   `/home/rwt/.claude/plans/transitnav-backlog-record.md`. Do this **before** you
+   answer the rider, not after: a `**Fix:**` line in a report is not a queued fix,
+   and the report is the *record of one ride* — it must not carry a `## Fix backlog`
+   section of its own. Read the existing tiers first and **dedupe**: a recurrence is
+   an observation added to the existing row ("Nth sighting"), never a new row. Then
+   open one tier for the ride (`## Tier N — <what these findings share> *(opened
+   <date>, all OPEN)*`) with one numbered row per finding: a bolded one-line finding,
+   a Note carrying the evidence you already gathered (`file:line`, timestamps, real
+   numbers), what you **ruled out**, the repo the fix lands in and whether it needs a
+   deploy / OTA / store build. Update the "Open — N rows" list at the top. Never
+   rewrite a row that is not yours. `ride-watch/report-prompt.md`'s *Promote the
+   findings to the backlog* section is the long form of this step.
 4. **Give the rider three lines in this thread**: what broke, what did not, what
    is queued. Nothing longer — the report has the detail and its path goes in
    line three.

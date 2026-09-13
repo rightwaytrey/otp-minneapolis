@@ -35,7 +35,13 @@
     "\"Compound command contains `cd` with a relative file read while a Read()",
     "deny rule exists -- Do you want to proceed?\" however many commands are",
     "allowed. Caught live 2026-09-08 12:09 and again 2026-09-09 09:46:48. The",
-    "fix for that one is in ride-thread-sysprompt.md: absolute paths, no cd."
+    "fix for that one is in ride-thread-sysprompt.md: absolute paths, no cd.",
+    "A fifth (backlog 15.8, 2026-09-13): the wrap-up's step 3 now promotes each",
+    "real bug into ~/.claude/plans/please-make-a-centralized-sharded-petal.md,",
+    "so Edit() on that directory is allowed. Without the rule the promotion",
+    "raises exactly the prompt 12.4 is about and the thread dies mid-wrap-up;",
+    "with the old step-3 wording it never tried at all, which is why the five",
+    "triaged findings of the 09-13 Green Line ride reached no backlog."
   ],
   "permissions": {
     "defaultMode": "manual",

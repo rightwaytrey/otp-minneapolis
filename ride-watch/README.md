@@ -86,6 +86,10 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `vehicle-match-never` | a transit leg polled >=30 times and the live matcher never named a vehicle | warn |
 | `bike-egress-missing` | a bike+transit search whose transit results all end on foot | warn |
 | `panel-torn-down` | a settings/detail screen unmounted by the rider's own query change (one finding per episode, with the count) | warn |
+| `access-leg-transit-speed` | `riderSpeedMps` >= 12 for >= 20 s on a WALK/BICYCLE leg with no riding fact | warn |
+| `boarding-prompt-empty` | "I'm on the bus" with no vehicle search behind it while the route feed held a vehicle in range | info |
+| `onboard-anchor-behind-rider` | the alight candidates are anchored >2 km from the rider's last fix | warn |
+| `same-route-transfer` | two consecutive transit legs, same `routeId`, different `tripId` | warn |
 | `boot-crash` | the app threw before it could run (`boot-error` / `boot-rejection`) | page |
 | `bundle-health` | the 5s health gate withheld its verdict, so the bundle rolls back | page (info when confirmed) |
 
@@ -258,6 +262,68 @@ typed the complaint out by hand on a bike.
   minute, and the notification in front of them says the opposite. Three
   minutes is "the last two captures" at the 90s cadence and never something
   from the other end of the ride.
+
+- **The 2026-09-13 four** (backlog 15.7) come from one hour in which the rider
+  was aboard a Green Line train the app never noticed. Go Mode started while
+  they were already moving at 13.7 m/s on what the itinerary called leg 0, a
+  bike leg to the station behind them; the trip sheet's "I'm on the bus" button
+  rendered `vehicleMatch.nearbyVehicles`, which only the transit-leg matcher
+  writes, so it said "No buses detected nearby" while the feed it was polling
+  every 20 s held the train; and the three onboard flows that followed anchored
+  the alight list at the far end of the line and installed **Green Line to
+  Green Line** as a transfer. The daemon's entire machine record of that ride
+  was one rider note. All four are **warn or info and none is in `PAGE_RANK`**:
+  the rider is looking at the screen each of them is about, and a ride has two
+  interrupts to spend on what they cannot see. What they are for is the ledger
+  and the wrap-up.
+
+  * **`access-leg-transit-speed`** — 12 m/s is 27 mph: above any bicycle, above
+    the 5.9 m/s `early-leg-transition` measured on a rider sprinting for a
+    station, below a freeway. 20 s because the daemon has seen a single fix at
+    1414 m accuracy. On 09-13 the run is unbroken from **11:35:50.051**
+    (13.69 m/s) and the finding lands at **11:36:11.049** — 21.0 s in, peak
+    21.05 m/s, and a full minute before the rider typed the same thing by hand.
+    The streak deliberately survives an itinerary swap: that ride re-planned
+    the same bike leg three times (11:35:52, 11:36:18, 11:36:44) inside the run.
+  * **`boarding-prompt-empty`** — the daemon cannot see the screen, so it reads
+    the two halves it can: no `UPDATE_NEARBY_VEHICLES` in the 30 s before the
+    prompt (the matcher never ran) while the last
+    `REALTIME_VEHICLE_POSITIONS_RESPONSE` for a route in the itinerary held a
+    vehicle inside **the radius the matcher itself would have used** — the
+    client's `speedAdjustedRadius`, 200 m plus 45 s of travel at the rider's
+    speed, capped at 2500 m (`vehicle-matching.ts:133-139`), rebuilt from the
+    same `coords.speed` the client passes it (`actions/go-mode.ts:6102`,
+    `:6158-6163`). At **11:36:24.799**: last poll 15.0 s old, rider at 15.22 m/s
+    (radius 884.7 m), train 32141 at 634.8 m. Fires. The 11:36:37 prompt is the
+    control the threshold is worth having for — the rider had slowed to 4.0 m/s
+    (radius 378 m) and the train had pulled 748.5 m ahead, so a search that ran
+    would have come back empty and the prompt was telling the truth. `info`,
+    once per ride: the rider taps that button repeatedly when it does not work.
+  * **`onboard-anchor-behind-rider`** — `STOP_GO_MODE` wipes the client's
+    `tracking.lastPosition`, and an onboard flow begun before the next fix
+    falls to `findAnchorIndex` index 0 and builds the list from the first stop
+    of the line. 09-13: STOP 11:38:36.664, flow 11:38:38.013, optimize
+    11:38:38.346 anchored at **Union Depot, 4760 m** east of a fix 3.3 s old,
+    with the next fix landing 689 ms too late. The other three flows that hour
+    anchored at 380 m, 97 m and 39 m, so 2 km is nowhere near either population.
+    The awkward part is that `START_ONBOARD_OPTIMIZE` names its candidates and
+    never places them — `stopId`, `stopName`, `busArrivalEpoch`, no coordinates
+    — so the rule waits for the per-candidate `ONBOARD_CANDIDATE_SNAPSHOT`
+    (`request.from`, joined back on `busArrivalEpoch`), 6.9 s later on the real
+    ride. The finding is stamped at **the optimize it is about**, with
+    `detectedMs` for the snapshot that resolved it. No snapshot, no finding: the
+    stop's position exists nowhere else in the stream and the rule will not
+    guess. Every one of those flows ran with no trip open, so it is filed
+    through `pending_onboard` on the ride that follows.
+  * **`same-route-transfer`** — two consecutive transit legs sharing `routeId`
+    with different `tripId` is the rider being told to get off their own
+    vehicle and wait for the next one of the same route. It is never a
+    transfer. 09-13 installed two: **11:37:59** (Green `1:879781` then
+    `1:905008`, 12 min on the platform) and **11:40:00** (`1:879781` then
+    `1:902233`, 16 min). The same `tripId` across two legs is excluded — that
+    is the app splitting one ride, a different animal — and so is a missing
+    `tripId`. One finding per pair, so a quiet re-plan that reinstalls the same
+    itinerary does not repeat it.
 
 ## The three surfaces
 
@@ -501,8 +567,24 @@ the request carries `findingsFrom` (the ride's start) and the thread triages
 only records at or after it. The report triages every
 finding and note as **real-bug**, **app-behaved-correctly**,
 **watcher-false-positive** or **no-rule-covers-this** with telemetry evidence;
-builds the replay fixture; lists the fix backlog; gives the rider three lines in
-the thread; and stays available for follow-ups.
+builds the replay fixture; **promotes every real bug into the one backlog**
+(`~/.claude/plans/please-make-a-centralized-sharded-petal.md`); gives the rider
+three lines in the thread; and stays available for follow-ups.
+
+That promotion step is newer than it looks (backlog 15.8). Until 2026-09-13 the
+sysprompt's step 3 read "list the fix backlog **at the end of the report**",
+which `report-prompt.md` forbids in as many words ("Do not add a `## Fix
+backlog` … the ordered list of what to do next belongs in the backlog"), and
+the backlog itself was named nowhere in the prompt the wrap-up actually runs
+under — the *Promote the findings to the backlog* section lives in
+`report-prompt.md`, which is retired as an agent invocation and offered only as
+optional reading "if the ride was complicated". The 09-13 wrap-up resolved the
+contradiction by doing neither: five findings triaged `real-bug`, a `**Fix:**`
+line on each, and nothing queued anywhere. Two more things had to move with the
+wording, or the new step would have died where it stood: writes were allowed in
+exactly two directories, neither of them `~/.claude/plans/`, and the permission
+allowlist had no `Edit()` rule for it — so the promotion would have raised the
+prompt that ends a ride thread (12.4) rather than the edit it asked for.
 
 ### Permissions
 
@@ -510,7 +592,8 @@ the thread; and stays available for follow-ups.
 on the phone of someone on a bicycle, so the routine job is allowed up front:
 read anywhere under `~`, a read-only Bash set (`python3`, `tail`, `grep`, `ls`,
 `git log`/`show`/`diff`, `node …/build-fixture.js`), and writes **only** under
-`~/obsidian-vault/Claude/` and `~/otp-debug-logs/ride-watch/`. Anything else
+`~/obsidian-vault/Claude/`, `~/otp-debug-logs/ride-watch/` and — since
+2026-09-13, for the wrap-up's promotion step — `~/.claude/plans/`. Anything else
 prompts, which is the intended fallback. The deny list encodes the mid-ride
 prohibitions (`systemctl`, `docker`, `git commit/push`, `*deploy*`, edits under
 `~/projects`) and beats the broad project `.claude/settings.json` this session
@@ -692,8 +775,18 @@ the whole ride, and they remain the highest-value input to the wrap-up report:
 the rule engine only notices what the telemetry admits, and the rider can see
 out of the window.
 
-A note typed when no trip is running is logged and nothing more — there is no
-thread to hand it to.
+A note typed **within five minutes of a ride ending, under that ride's own
+session id**, attaches to that ride (`NOTE_ATTACH_GRACE_MS`) — and if the
+wrap-up request had already been written, it is rewritten so the report the
+thread is about to write actually contains the note. On 2026-09-09 the
+09:03:42 note *"We should finish a trip on auto if within x distance for x
+time"* — a sentence about the trip that had closed 53 s earlier at 09:02:49 —
+was logged as "outside any trip" and reached no ledger, no digest and no
+report. The session id is the evidence, which is why this is tried **before**
+the "only one ride is happening" guess and never matches another mount's note.
+
+Beyond that window, a note typed when no trip is running is logged and nothing
+more — there is no thread to hand it to.
 
 The page also polls `/api/ride-status` (5s, paused when hidden) for the current
 `current-ride.md`, the newest findings, today's notes, and any replies still on
