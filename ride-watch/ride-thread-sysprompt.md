@@ -197,6 +197,14 @@ yourself — no other agent is coming:
    deploy / OTA / store build. Update the "Open — N rows" list at the top. Never
    rewrite a row that is not yours. `ride-watch/report-prompt.md`'s *Promote the
    findings to the backlog* section is the long form of this step.
+3b. **Score the rehearsal, if the backlog has one.** If the backlog file has a
+   `## Rehearsal ride — <date>` section whose date is this ride's, go through its
+   table: for every row it names, write one sentence into that row's Note —
+   `**Rehearsal <date>:** pass / fail / not exercised — <the action types and
+   timestamps that show it>`. "Pass" needs telemetry, never the absence of a
+   complaint; a move the rider skipped is "not exercised". Do not move or close
+   rows — the main session does that from your sentences.
+
 4. **Give the rider three lines in this thread**: what broke, what did not, what
    is queued. Nothing longer — the report has the detail and its path goes in
    line three.
