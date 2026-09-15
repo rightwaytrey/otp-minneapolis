@@ -189,6 +189,37 @@ HEAD_RECHECK_MS = 5 * 60 * 1000
 # Rule thresholds (ms unless noted)
 STARTUP_LOOKBACK_MS = 5 * 60 * 1000        # scan back this far at startup
 LOOKBACK_TAIL_BYTES = 16 * 1024 * 1024     # ...reading at most this much tail
+
+# Before an adoption asserts "this ride has no START_GO_MODE", go and look.
+#
+# 2026-09-15 ride 1 (`mu2rh9og-fw6prf`): the live daemon acted on none of
+# records 69-329 of debug-2026-09-15.jsonl -- four START_GO_MODE and two
+# STOP_GO_MODE between 09:24:31 and 09:26:31 -- then adopted off the
+# UPDATE_PROGRESS at record 330 (09:26:31.238) and filed `resumed-trip`
+# "no START_GO_MODE ... cannot be replayed" 18 ms after a START_GO_MODE that
+# was already three lines above it in the same POST batch (records 324-331 all
+# carry recv 09:26:33.285). The same file replays correctly, so the records
+# were there and the follower did not hand them over.
+#
+# The follower bug that lost them is not understood (see Tailer._drain's
+# diagnostics). This is the part that can be made not to matter: the stream is
+# on disk either way, so read it back before making a claim about what is not
+# in it. The window is generous because it only ever costs one tail read of an
+# already-open file, and the claim it is guarding is load-bearing -- a ride
+# called unreplayable gets no fixture and the wrap-up spends itself arguing.
+ADOPT_START_LOOKBACK_MS = 15 * 60 * 1000
+# ...reading at most this much tail. A START_GO_MODE carries the whole
+# itinerary: records 69/144/309/325 of 09-15 are 27 KB, 112 KB, 110 KB and
+# 110 KB. 8 MB is ~70 such records, far more than one Go Mode run.
+ADOPT_START_LOOKBACK_BYTES = 8 * 1024 * 1024
+
+# Follower diagnostics. A poll that delivers lines logs one INFO line, at most
+# this often, so a 1 Hz telemetry stream does not turn daemon.log into a second
+# copy of the telemetry. The per-drain summaries are kept in a ring regardless
+# and dumped in full when a trip opens or is adopted, which is the moment the
+# next miss will need them.
+TAILER_DRAIN_LOG_INTERVAL_S = 60.0
+TAILER_DRAIN_RING = 12
 SESSION_TIMEOUT_MS = 15 * 60 * 1000        # trip ends after this much silence
 # ...and this long after arrival, whether or not the app ever goes quiet.
 # Every trip-end this daemon had was a silence: STOP_GO_MODE, the timeout
@@ -570,6 +601,17 @@ NOT_A_PANEL_ROUTE = frozenset(("/account", "/account/create", "/signedin"))
 
 MAX_PAGES_PER_TRIP = 2
 PUSH_MIN_INTERVAL_MS = 120 * 1000
+# ...except the one page that says a ride produced findings and no report.
+#
+# 2026-09-15 09:40:42: "no wrap-up for mu2rh9og-fw6prf 10 min after the ride
+# ended ... paging" was followed by "push suppressed (rate limit)" -- the
+# deviated-streak page had gone out at 09:39:22, 80 s earlier, so the rider was
+# never told that ride 1's report was missing. It still is. Every other page is
+# about something the rider can see out of the window; this one is the only
+# notice that a ride's whole record is about to be lost, and the ten-minute
+# deadline it rides on has already made it late. So it bypasses the global
+# 120 s limit and spends its own, much longer, budget instead.
+REPORT_PAGE_MIN_INTERVAL_MS = 10 * 60 * 1000
 # Every push body the rider sees is one bounded line. 120 is the number the
 # suite has asserted since the copy rules were written; this is that, minus
 # room for the ellipsis one_line() adds when it has to cut.
@@ -812,6 +854,29 @@ def fmt_hms(ms):
     if not ms:
         return "?"
     return datetime.datetime.fromtimestamp(ms / 1000).strftime("%H:%M:%S")
+
+
+_PEEK_T_RE = re.compile(rb'"t"\s*:\s*(\d{12,14})')
+
+
+def peek_record_ms(raw):
+    """A record's `t` without parsing it. Diagnostics only.
+
+    The follower logs the first and last `t` of every poll that delivers
+    lines, and a START_GO_MODE line is 110 KB of itinerary -- json.loads on
+    both ends of every drain would cost more than the diagnostic is worth.
+    This is a regex for a 12-to-14-digit epoch-ms `t`, which can in principle
+    match a `t` inside `payload` before the envelope's own. That is acceptable
+    HERE and nowhere else: the number is for a human reading daemon.log next
+    to the JSONL, never for a rule.
+    """
+    m = _PEEK_T_RE.search(raw)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
 
 
 def fmt_date(ms):
@@ -1294,7 +1359,17 @@ class RideWatch:
         self.last_trip_summary = self._load_state()
         self.clock_ms = 0             # replay: max event t; live: wall clock
         self.last_push_ms = 0         # global rate limit (shared w/ fallback)
+        # ...which the "report pending" page is now exempt from; it spends
+        # REPORT_PAGE_MIN_INTERVAL_MS of its own instead.
+        self.last_report_page_ms = 0
         self.push_log = []            # [{tsMs, title, body, sent, kind}]
+        # The file this daemon is reading, when it is not today's live one:
+        # run_replay points it at the replayed file so the adoption path's
+        # look-back reads the stream it is actually processing. None means
+        # "whatever current_log_path() says", which is the live answer.
+        self.stream_path = None
+        # Shared with the Tailer in run_live (see Tailer._note_drain).
+        self.stream_drains = collections.deque(maxlen=TAILER_DRAIN_RING)
         self._status_dirty = True
         self._status_last_write = 0
         # -- the ride thread ------------------------------------------------
@@ -1651,6 +1726,7 @@ class RideWatch:
             self.trips[session] = trip
             self.log.info("trip started: session=%s itinerary=%s" % (
                 session, itinerary_one_liner(summary)))
+            self._log_stream_window("trip start for %s" % session)
             self._begin_ride_thread(trip, t)
         else:
             # Itinerary replacement mid-trip.
@@ -1722,6 +1798,22 @@ class RideWatch:
                     % (session, p.get("currentLegIndex"),
                        fmt_pct(p.get("currentLegProgress"))))
             return
+        # Before anything infers what this ride is, read the stream back and
+        # see whether it says so outright. 2026-09-15: it did -- the adopt at
+        # 09:26:31.238 happened 18 ms after a START_GO_MODE for the same
+        # session that was three lines above it in the same POST batch, and
+        # the daemon filed "no START_GO_MODE ... cannot be replayed" anyway.
+        #
+        # Above _continuation_of on purpose. That rule's own contract is that
+        # it is "only reachable ... when the new session arrived with no
+        # START_GO_MODE of its own", and an explicit start is the rider asking
+        # for a ride in so many words. A session that turns out to have one is
+        # not a continuation of anything; it is a trip this daemon should have
+        # opened already.
+        recovered = self._recover_go_mode_starts(session, t)
+        if recovered:
+            self._open_from_recovered_start(session, t, obj, p, recovered)
+            return
         prior = self._continuation_of(session, t, obj, p)
         if prior is not None:
             self._adopt_continuation(prior, session, t, p)
@@ -1731,6 +1823,7 @@ class RideWatch:
         self._stamp_trip_bundle(trip)
         self.trips[session] = trip
         self.log.info("adopted mid-stream trip for session %s" % session)
+        self._log_stream_window("adopt of %s" % session)
         # An adopted trip is a ride in progress — usually the daemon was
         # just restarted under a rider who is still on the bus — so it
         # gets a thread too, marked as adopted in the digest.
@@ -1740,6 +1833,149 @@ class RideWatch:
         self._rule_resumed_trip(trip, t, obj)
         self._on_progress(trip, t, p)
         self._mark_dirty()
+
+    def _open_from_recovered_start(self, session, t, obj, p, recovered):
+        """Open the trip off the START_GO_MODE the follower never delivered.
+
+        The difference this makes to the ride, all of it downstream of one
+        record the daemon already had on disk: the ride window starts when the
+        rider pressed Go rather than at the first tick the daemon happened to
+        see (09-15: 09:26:29 instead of 09:26:31, and on a worse miss it would
+        be minutes); the itinerary summary exists at all, so the thread's
+        kickoff line names the route instead of "itinerary unavailable"; every
+        rule that keys off trip.itinerary works; and the ride is replayable,
+        so the fixture step of the wrap-up succeeds.
+
+        Each recovered START is fed through the ordinary handler in order, so
+        the first opens the trip and any later one lands as the itinerary swap
+        it actually was -- no second state machine to keep in step with the
+        first.
+        """
+        self.log.warn(
+            "%s had no trip open at %s, but the stream holds %d"
+            " START_GO_MODE record(s) for it from %s that this daemon never"
+            " processed; opening the trip from them instead of adopting"
+            % (session, fmt_hms(t), len(recovered), fmt_hms(recovered[0][0])))
+        self._log_stream_window("recovered start for %s" % session)
+        for start_ms, start_obj in recovered:
+            self._on_start_go_mode(session, start_ms, start_obj)
+        trip = self.trips.get(session)
+        if trip is None:
+            # _on_start_go_mode does not fail, but it is not this function's
+            # business to assume so: falling through to the adopt is worse
+            # than a log line and no trip.
+            self.log.error("recovered start for %s opened no trip" % session)
+            return
+        trip.last_event_ms = max(trip.last_event_ms, t)
+        # Not `resumed-trip`: this ride HAS a start and IS replayable, and the
+        # whole cost of 09-15 was a thread spending its wrap-up disproving the
+        # opposite. What is worth a finding is the thing that actually went
+        # wrong -- the follower handed over none of it.
+        self._finding(
+            trip, t, "missed-start", "warn",
+            "the daemon opened this ride %s late: %d START_GO_MODE record(s)"
+            " from %s were in the stream and were never processed"
+            % (fmt_ms_span(t - recovered[0][0]), len(recovered),
+               fmt_hms(recovered[0][0])),
+            {"session": session,
+             "device": obj.get("device"),
+             "startMs": recovered[0][0],
+             "noticedMs": int(t),
+             "startsRecovered": [ms for ms, _ in recovered],
+             "recoveredFrom": self._stream_path(),
+             "replayable": True})
+        self._on_progress(trip, t, p)
+        self._mark_dirty()
+
+    # -- reading the stream back ------------------------------------------
+    #
+    # Everything else here is fed by the follower. These two go to the file
+    # directly, because the one claim that cannot be made from the follower's
+    # output alone is "this is not in the stream".
+
+    def _stream_path(self):
+        return self.stream_path or current_log_path()
+
+    def _tail_records(self, max_bytes=ADOPT_START_LOOKBACK_BYTES):
+        """The last records of the stream, newest-last. [] if unreadable.
+
+        Shaped after preferences_api._tail_lines: seek back a bounded number
+        of bytes, drop the partial line the arbitrary seek lands in, parse
+        what is left. The day's file runs to 30 MB (09-15 finished at
+        29,941,984 bytes) and nothing on the event path is allowed to read it
+        whole.
+        """
+        path = self._stream_path()
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes))
+                chunk = f.read()
+        except OSError as exc:
+            self.log.warn("could not read back the stream (%s): %r"
+                          % (path, exc))
+            return []
+        lines = chunk.split(b"\n")
+        if size > max_bytes and lines:
+            lines.pop(0)  # partial head from the arbitrary seek
+        out = []
+        for raw in lines:
+            if not raw.strip():
+                continue
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+        return out
+
+    def _recover_go_mode_starts(self, session, t):
+        """The START_GO_MODE records of the Go Mode run that is live at `t`.
+
+        Returned oldest-first as (tMs, record). Empty when the stream really
+        does not hold one — which is the case this daemon was built for (its
+        own restart mid-ride, or an app re-mount, both of which emit none) and
+        which `resumed-trip` is still right about.
+
+        A STOP_GO_MODE resets the list, because everything before it belongs
+        to a trip that is over: on 09-15 the session's records hold
+        START 09:24:31, STOP 09:24:44, START 09:24:52, STOP 09:25:13,
+        START 09:26:29, START 09:26:31, and the run that was live at the
+        09:26:31.238 adopt is the last two. Opening from 09:24:31 would put
+        two finished trips inside one ride's window.
+        """
+        cutoff = t - ADOPT_START_LOOKBACK_MS
+        starts = []
+        for obj in self._tail_records():
+            if obj.get("session") != session:
+                continue
+            ot = obj.get("t")
+            if not isinstance(ot, (int, float)) or ot > t or ot < cutoff:
+                continue
+            typ = obj.get("type")
+            if typ == "STOP_GO_MODE":
+                starts = []
+            elif typ == "START_GO_MODE":
+                starts.append((int(ot), obj))
+        starts.sort(key=lambda e: e[0])
+        return starts
+
+    def _log_stream_window(self, why):
+        """Dump the follower's recent drains. Called when a trip opens.
+
+        This is the record that did not exist on 09-15. A trip opening (or
+        being adopted) is the only moment worth spending the lines on, and it
+        is exactly the moment at which the next miss will be noticed.
+        """
+        if not self.stream_drains:
+            return
+        self.log.info("stream window at %s: %s" % (why, "; ".join(
+            "%d line(s) %d->%d t %s..%s" % (
+                d.get("lines", 0), d.get("from", 0), d.get("to", 0),
+                fmt_hms(d.get("firstT")), fmt_hms(d.get("lastT")))
+            for d in self.stream_drains)))
 
     def _note_device_session(self, device, session):
         """Remember which session ids a phone has been seen under."""
@@ -2047,6 +2283,14 @@ class RideWatch:
         _adopt_continuation files `session-churn` instead. This rule is for
         the one that arrives too late for that — after the prior ride ended,
         or onto a trip the daemon had declined.
+
+        And it no longer asserts "no START_GO_MODE" on the follower's word
+        alone. _maybe_adopt reads the stream back first
+        (_recover_go_mode_starts); a session whose start IS on disk is opened
+        from it and files `missed-start` instead, and never reaches here. On
+        2026-09-15 this rule told a ride thread that a perfectly replayable
+        ride could not be replayed, and the thread spent its whole wrap-up
+        window disproving it instead of writing the report.
         """
         device = obj.get("device")
         prior = [s for s in self.device_sessions.get(device, [])
@@ -2735,7 +2979,16 @@ class RideWatch:
         line = "trip ended (%s) after %dm — %d finding(s), %d recorded note(s)" % (
             reason, max(0, (t - trip.start_ms) // 60000), n, len(trip.notes))
         if req_path:
-            line += " — wrap-up now; request: %s" % req_path
+            # "report FIRST" is in the typed line, not only in the sysprompt,
+            # because the sysprompt is read once at spawn and this line lands
+            # an hour later on a thread in the middle of something. 09-15 ride
+            # 1: the thread took the wrap-up at 09:30:41 and spent it auditing
+            # the daemon's (wrong) `resumed-trip` finding, stalled on a
+            # permission prompt at 09:31:21, and the report was never written.
+            # An audit that dies with the pane costs the ride its record; one
+            # that runs after the report is written costs nothing.
+            line += (" — wrap-up now: WRITE THE REPORT FIRST, investigate"
+                     " anything else after; request: %s" % req_path)
         self._thread_event(trip, t, line)
         # The one line that must land. Everything else is a milestone the
         # digest repeats anyway; this one is the whole wrap-up, so it waits
@@ -4555,14 +4808,21 @@ class RideWatch:
             return True
         return False
 
-    def _send_push(self, title, body, kind="page"):
+    def _send_push(self, title, body, kind="page", bypass_rate_limit=False):
         """Send a Pushover message. Returns True if sent (or dry-run-logged).
 
-        Global 120s rate limit applies to every send, including the
-        trip-end fallback (which is exempt only from the per-trip cap).
+        The global 120s rate limit applies to every send but one: the
+        "report pending" page carries `bypass_rate_limit`, because it is the
+        only page about the ride's RECORD rather than the ride, and on
+        2026-09-15 09:40:42 a deviated-streak page 80 s earlier ate it and
+        nobody was told ride 1's report was missing. It spends its own
+        REPORT_PAGE_MIN_INTERVAL_MS budget in _report_fallback_push instead.
+        It still stamps last_push_ms, so it does not turn into a way to send
+        two pages in a second.
         """
         now = self.now_ms()
-        if self.last_push_ms and now - self.last_push_ms < PUSH_MIN_INTERVAL_MS:
+        if (not bypass_rate_limit and self.last_push_ms
+                and now - self.last_push_ms < PUSH_MIN_INTERVAL_MS):
             self.log.info("push suppressed (rate limit): %s" % body)
             self.push_log.append({"tsMs": now, "title": title, "body": body,
                                   "sent": False, "kind": kind,
@@ -4745,11 +5005,31 @@ class RideWatch:
         # Takes a count, not a Trip: the report-deadline path fires long after
         # _end_trip dropped the Trip object, and may fire in a process that
         # never saw the ride at all (state.json survives a restart).
-        self._send_push(
+        #
+        # Exempt from the global 120 s limit and rate-limited on its own,
+        # longer budget. See REPORT_PAGE_MIN_INTERVAL_MS: this page is the
+        # only notice the rider gets that a ride's findings have no report,
+        # it fires ten minutes after the ride already ended, and a page about
+        # the ride itself must not be allowed to eat it.
+        now = self.now_ms()
+        if (self.last_report_page_ms
+                and now - self.last_report_page_ms
+                < REPORT_PAGE_MIN_INTERVAL_MS):
+            self.log.info(
+                "report-pending page suppressed (one per %d min): %d findings"
+                % (REPORT_PAGE_MIN_INTERVAL_MS // 60000, findings_n))
+            self.push_log.append({
+                "tsMs": now, "title": "Ride watch",
+                "body": "Ride ended — %d findings. Report pending." % findings_n,
+                "sent": False, "kind": "fallback",
+                "suppressed": "report-page-budget"})
+            return False
+        self.last_report_page_ms = now
+        return self._send_push(
             "Ride watch",
             "Ride ended — %d findings. Report pending; open Claude and say 'ride report'."
             % findings_n,
-            kind="fallback")
+            kind="fallback", bypass_rate_limit=True)
 
     # -- the ride thread ----------------------------------------------------
     #
@@ -5653,12 +5933,28 @@ class Tailer:
     """Follows the current UTC-day JSONL file; handles rollover, absence,
     truncation, and partial trailing lines."""
 
-    def __init__(self, log):
+    def __init__(self, log, drains=None):
         self.log = log
         self.path = None
         self.fh = None
         self.offset = 0
         self.buf = b""
+        # Diagnostics for the 09-15 miss (see ADOPT_START_LOOKBACK_MS). The
+        # daemon acted on none of 260 consecutive lines and there was nothing
+        # in daemon.log or the journal between "opened ... from start" at
+        # 05:00:03 and the adopt at 09:26:38 to say what the follower had
+        # done with them -- not a byte count, not an offset, nothing. So every
+        # drain that delivers lines now leaves a trace.
+        # Shared with the RideWatch that consumes this stream, so the rule
+        # engine can print the follower's recent history at the one moment it
+        # matters (a trip opening or being adopted) without the follower
+        # knowing anything about trips.
+        self.drains = (drains if drains is not None
+                       else collections.deque(maxlen=TAILER_DRAIN_RING))
+        self.lines_out = 0
+        self._log_window_lines = 0
+        self._log_window_polls = 0
+        self._last_drain_log = 0.0
 
     def _open(self, path, seek_end=False, lookback_cb=None):
         self._close()
@@ -5745,15 +6041,57 @@ class Tailer:
             return
         if size == self.offset:
             return
+        start_offset = self.offset
         self.fh.seek(self.offset)
         chunk = self.fh.read(size - self.offset)
         self.offset = self.fh.tell()
         data = self.buf + chunk
         lines = data.split(b"\n")
         self.buf = lines.pop()  # possibly-partial tail
-        for raw in lines:
-            if raw.strip():
-                on_line(raw.decode("utf-8", "replace"))
+        delivered = [raw for raw in lines if raw.strip()]
+        for raw in delivered:
+            on_line(raw.decode("utf-8", "replace"))
+        self._note_drain(start_offset, delivered)
+
+    def _note_drain(self, start_offset, delivered):
+        """Record — and, at a rate limit, log — what one poll handed over.
+
+        The whole point is that this fires on the poll ITSELF, before any rule
+        sees the lines: on 09-15 the question that could not be answered was
+        whether the follower ever read records 69-329 at all, and no evidence
+        either way existed. Now a drain that delivers lines always lands in the
+        ring (dumped when a trip opens or is adopted) and lands in daemon.log
+        at most once a TAILER_DRAIN_LOG_INTERVAL_S, so a 1 Hz ride writes one
+        line a minute rather than one a second.
+        """
+        if not delivered:
+            return
+        self.lines_out += len(delivered)
+        summary = {
+            "atMs": int(time.time() * 1000),
+            "lines": len(delivered),
+            "bytes": self.offset - start_offset,
+            "from": start_offset,
+            "to": self.offset,
+            "firstT": peek_record_ms(delivered[0]),
+            "lastT": peek_record_ms(delivered[-1]),
+        }
+        self.drains.append(summary)
+        self._log_window_lines += len(delivered)
+        self._log_window_polls += 1
+        now = time.time()
+        if now - self._last_drain_log < TAILER_DRAIN_LOG_INTERVAL_S:
+            return
+        self._last_drain_log = now
+        self.log.info(
+            "stream: %d line(s) this poll (%d byte(s), offset %d->%d, t %s..%s)"
+            "; %d line(s) over %d poll(s) since the last note, %d total"
+            % (summary["lines"], summary["bytes"], summary["from"],
+               summary["to"], fmt_hms(summary["firstT"]),
+               fmt_hms(summary["lastT"]), self._log_window_lines,
+               self._log_window_polls, self.lines_out))
+        self._log_window_lines = 0
+        self._log_window_polls = 0
 
 
 # ---------------------------------------------------------------------------
@@ -5775,6 +6113,10 @@ def run_replay(path, watch=None, watch_dir=None):
                           report_dir=os.path.join(wd, "reports"))
     watch.dry_run = True
     watch.replay = True
+    # So the adoption path's look-back reads the file being replayed, not
+    # today's live one. Without this a replay of an old log would go looking
+    # for its START_GO_MODE in today's telemetry.
+    watch.stream_path = path
     with open(path, "rb") as f:
         for raw in f:
             watch.process_line(raw.decode("utf-8", "replace"))
@@ -5787,7 +6129,9 @@ def run_live(watch_dir=None):
     log = watch.log
     log.info("ride-watch starting (sha=%s, dry_run=%s, log_dir=%s, watch_dir=%s)"
              % (DAEMON_GIT_SHA, watch.dry_run, DEBUG_LOG_DIR, watch.watch_dir))
-    tailer = Tailer(log)
+    # One ring, shared: the follower fills it, the rule engine prints it when
+    # a trip opens. See Tailer._note_drain.
+    tailer = Tailer(log, drains=watch.stream_drains)
     stop = {"flag": False}
 
     def on_signal(signum, _frame):

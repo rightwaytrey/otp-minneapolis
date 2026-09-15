@@ -82,7 +82,8 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `wake-lock-denied` | the screen wake lock was refused during a trip (one finding per launch/resume, with the count) | warn |
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
 | `session-churn` | the app re-mounted mid-ride and minted a new session id | warn |
-| `resumed-trip` | a ride that began with no `START_GO_MODE`, so it has no replay fixture | warn (info when it is the daemon that restarted) |
+| `resumed-trip` | a ride that began with no `START_GO_MODE` **anywhere in the stream**, so it has no replay fixture | warn (info when it is the daemon that restarted) |
+| `missed-start` | the ride's `START_GO_MODE` was in the stream and the follower never delivered it; the trip is opened from it rather than adopted | warn |
 | `vehicle-match-never` | a transit leg polled >=30 times and the live matcher never named a vehicle | warn |
 | `bike-egress-missing` | a bike+transit search whose transit results all end on foot | warn |
 | `panel-torn-down` | a settings/detail screen unmounted by the rider's own query change (one finding per episode, with the count) | warn |

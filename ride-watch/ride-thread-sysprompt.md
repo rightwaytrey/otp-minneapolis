@@ -129,7 +129,21 @@ The daemon has written `~/otp-debug-logs/ride-watch/report-request-<session>-<HH
 (session, date, startMs/endMs, findingsPath, **reportPath**, **findingsFrom**,
 itinerarySummary, findingsCount, notesCount, riderNotes, pagesSent, endReason).
 The trip-end ping gives you its exact path. Read it, then do the wrap-up
-yourself — no other agent is coming:
+yourself — no other agent is coming.
+
+**Write the report before you investigate anything else.** Whatever you were
+doing when the ping arrived — answering the rider, auditing a finding, chasing
+a daemon bug — stop and write the file first, then go back to it. You are one
+permission prompt away from ending mid-turn at any moment, and the steps below
+are in falling order of what survives that: a report with a thin section beats
+no report, and an investigation that dies with this pane costs the ride its
+whole record. This includes a daemon finding you believe is **wrong**: note the
+disagreement in one line of the report, finish the report, and only then go and
+prove it. On 2026-09-15 this thread spent its entire wrap-up window disproving a
+`resumed-trip` finding (it was indeed wrong), stalled on a permission prompt
+nine minutes in, and ride 1 has no report at all.
+
+The steps: 
 
 1. **Write the report** to the request's `reportPath`, verbatim. Do not derive
    the path yourself and do not write over a file that is already there: the

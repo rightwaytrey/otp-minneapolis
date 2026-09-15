@@ -39,14 +39,24 @@ def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
     report_dir is pinned under the temp dir: _report_path stats the vault to
     pick a non-colliding name, and a test must neither read the rider's real
     notes nor hand back a path pointing into them.
+
+    stream_path is pinned for the same reason. The adoption path reads the
+    stream back (_recover_go_mode_starts), and its default is
+    current_log_path() — today's real telemetry, tens of megabytes of the
+    rider's actual rides. A test that adopts must not go anywhere near it:
+    it is slow, it is not reproducible, and a test asserting on what is or
+    is not in the stream would be asserting on what the rider did this
+    morning. Tests that want records there write them to this path.
     """
     log = Log(os.path.join(watch_dir, "daemon.log"), echo=False)
     reports = os.path.join(watch_dir, "reports")
     os.makedirs(reports, exist_ok=True)
-    return RideWatch(dry_run=True, replay=replay, watch_dir=watch_dir, log=log,
-                     spawn_thread=spawn_thread, push_line=push_line,
-                     thread_enabled=thread_enabled, report_dir=reports,
-                     kill_thread=kill_thread)
+    watch = RideWatch(dry_run=True, replay=replay, watch_dir=watch_dir, log=log,
+                      spawn_thread=spawn_thread, push_line=push_line,
+                      thread_enabled=thread_enabled, report_dir=reports,
+                      kill_thread=kill_thread)
+    watch.stream_path = os.path.join(watch_dir, "stream.jsonl")
+    return watch
 
 
 def read_text(path):
@@ -4214,6 +4224,398 @@ class TestResumedTrip(RuleTestCase):
         self.assertEqual(self.find(watch, "resumed-trip"), [])
         self.assertEqual(len(self.find(watch, "session-churn")), 1)
         self.assertIs(watch.trips["sess-remount"], watch.trips[SESSION])
+
+
+class TestStartRecoveredFromTheStream(RuleTestCase):
+    """16.7. 2026-09-15 ride 1: the start was on disk and the daemon said no.
+
+    The live daemon acted on none of records 69-329 of
+    debug-2026-09-15.jsonl — four START_GO_MODE and two STOP_GO_MODE between
+    09:24:31 and 09:26:31 — then adopted off the UPDATE_PROGRESS at record 330
+    (09:26:31.238) and filed `resumed-trip` "no START_GO_MODE ... cannot be
+    replayed" 18 ms after a START_GO_MODE that was three lines above it in the
+    same POST batch (records 324-331 all carry recv 09:26:33.285). Replaying
+    the same file opens and closes all four trips.
+
+    Whatever the follower did with those lines, the bytes were on disk the
+    whole time. These pin the daemon reading them back rather than asserting
+    from what it happened to be handed.
+    """
+
+    def stream(self, watch, builder):
+        """Write the builder's events to the file the daemon reads back."""
+        with open(watch.stream_path, "w") as f:
+            for ev in builder.events:
+                f.write(json.dumps(ev) + "\n")
+
+    def missed_ride(self, drop_before=None, thread=None):
+        """The 09-15 shape: every record is in the file, the daemon saw the
+        tail only. `drop_before` is the index the follower "woke up" at."""
+        watch = quiet_watch(
+            self.tmp,
+            spawn_thread=thread.spawn if thread else None,
+            push_line=thread.push if thread else None,
+            kill_thread=thread.kill if thread else None)
+        b = StreamBuilder(device="phone-1")
+        b.start()                                   # 09:24:31
+        b.advance(13000).stop()                     # 09:24:44
+        b.advance(8000).start()                     # 09:24:52
+        b.advance(21000).stop()                     # 09:25:13
+        b.advance(76000).start()                    # 09:26:29
+        b.advance(1640).start()                     # 09:26:31.220
+        b.advance(18).progress(leg=0, prog=0.0, stops=6)   # 09:26:31.238
+        self.stream(watch, b)
+        for ev in b.events[drop_before if drop_before is not None else 0:]:
+            watch.process(ev)
+        return watch, b
+
+    def test_the_start_is_recovered_instead_of_adopting(self):
+        watch, _ = self.missed_ride(drop_before=-1)
+        trip = watch.trips[SESSION]
+        self.assertFalse(trip.adopted)
+        self.assertEqual(self.find(watch, "resumed-trip"), [])
+        self.assertEqual(len(self.find(watch, "missed-start")), 1)
+
+    def test_the_window_begins_at_the_start_the_rider_pressed(self):
+        """Not at the first tick the daemon happened to see."""
+        watch, b = self.missed_ride(drop_before=-1)
+        starts = [ev["t"] for ev in b.events
+                  if ev.get("type") == "START_GO_MODE"]
+        # The run that was live at the adopt is the last two starts; the two
+        # before them were closed by their own STOP_GO_MODE.
+        self.assertEqual(watch.trips[SESSION].start_ms, starts[2])
+        self.assertNotEqual(watch.trips[SESSION].start_ms, starts[0])
+
+    def test_the_later_start_lands_as_the_itinerary_swap_it_was(self):
+        watch, _ = self.missed_ride(drop_before=-1)
+        self.assertEqual(watch.trips[SESSION].swap_seq, 1)
+
+    def test_the_recovered_ride_has_an_itinerary_and_is_replayable(self):
+        """The two things 09-15 lost: the thread's kickoff line read
+        "itinerary unavailable (summarized payload)" and the finding said the
+        ride could not be replayed. Both were wrong."""
+        watch, _ = self.missed_ride(drop_before=-1)
+        self.assertIsNotNone(watch.trips[SESSION].itinerary)
+        found = self.find(watch, "missed-start")[0]
+        self.assertTrue(found["context"]["replayable"])
+        self.assertEqual(found["severity"], "warn")
+        self.assertEqual(len(found["context"]["startsRecovered"]), 2)
+
+    def test_the_finding_names_how_late_the_daemon_was(self):
+        watch, b = self.missed_ride(drop_before=-1)
+        found = self.find(watch, "missed-start")[0]
+        starts = [ev["t"] for ev in b.events
+                  if ev.get("type") == "START_GO_MODE"]
+        self.assertEqual(found["context"]["startMs"], starts[2])
+        self.assertEqual(found["context"]["noticedMs"], b.events[-1]["t"])
+
+    def test_a_stream_with_no_start_still_files_resumed_trip(self):
+        """The case the rule was built for — a daemon restarted mid-ride —
+        is unchanged, and must stay that way."""
+        watch = quiet_watch(self.tmp)
+        b = StreamBuilder(device="phone-1").progress(leg=1, prog=42.0, stops=3)
+        self.stream(watch, b)
+        for ev in b.events:
+            watch.process(ev)
+        self.assertEqual(self.find(watch, "missed-start"), [])
+        found = self.find(watch, "resumed-trip")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["context"]["cause"],
+                         "daemon-started-mid-ride")
+        self.assertTrue(watch.trips[SESSION].adopted)
+
+    def test_an_unreadable_stream_falls_back_to_adopting(self):
+        """No file at all — a replay, a fresh day, a permissions accident.
+        The look-back is an improvement on the old answer, never a
+        prerequisite for having one."""
+        watch = quiet_watch(self.tmp)
+        watch.stream_path = os.path.join(self.tmp, "no-such-file.jsonl")
+        b = StreamBuilder(device="phone-1").progress(leg=1, prog=42.0, stops=3)
+        for ev in b.events:
+            watch.process(ev)
+        self.assertEqual(len(self.find(watch, "resumed-trip")), 1)
+
+    def test_a_start_outside_the_window_is_not_used(self):
+        watch = quiet_watch(self.tmp)
+        b = StreamBuilder(device="phone-1").start()
+        b.advance(ride_watch.ADOPT_START_LOOKBACK_MS + 60000)
+        b.progress(leg=1, prog=42.0, stops=3)
+        self.stream(watch, b)
+        watch.process(b.events[-1])
+        self.assertEqual(len(self.find(watch, "resumed-trip")), 1)
+        self.assertEqual(self.find(watch, "missed-start"), [])
+
+    def test_another_sessions_start_is_not_borrowed(self):
+        """The phone keeps one session id per app load, so the day's file is
+        full of other rides' starts. Only this session's count."""
+        watch = quiet_watch(self.tmp)
+        other = StreamBuilder(session="someone-else", device="phone-2").start()
+        mine = StreamBuilder(device="phone-1")
+        mine.t = other.t + 1000
+        mine.progress(leg=1, prog=42.0, stops=3)
+        with open(watch.stream_path, "w") as f:
+            for ev in other.events + mine.events:
+                f.write(json.dumps(ev) + "\n")
+        watch.process(mine.events[-1])
+        self.assertEqual(len(self.find(watch, "resumed-trip")), 1)
+
+    def test_a_completed_ride_is_still_declined(self):
+        """The 8/31 decline runs before the look-back and must keep running:
+        a finished ride with a start in the file is still a finished ride."""
+        watch = quiet_watch(self.tmp)
+        b = StreamBuilder(device="phone-1").start().advance(1000)
+        b.progress(leg=2, prog=76.4, status="completed")
+        self.stream(watch, b)
+        watch.process(b.events[-1])
+        self.assertEqual(watch.trips, {})
+
+    def test_the_ride_thread_is_told_the_route_not_an_apology(self):
+        thread = StubThread()
+        watch, _ = self.missed_ride(drop_before=-1, thread=thread)
+        kickoff = thread.lines()[0]
+        self.assertIn("trip started", kickoff)
+        self.assertNotIn("itinerary unavailable", kickoff)
+        self.assertNotIn("(adopted)", kickoff)
+
+    def test_the_recovery_is_logged_with_the_stream_it_read(self):
+        watch, _ = self.missed_ride(drop_before=-1)
+        text = read_text(os.path.join(self.tmp, "daemon.log"))
+        self.assertIn("never processed", text)
+        self.assertIn(watch.stream_path,
+                      self.find(watch, "missed-start")[0]["context"]
+                      ["recoveredFrom"])
+
+
+class TestFollowerDiagnostics(unittest.TestCase):
+    """16.7(b). Nothing in daemon.log or the journal said what the follower
+    had done with records 69-329 on 09-15 — not a byte count, not an offset.
+    The miss is still unexplained; the next one will not be undiagnosable."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ride-watch-tailer-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "stream.jsonl")
+        self.log = Log(os.path.join(self.tmp, "daemon.log"), echo=False)
+        self._real_path = ride_watch.current_log_path
+        ride_watch.current_log_path = lambda: self.path
+        self.addCleanup(setattr, ride_watch, "current_log_path",
+                        self._real_path)
+
+    def append(self, records):
+        with open(self.path, "a") as f:
+            for rec in records:
+                f.write(json.dumps(rec) + "\n")
+
+    def rec(self, t, typ="UPDATE_PROGRESS"):
+        return {"t": t, "recv": t / 1000.0, "session": SESSION, "type": typ,
+                "payload": {"currentLegIndex": 1}}
+
+    def test_a_drain_records_what_it_handed_over(self):
+        self.append([self.rec(T0), self.rec(T0 + 1000)])
+        tailer = ride_watch.Tailer(self.log)
+        self.addCleanup(tailer._close)
+        seen = []
+        tailer.poll(seen.append)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(len(tailer.drains), 1)
+        d = tailer.drains[-1]
+        self.assertEqual(d["lines"], 2)
+        self.assertEqual(d["from"], 0)
+        self.assertEqual(d["to"], os.path.getsize(self.path))
+        self.assertEqual(d["bytes"], d["to"] - d["from"])
+        self.assertEqual(d["firstT"], T0)
+        self.assertEqual(d["lastT"], T0 + 1000)
+
+    def test_a_poll_that_delivers_nothing_leaves_no_trace(self):
+        """Otherwise the ring is 12 empty polls deep by the time it matters:
+        the loop polls twice a second and a ride is mostly silence."""
+        self.append([self.rec(T0)])
+        tailer = ride_watch.Tailer(self.log)
+        self.addCleanup(tailer._close)
+        tailer.poll(lambda line: None)
+        tailer.poll(lambda line: None)
+        tailer.poll(lambda line: None)
+        self.assertEqual(len(tailer.drains), 1)
+
+    def test_the_ring_keeps_only_the_recent_past(self):
+        tailer = ride_watch.Tailer(self.log)
+        self.addCleanup(tailer._close)
+        for i in range(ride_watch.TAILER_DRAIN_RING + 5):
+            self.append([self.rec(T0 + i * 1000)])
+            tailer.poll(lambda line: None)
+        self.assertEqual(len(tailer.drains), ride_watch.TAILER_DRAIN_RING)
+        self.assertEqual(tailer.drains[-1]["firstT"],
+                         T0 + (ride_watch.TAILER_DRAIN_RING + 4) * 1000)
+
+    def notes(self):
+        return [l for l in read_text(os.path.join(self.tmp, "daemon.log"))
+                .splitlines() if "line(s) this poll" in l]
+
+    def test_the_log_line_is_rate_limited(self):
+        """A 1 Hz stream must not write a second copy of itself to
+        daemon.log. The ring is the complete record; the log is a heartbeat."""
+        tailer = ride_watch.Tailer(self.log)
+        self.addCleanup(tailer._close)
+        for i in range(30):
+            self.append([self.rec(T0 + i * 1000)])
+            tailer.poll(lambda line: None)
+        # The first delivering poll notes itself — the useful moment is the
+        # start of activity — and the next 29 inside the interval do not.
+        self.assertEqual(len(self.notes()), 1)
+        self.assertIn("1 line(s) over 1 poll(s)", self.notes()[0])
+        self.assertEqual(tailer.lines_out, 30)
+
+    def test_the_next_note_carries_the_polls_that_were_quiet(self):
+        """Suppressed is not lost: the counters keep running, so the note a
+        minute later says how much stream went by in between."""
+        tailer = ride_watch.Tailer(self.log)
+        self.addCleanup(tailer._close)
+        for i in range(30):
+            self.append([self.rec(T0 + i * 1000)])
+            tailer.poll(lambda line: None)
+        tailer._last_drain_log -= ride_watch.TAILER_DRAIN_LOG_INTERVAL_S + 1
+        self.append([self.rec(T0 + 30000)])
+        tailer.poll(lambda line: None)
+        self.assertEqual(len(self.notes()), 2)
+        self.assertIn("30 line(s) over 30 poll(s)", self.notes()[1])
+        self.assertEqual(tailer.lines_out, 31)
+
+    def test_a_partial_trailing_line_is_not_counted_until_it_is_whole(self):
+        """The writer is mid-write of a 110 KB START_GO_MODE as often as not;
+        a drain must not claim a line it only has half of."""
+        tailer = ride_watch.Tailer(self.log)
+        self.addCleanup(tailer._close)
+        with open(self.path, "a") as f:
+            f.write('{"t": %d, "session": "%s"' % (T0, SESSION))
+        seen = []
+        tailer.poll(seen.append)
+        self.assertEqual(seen, [])
+        self.assertEqual(list(tailer.drains), [])
+        with open(self.path, "a") as f:
+            f.write('}\n')
+        tailer.poll(seen.append)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(tailer.drains[-1]["lines"], 1)
+
+    def test_peek_reads_t_without_parsing_the_record(self):
+        self.assertEqual(
+            ride_watch.peek_record_ms(b'{"recv": 1.5, "t": 1789482271369}'),
+            1789482271369)
+        self.assertEqual(
+            ride_watch.peek_record_ms(b'{"t" : 1789482271369, "x": 1}'),
+            1789482271369)
+        self.assertIsNone(ride_watch.peek_record_ms(b'{"kind": "session"}'))
+        self.assertIsNone(ride_watch.peek_record_ms(b'not json at all'))
+
+    def test_a_trip_opening_dumps_the_window(self):
+        """The one moment the drains are worth the lines."""
+        tmp = tempfile.mkdtemp(prefix="ride-watch-window-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        watch.stream_drains.append({"lines": 260, "from": 946947,
+                                    "to": 1845512, "firstT": T0,
+                                    "lastT": T0 + 120000})
+        b = StreamBuilder().start()
+        for ev in b.events:
+            watch.process(ev)
+        text = read_text(os.path.join(tmp, "daemon.log"))
+        self.assertIn("stream window at trip start", text)
+        self.assertIn("260 line(s) 946947->1845512", text)
+
+
+class TestReportPendingPageBudget(RuleTestCase):
+    """12.4(b). 2026-09-15 09:40:42: "no wrap-up for mu2rh9og-fw6prf 10 min
+    after the ride ended ... paging" and then "push suppressed (rate limit)",
+    because a deviated-streak page had gone out at 09:39:22. Nobody was told
+    ride 1's report was missing, and it still is."""
+
+    def test_a_recent_page_no_longer_eats_the_report_page(self):
+        watch = quiet_watch(self.tmp)
+        watch.clock_ms = T0
+        watch.last_push_ms = T0 - 80000        # the 09:39:22 deviated-streak
+        self.assertTrue(watch._report_fallback_push(3))
+        sent = [p for p in watch.push_log if p["kind"] == "fallback"]
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0]["sent"])
+        self.assertIn("Report pending", sent[0]["body"])
+
+    def test_an_ordinary_page_is_still_rate_limited(self):
+        """The bypass is for this one page, not a hole in the limiter."""
+        watch = quiet_watch(self.tmp)
+        watch.clock_ms = T0
+        watch.last_push_ms = T0 - 80000
+        self.assertFalse(watch._send_push("Ride watch", "an ordinary page"))
+        self.assertEqual(watch.push_log[-1]["suppressed"], "rate-limit")
+
+    def test_the_report_page_still_stamps_the_global_limiter(self):
+        """So it cannot become a way to send two pushes in a second."""
+        watch = quiet_watch(self.tmp)
+        watch.clock_ms = T0
+        watch._report_fallback_push(3)
+        self.assertEqual(watch.last_push_ms, T0)
+        self.assertFalse(watch._send_push("Ride watch", "right behind it"))
+
+    def test_the_report_page_spends_its_own_budget(self):
+        """Two rides' deadlines expiring a minute apart must not become two
+        identical pages."""
+        watch = quiet_watch(self.tmp)
+        watch.clock_ms = T0
+        self.assertTrue(watch._report_fallback_push(3))
+        watch.clock_ms = T0 + 60000
+        self.assertFalse(watch._report_fallback_push(5))
+        self.assertEqual(watch.push_log[-1]["suppressed"],
+                         "report-page-budget")
+        watch.clock_ms = T0 + ride_watch.REPORT_PAGE_MIN_INTERVAL_MS + 1000
+        self.assertTrue(watch._report_fallback_push(5))
+
+    def test_the_deadline_path_sends_it_through_the_bypass(self):
+        """End to end: a ride ends, the thread never writes, a page lands
+        even though the ride paged a minute earlier."""
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000)
+        b.progress(leg=1, prog=10.0, stops=6)
+        b.advance(1000).console("error", ["wake lock denied"])
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        watch.last_push_ms = watch.now_ms()      # a page, seconds ago
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 60000
+        watch.check_timers()
+        sent = [p for p in watch.push_log
+                if p["kind"] == "fallback" and p["sent"]]
+        self.assertEqual(len(sent), 1)
+
+
+class TestWrapUpAsksForTheReportFirst(RuleTestCase):
+    """12.4(a). 2026-09-15 ride 1: thread `ride-0926` took the wrap-up push at
+    09:30:41 and spent it auditing the daemon's (wrong) `resumed-trip`
+    finding; its last tool call at 09:31:21 has no result, the deadline
+    expired at 09:40:42 and no report was ever written."""
+
+    def ended_ride(self):
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000)
+        b.progress(leg=1, prog=10.0, stops=6)
+        b.advance(1000).console("error", ["wake lock denied"])
+        b.advance(1000).stop()
+        return self.run_stream(b, finalize=False, thread=thread), thread
+
+    def test_the_typed_line_puts_the_report_before_the_investigation(self):
+        _, thread = self.ended_ride()
+        wrap = [l for l in thread.lines() if "wrap-up now" in l]
+        self.assertEqual(len(wrap), 1)
+        self.assertIn("WRITE THE REPORT FIRST", wrap[0])
+        self.assertIn("investigate anything else after", wrap[0])
+        self.assertIn("request: ", wrap[0])
+
+    def test_the_sysprompt_says_it_too(self):
+        """The typed line lands on a thread mid-task an hour after the
+        sysprompt was read; both have to carry it."""
+        text = read_text(os.path.join(
+            os.path.dirname(os.path.abspath(ride_watch.__file__)),
+            "ride-thread-sysprompt.md"))
+        self.assertIn("Write the report before you investigate anything else",
+                      text)
+        self.assertIn("2026-09-15", text)
 
 
 class TestResumedTripOnTheRecordedSession(unittest.TestCase):
