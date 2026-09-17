@@ -55,10 +55,30 @@ tree_branch=$(git -C "$WEB_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)
   echo "- App: \`$APP_URL\`"
   echo "- Tree: \`$tree_branch\` @ \`$tree_desc\`"
   if [ -n "$tree_status" ]; then
-    echo "- **Working tree is DIRTY** — results reflect uncommitted edits:"
-    echo '```'
-    echo "$tree_status"
-    echo '```'
+    # Untracked replay fixtures are EXPECTED and change nothing the suite runs:
+    # lib/util/go-mode/replay/fixtures/*.json are recordings of real rides, kept
+    # deliberately out of git, and no verify-*.js script reads one. Every night
+    # since they started accumulating, the report opened by dumping a dozen of
+    # them under a bold "DIRTY -- results reflect uncommitted edits" banner, so
+    # each run announced itself as untrustworthy for a reason that was not one.
+    # A tree dirty ONLY with those gets a one-line note; anything else -- a
+    # modified tracked file, a staged change, an untracked source file -- still
+    # gets the full banner and the full list, because that genuinely does change
+    # what :9967 is serving. (backlog 13.6)
+    other=$(printf '%s\n' "$tree_status" |
+      grep -vE '^\?\? lib/util/go-mode/replay/fixtures/[^/]+\.json$')
+    fixtures=$(printf '%s\n' "$tree_status" | grep -cE \
+      '^\?\? lib/util/go-mode/replay/fixtures/[^/]+\.json$')
+    if [ -z "$other" ]; then
+      echo "- Working tree dirty with untracked replay fixtures only" \
+        "($fixtures of them) — nothing the suite runs is modified."
+    else
+      echo "- **Working tree is DIRTY** — results reflect uncommitted edits" \
+        "(plus $fixtures untracked replay fixture(s), not listed):"
+      echo '```'
+      echo "$other"
+      echo '```'
+    fi
   else
     echo "- Working tree clean."
   fi
