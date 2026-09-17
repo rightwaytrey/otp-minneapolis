@@ -5182,6 +5182,136 @@ class TestBundleHealth(BootTestCase):
         self.assertEqual(len(recovery), 2)
 
 
+class TestRecoveryVersusRidePage(BootTestCase):
+    """17.21: the "App came back" line must not outrun a ride's own page.
+
+    2026-09-15 ride A. The crash page went out 15:18:11; its follow-up was
+    rate-limited 14 s later, so the ack stayed unset and re-armed on every
+    `confirmed` verdict for the hour. It finally sent on the 15:47:16 verdict
+    — 29 minutes on, mid-ride — and took the global slot from a
+    `session-restart-while-aboard` page buffered at 15:47:11 and still 10 s
+    inside its coalescing window. Two pushes about one relaunch, and the
+    rider was to get the one that says less, out of a budget of two.
+
+    Measured, not inferred: the day file's `recv` puts the relaunch batch
+    3.22 s and the verdict batch 1.05 s behind their own clocks, so on the
+    wire the page is buffered at 15:47:15.0, flushes at 15:47:30.0, and this
+    line sends at 15:47:17.9 — 12.1 s ahead of the flush, against a 120 s
+    rate limit. No spacing saves it; the ordering is what is wrong.
+    """
+
+    def aboard(self, b, session=SESSION):
+        """A rider on the bus, as the rule requires."""
+        b.start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding().vehicle_match()
+        return b
+
+    def ride_a(self):
+        """The 09-15 sequence: crash, ride, relaunch aboard, healthy verdict."""
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        b.advance(29 * 60 * 1000)
+        self.aboard(b)
+        b.advance(60000)._envelope(kind="session", event="resumed-session")
+        b.advance(5000).bundle_health()             # 15:47:16, the boot verdict
+        # The coalescing window closes and the tick flushes the page.
+        b.advance(20000).progress(leg=1, stops=5)
+        return b
+
+    def test_the_relaunch_page_gets_the_slot_not_the_recovery_line(self):
+        """Fails on 754ed18: sent is [boot-crash, boot-recovery] there and the
+        page is dropped with suppressed == "rate-limit"."""
+        watch = self.run_stream(self.ride_a(), finalize=False)
+        self.assertEqual([p["kind"] for p in self.sent(watch)],
+                         ["boot-crash", "page"])
+        self.assertIn("The app restarted while you were on",
+                      self.sent(watch)[1]["body"])
+        self.assertEqual(self.suppressed(watch, "rate-limit"), [])
+
+    def test_the_dropped_recovery_line_leaves_a_row_saying_why(self):
+        """A decision with no push_log row is one the wrap-up cannot read."""
+        watch = self.run_stream(self.ride_a(), finalize=False)
+        rows = self.suppressed(watch, "collapsed-into-session-restart")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "boot-recovery")
+        self.assertIn("App came back", rows[0]["body"])
+
+    def test_the_collapsed_line_is_not_retried_after_the_ride(self):
+        """Collapsed means spent: the ride page said the app is back, so a
+        later verdict must not say it again half an hour on."""
+        b = self.ride_a()
+        b.advance(2 * 60 * 1000).stop()
+        b.advance(60000).bundle_health()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(
+            [p for p in self.sent(watch) if p["kind"] == "boot-recovery"], [])
+
+    def test_an_unrelated_page_mid_window_only_defers_the_line(self):
+        """A page about something else is not the same news, so the recovery
+        waits for its next verdict rather than being collapsed into it."""
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        b.advance(29 * 60 * 1000).start().advance(1000).progress(leg=1, stops=6)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).riding(trip_id="1:222")    # riding-flip, buffered
+        b.advance(5000).bundle_health()            # lands mid-window
+        b.advance(20000).progress(leg=1, stops=6)  # window closes, page sends
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual([p["kind"] for p in self.sent(watch)],
+                         ["boot-crash", "page"])
+        self.assertEqual(len(self.suppressed(watch, "ride-page-waiting")), 1)
+        self.assertEqual(self.suppressed(watch, "collapsed-into-session-restart"),
+                         [])
+
+    def test_a_deferred_line_still_gets_its_next_verdict(self):
+        """The ack is left unset on purpose: deferring must not silence it."""
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        b.advance(29 * 60 * 1000).start().advance(1000).progress(leg=1, stops=6)
+        b.advance(1000).riding(trip_id="1:100")
+        b.advance(1000).riding(trip_id="1:222")
+        b.advance(5000).bundle_health()            # deferred
+        b.advance(20000).progress(leg=1, stops=6)  # the page goes out
+        b.advance(4 * 60 * 1000).bundle_health()   # past the rate limit
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual([p["kind"] for p in self.sent(watch)],
+                         ["boot-crash", "page", "boot-recovery"])
+
+    def test_a_relaunch_before_the_crash_does_not_collapse_it(self):
+        """A relaunch page that predates the crash says nothing about whether
+        the app came back from it."""
+        b = StreamBuilder(device=DEVICE).bundle()
+        self.aboard(b)
+        b.advance(60000)._envelope(kind="session", event="resumed-session")
+        b.advance(20000).progress(leg=1, stops=5)  # the relaunch page goes out
+        b.advance(4 * 60 * 1000).boot_error()      # the crash comes after it
+        b.advance(4 * 60 * 1000).bundle_health()
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual([p["kind"] for p in self.sent(watch)],
+                         ["page", "boot-crash", "boot-recovery"])
+
+    def test_another_phones_relaunch_does_not_collapse_this_ones(self):
+        """Two phones, and only one of them crashed."""
+        other = "dev-other-phone"
+        b = StreamBuilder(device=DEVICE).bundle().advance(400).boot_error()
+        # Five minutes on, so the other phone's page is not merely losing to
+        # the crash push's own 120 s rate limit.
+        b2 = StreamBuilder(session="other-session", t=b.t + 5 * 60 * 1000,
+                           device=other).bundle()
+        self.aboard(b2)
+        b2.advance(60000)._envelope(kind="session", event="resumed-session")
+        b2.advance(20000).progress(leg=1, stops=5)   # its page goes out
+        b2.advance(4 * 60 * 1000).bundle_health(reason="confirmed")
+        watch = quiet_watch(self.tmp)
+        for ev in sorted(b.events + b2.events, key=lambda e: e["t"]):
+            watch.process(ev)
+        # The other phone's ride paged, and DEVICE's crash is still unclosed.
+        kinds = [p["kind"] for p in self.sent(watch)]
+        self.assertEqual(kinds, ["boot-crash", "page"])
+        b.t = b2.t + 60000
+        b.bundle_health()
+        watch.process(b.events[-1])
+        self.assertEqual([p["kind"] for p in self.sent(watch)],
+                         ["boot-crash", "page", "boot-recovery"])
+
+
 class TestBundleBookkeeping(BootTestCase):
     """Which bundle a ride ran on. The `bundle` session event has been in the
     stream since the OTA lane shipped and was ignored for the same reason the

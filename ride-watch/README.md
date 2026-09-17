@@ -360,10 +360,19 @@ by the first page and later pages do **not** extend it, so a continuing storm
 cannot defer paging indefinitely; subsequent pages simply open the next
 window. The 2-per-trip cap and the 120s global rate limit still apply on top.
 
-`boot-crash` and `bundle-health` are **not** in this scheme at all: they are
-outside a ride, so there is no trip buffer to enter, nothing concurrent to be
-ranked against, and no trip budget to charge. Do not add them to `PAGE_RANK`
-— see *Boot crashes*.
+The three **device** pushes (`boot-crash`, `bundle-health`, `boot-recovery`)
+are **not** in this scheme: they usually fire outside a ride, so there is no
+trip buffer to enter, nothing concurrent to be ranked against, and no trip
+budget to charge. Do not add them to `PAGE_RANK` — see *Boot crashes*. But a
+push that sends the instant it fires beats one the buffer is holding, and on
+2026-09-15 that cost the rider the better of two lines about one relaunch
+(backlog 17.21): the `session-restart-while-aboard` page buffered at 15:47:11
+lost its slot to an "App came back" line at 15:47:16, which was itself the
+29-minute-late follow-up to the 15:18:11 crash. So the order of a device push
+against a held ride page is settled in code rather than in the table —
+`boot-crash` and a withheld `bundle-health` keep the instant path (the app
+being broken outranks any ride page), while `boot-recovery` ranks **below
+every rule below** and gives way to a page mid-window.
 
 `PAGE_RANK`, highest first — the question is "how much does this change what
 the rider does in the next minute?", not "how broken is the app" (the
@@ -372,10 +381,13 @@ post-ride report covers that):
 | rank | rule | why |
 | --- | --- | --- |
 | 50 | `stop-count-collapse` | the banner is lying about when to get off; acted on immediately |
+| 45 | `itinerary-backwards` | every time on the trip sheet is suspect, and they are reading it now |
 | 40 | `missed-bus-while-riding` | a wrong alert telling a seated rider to move |
 | 38 | `replan-not-converging` | the app cannot get them there and has not said so; every minute spent waiting for the next plan is spent |
+| 37 | `unreachable-but-routable` | the app just told them to give up and is wrong; "ask again" expires |
 | 35 | `notification-repeat` | their phone is buzzing wrongly; "ignore it" is actionable this second |
 | 30 | `aboard-swap` | the on-screen route no longer matches their bus |
+| 28 | `session-restart-while-aboard` | the screen they were navigating by went away under them |
 | 20 | `riding-flip` | board state suspect, but they are on the right vehicle |
 | 10 | `deviated-streak` | tracking looks off; nothing to do about it |
 
@@ -404,6 +416,15 @@ bundle was confirmed or is about to be rolled back. This daemon reads both.
   (`boot-error` / `not-rendered`) pages; `confirmed` is an `info` line, except
   on a phone paged about within the last hour, which gets a one-line
   **"App came back on `<bundle>`"** to close the incident.
+- **"App came back" never costs another push its slot** (17.21). It is the one
+  push here designed to be losable — lose it and the next launch's verdict
+  says it instead — so it is *collapsed* when a live ride on that phone has
+  already paged that the app relaunched under the rider (the same news, said
+  better: it names the bus), and *deferred* when any ride is holding a page
+  inside its coalescing window. Collapsing marks the incident acknowledged;
+  deferring leaves it unacknowledged on purpose, so the next verdict retries.
+  Both leave a `push_log` row (`collapsed-into-session-restart` /
+  `ride-page-waiting`) so the wrap-up can see the decision.
 
 **Their own page budget.** These pay out of a per-phone budget
 (`BOOT_PAGE_INTERVAL_MS`, **30 min**), never out of a ride's two interrupts,
@@ -1056,7 +1077,7 @@ states the convention outright.
 python3 ride-watch/test_ride_watch.py
 ```
 
-358 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
+500 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
 (both the firing case and the case that must stay quiet), the state machine, and
 page ranking (supersession inside the window, tie-breaking, flush on a quiet log,
 flush on trip end).

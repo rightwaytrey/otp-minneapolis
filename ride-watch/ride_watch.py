@@ -959,6 +959,14 @@ PAGE_COALESCE_MS = 15 * 1000
 # thought about where it belongs. Add it here when you add the rule.
 #   notification-repeat     their phone is buzzing wrongly; "ignore it" is an
 #                           instruction they can act on this second
+#
+# This table holds the TRIP page rules and only those, because _buffer_page is
+# its only reader. The three device pushes (boot-crash, bundle-health,
+# boot-recovery) never enter the buffer — see _page_device — and their order
+# against a buffered ride page is settled in code, not here: boot-crash and a
+# withheld bundle-health send instantly and outrank everything (the app being
+# broken beats any ride page), while boot-recovery ranks below every entry
+# above and defers to a page mid-window (17.21, _maybe_page_recovery).
 PAGE_RANK = {
     "stop-count-collapse": 50,
     # itinerary-backwards  every time on the trip sheet is suspect; the rider
@@ -2424,7 +2432,38 @@ class RideWatch:
             % (bundle or "unknown", reason), finding, trip)
 
     def _maybe_page_recovery(self, device, t, bundle):
-        """One line closing a boot crash we already paged about."""
+        """One line closing a boot crash we already paged about.
+
+        Two things it must never do (17.21), both measured on 2026-09-15 ride
+        A. The crash page went out 15:18:11 and its follow-up was rate-limited
+        14 s later, so the ack stayed unset and kept re-arming on every
+        `confirmed` verdict for the whole hour. It finally sent on the
+        15:47:16 verdict — 29 minutes on, with a ride running — and took the
+        global push slot from a `session-restart-while-aboard` page that had
+        been buffered at 15:47:11 and was still 10 s inside its coalescing
+        window. The rider would have been told "App came back on 2026.0915.1"
+        and not "The app restarted while you were on ORANGE Downtown
+        Minneapolis", out of a two-page ride budget.
+
+        Not a replay artefact. `now_ms()` in a replay is the event clock, not
+        a compressed wall clock, and the day file's own `recv` says the two
+        batches reached the sink 3.22 s and 1.05 s after they were written: on
+        the real ride the page is buffered at wall 15:47:15.0 and flushes at
+        15:47:30.0 while this line sends at 15:47:17.9, 12.1 s ahead of it.
+        For the page to survive, the recovery would have to land more than
+        PUSH_MIN_INTERVAL_MS (120 s) before a flush that is only
+        PAGE_COALESCE_MS (15 s) after the page's own arrival, which no
+        spacing allows.
+
+        So: this line is the one push in this file designed to be losable
+        ("one more chance at the next launch", below), which makes it the one
+        push that must never cost anything else its slot. It ranks below every
+        entry in PAGE_RANK — enforced here rather than in that table, which
+        only `_buffer_page` reads and which is asserted to hold exactly the
+        trip page rules. `boot-crash` and a withheld `bundle-health`
+        deliberately keep their instant path: the app being broken outranks
+        any ride page.
+        """
         if not device:
             return
         paged_ms = self.device_boot_page_ms.get(device)
@@ -2433,6 +2472,36 @@ class RideWatch:
         if self.device_boot_ack.get(device) == paged_ms:
             return
         body = "App came back on %s" % (bundle or "the current bundle")
+        # Collapsed, not deferred: a ride on this phone has already told the
+        # rider the app relaunched under them mid-ride, which is the same news
+        # said better — it names the bus and gives them something to do. A
+        # second line saying the app is back adds nothing a rider looking at a
+        # working app does not already know, and the standing copy rule is
+        # that a push carries only what they act on. The relaunch has to be
+        # AFTER the crash being acknowledged or it says nothing about it.
+        restarted = self._restart_paged_since(device, paged_ms)
+        if restarted is not None:
+            self.log.info(
+                "boot-recovery collapsed into %s's relaunch page at %s: the"
+                " ride already said the app came back"
+                % (restarted.session, fmt_hms(restarted.restart_aboard_ms)))
+            self._log_recovery_suppressed(
+                t, body, "collapsed-into-session-restart")
+            self.device_boot_ack[device] = paged_ms
+            self._save_state()
+            return
+        # ...and if some other ride page is mid-window, wait. The ack is left
+        # unset on purpose, so this takes the next launch's verdict instead,
+        # which is the fallback the send path below already relies on.
+        waiting = self._trip_page_waiting()
+        if waiting is not None:
+            self.log.info(
+                "boot-recovery deferred: %s holds %d page(s) in the coalescing"
+                " window until %s, and every ride page outranks this line"
+                % (waiting.session, len(waiting.pending_pages),
+                   fmt_hms(waiting.pending_until_ms)))
+            self._log_recovery_suppressed(t, body, "ride-page-waiting")
+            return
         if self._send_push("Ride watch", one_line(body, PUSH_BODY_MAX),
                            kind="boot-recovery"):
             # Only on a send: a recovery page lost to the 120 s rate limit
@@ -2440,6 +2509,44 @@ class RideWatch:
             # the thing anyway.
             self.device_boot_ack[device] = paged_ms
             self._save_state()
+
+    def _log_recovery_suppressed(self, t, body, why):
+        """Record a recovery line that was not sent, so the file still says so.
+
+        _send_push writes a push_log row for everything it refuses; these two
+        never reach it, and a decision that leaves no row is a decision the
+        wrap-up cannot read.
+        """
+        self.push_log.append({
+            "tsMs": int(t), "title": "Ride watch",
+            "body": one_line(body, PUSH_BODY_MAX),
+            "sent": False, "kind": "boot-recovery", "suppressed": why})
+
+    def _restart_paged_since(self, device, since_ms):
+        """A live ride on this phone that has reported a relaunch since `since_ms`.
+
+        `restart_aboard_ms` is stamped by _rule_session_restart_while_aboard
+        whether the page went out or was superseded: either way the rider's
+        ride budget has been spent on this relaunch, and the recovery line is
+        not the way to spend more of it.
+        """
+        for trip in self._active_trips():
+            if device and trip.device != device:
+                continue
+            if trip.restart_aboard_ms and trip.restart_aboard_ms >= since_ms:
+                return trip
+        return None
+
+    def _trip_page_waiting(self):
+        """Any live ride holding a page inside its coalescing window.
+
+        Deliberately every ride, not just this phone's: the rate limit is
+        global because the rider is one person with one lock screen.
+        """
+        for trip in self._active_trips():
+            if trip.pending_pages:
+                return trip
+        return None
 
     def _device_finding(self, session, device, t, rule, severity, summary,
                         context, trip=None, boot_health=True):
