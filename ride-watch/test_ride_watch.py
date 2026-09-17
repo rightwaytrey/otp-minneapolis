@@ -128,6 +128,35 @@ def transit_itinerary():
     }
 
 
+def replacement_itinerary(route_id="1:21", trip_id="1:400", short="21",
+                          end_offset=2400000, drop_first_walk=False):
+    """A plan that is genuinely a DIFFERENT journey from transit_itinerary().
+
+    aboard-swap is now exempt from a swap that keeps every route id and the
+    arrival time (17.9a), so a test that swaps `transit_itinerary()` for itself
+    is a test of the exemption, not of the rule. Everything here that tests the
+    rule swaps this in instead: a different route, and an arrival 10 minutes
+    later.
+
+    `drop_first_walk` reproduces the shape the exemption is FOR — the
+    boarded-earlier splice of 2026-09-15 15:36:33 dropped the spent walk leg
+    and changed nothing else — so a test can hold the routes and the arrival
+    fixed while the leg list changes.
+    """
+    itin = transit_itinerary()["itinerary"]
+    if drop_first_walk:
+        # Arrival deliberately untouched: the 15:36:33 splice kept 16:32:43.
+        itin["legs"] = itin["legs"][1:]
+        return {"itinerary": itin}
+    itin["endTime"] = T0 + end_offset
+    bus = itin["legs"][1]
+    bus["route"] = {"shortName": short, "longName": "Route %s" % short,
+                    "gtfsId": route_id}
+    bus["routeId"] = route_id
+    bus["tripId"] = trip_id
+    return {"itinerary": itin}
+
+
 class StreamBuilder:
     """Builds a synthetic JSONL-shaped event stream with a moving clock."""
 
@@ -218,6 +247,25 @@ class StreamBuilder:
 
     def start(self, payload=None):
         return self.action("START_GO_MODE", payload or transit_itinerary())
+
+    def swap(self, **kw):
+        """An itinerary replacement that really replaces the itinerary.
+
+        A bare `.start()` mid-trip now reads as a route-preserving swap and is
+        exempt (17.9a), which is correct and is not what most of these tests
+        are about.
+        """
+        return self.action("START_GO_MODE", replacement_itinerary(**kw))
+
+    def onboard_commit(self, **kw):
+        """The onboard picker's commit: CLEAR_ONBOARD then START_GO_MODE.
+
+        3 ms apart on the real stream (2026-09-15 15:43:28.647 / .650) and the
+        only trace a rider's alight pick leaves — the commit carries no reroute
+        marker at all, which is why it read as automatic (17.9b).
+        """
+        self.action("CLEAR_ONBOARD")
+        return self.advance(3).swap(**kw)
 
     def stop(self):
         return self.action("STOP_GO_MODE")
@@ -634,7 +682,7 @@ class TestRules(RuleTestCase):
         b = StreamBuilder().start().advance(1000).progress(stops=5)
         b.advance(1000).riding()
         b.advance(59000).vehicle_match()
-        b.advance(1000).start()
+        b.advance(1000).swap()
         watch = self.run_stream(b)
         hits = self.find(watch, "aboard-swap")
         self.assertEqual(len(hits), 1)
@@ -666,7 +714,7 @@ class TestRules(RuleTestCase):
         b.advance(1000).riding(leg=0).vehicle_match()
         # Progress now says leg 1, which the itinerary summary calls a walk.
         b.advance(1000).progress(leg=1, stops=None)
-        b.advance(30000).start()
+        b.advance(30000).swap()
         watch = self.run_stream(b)
         self.assertIn("aboard-swap", self.rules(watch))
 
@@ -686,7 +734,7 @@ class TestRules(RuleTestCase):
         b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
         b.advance(1000).riding(leg=2).vehicle_match()
         b.advance(1000).transition_leg(2)   # onto the bus leg, not past it
-        b.advance(30000).start()
+        b.advance(30000).swap()
         watch = self.run_stream(b)
         self.assertIn("aboard-swap", self.rules(watch))
 
@@ -696,7 +744,7 @@ class TestRules(RuleTestCase):
         b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
         b.advance(1000).riding(leg=-1).vehicle_match()
         b.advance(1000).transition_leg(3)
-        b.advance(30000).start()
+        b.advance(30000).swap()
         watch = self.run_stream(b)
         self.assertIn("aboard-swap", self.rules(watch))
 
@@ -1360,13 +1408,14 @@ class TestPageRanking(RuleTestCase):
         page_rules = {"stop-count-collapse", "itinerary-backwards",
                       "missed-bus-while-riding", "replan-not-converging",
                       "unreachable-but-routable", "notification-repeat",
-                      "aboard-swap", "riding-flip", "deviated-streak"}
+                      "aboard-swap", "session-restart-while-aboard",
+                      "riding-flip", "deviated-streak"}
         self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
         self.assertEqual(
             ["stop-count-collapse", "itinerary-backwards",
              "missed-bus-while-riding", "replan-not-converging",
              "unreachable-but-routable", "notification-repeat", "aboard-swap",
-             "riding-flip", "deviated-streak"],
+             "session-restart-while-aboard", "riding-flip", "deviated-streak"],
             sorted(ride_watch.PAGE_RANK, key=ride_watch.PAGE_RANK.get,
                    reverse=True))
 
@@ -4607,6 +4656,51 @@ class TestWrapUpAsksForTheReportFirst(RuleTestCase):
         self.assertIn("investigate anything else after", wrap[0])
         self.assertIn("request: ", wrap[0])
 
+    def test_the_typed_line_also_asks_for_the_promotion(self):
+        """15.8's second mechanism, from the thread's side: the report is not
+        the end of the wrap-up, and the console is held for what follows."""
+        _, thread = self.ended_ride()
+        wrap = [l for l in thread.lines() if "wrap-up now" in l][0]
+        self.assertIn("PROMOTE its real bugs to the backlog", wrap)
+        self.assertIn("console held %d min"
+                      % (ride_watch.PROMOTION_DEADLINE_MS // 60000), wrap)
+
+    def test_the_wrap_up_line_is_not_truncated(self):
+        """one_line() cuts at THREAD_LINE_MAX from the RIGHT, and the request
+        path is the rightmost thing on this line — so a line that grows by a
+        clause silently takes the path with it, and the thread is handed a
+        wrap-up it cannot find. (That is exactly what adding the promotion
+        clause did on the first attempt: StubThread could not open the
+        truncated digest path and the push was dropped.)"""
+        _, thread = self.ended_ride()
+        wrap = [l for l in thread.lines() if "wrap-up now" in l][0]
+        self.assertLessEqual(len(wrap), ride_watch.THREAD_LINE_MAX)
+        self.assertNotIn("\u2026", wrap)
+        self.assertTrue(wrap.endswith(".digest.md"), wrap)
+        self.assertIn("request: ", wrap)
+        self.assertIn(".json", wrap)
+
+    def test_a_long_message_is_cut_before_the_digest_path_is(self):
+        """Why the wrap-up line above is safe to grow.
+
+        `one_line()` cuts at THREAD_LINE_MAX from the RIGHT and the digest path
+        is the rightmost thing on every pushed line, so a long message used to
+        take the path with it: the thread got a line ending in "…" and, in the
+        harness that actually opens the path it is handed, the push was dropped
+        with nothing but a log line. In production the wrap-up line reached 379
+        of 400 characters — 21 to spare, less than one session id — which is
+        how close this came. `_thread_push` now bounds the message and appends
+        the suffix whole."""
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        trip = watch.trips[SESSION]
+        self.assertTrue(watch._thread_push(trip, "y" * 600))
+        line = thread.lines()[-1]
+        self.assertEqual(len(line), ride_watch.THREAD_LINE_MAX)
+        self.assertTrue(line.endswith(".digest.md"), line)
+        self.assertIn("\u2026 — digest: ", line)   # the message took the cut
+
     def test_the_sysprompt_says_it_too(self):
         """The typed line lands on a thread mid-task an hour after the
         sysprompt was read; both have to carry it."""
@@ -4616,6 +4710,9 @@ class TestWrapUpAsksForTheReportFirst(RuleTestCase):
         self.assertIn("Write the report before you investigate anything else",
                       text)
         self.assertIn("2026-09-15", text)
+        # ...and the promotion half, which the 09-13 prompt fix asked for and
+        # the daemon then gave 120 seconds (15.8).
+        self.assertIn("This console is kept open", text)
 
 
 class TestResumedTripOnTheRecordedSession(unittest.TestCase):
@@ -5774,15 +5871,31 @@ class TestOnboardAnchorBehindRider(RuleTestCase):
 
     FAR = ("1:56026", "Union Depot Station", T0 + 60000)
     NEAR = ("1:56034", "Lexington Pkwy Station", T0 + 60000)
+    # The stop after the anchor on the real 09-13 list: Capitol / Rice St, 3230
+    # m from the rider against Union Depot's 4760 m. That NEARER later stop is
+    # what makes "behind" a measurement — the list walks back toward the rider
+    # instead of away from them (17.9c). Without it the rule fires on distance
+    # alone, which is exactly the 09-15 15:46:02 false positive.
+    BEHIND_TAIL = [(("1:56027", "Capitol / Rice St Station", T0 + 120000),
+                    3230.0)]
+    # ...and the 09-15 shape: the next stop up the line, 9500 m out against the
+    # anchor's 2044 m. The list recedes, so the anchor is ahead.
+    AHEAD_TAIL = [(("1:17780", "I-35W & Lake St Station", T0 + 120000),
+                   9500.0)]
 
-    def flow(self, stop, metres, in_trip=True, snapshot=True, fix_age_s=3):
+    def flow(self, stop, metres, in_trip=True, snapshot=True, fix_age_s=3,
+             rest=None):
         b = StreamBuilder()
         if in_trip:
             b.start().advance(1000).progress(leg=1, prog=10.0)
         b.advance(1000).position()
-        b.advance(fix_age_s * 1000).onboard_optimize([stop])
+        rest = self.BEHIND_TAIL if rest is None else rest
+        b.advance(fix_age_s * 1000).onboard_optimize(
+            [stop] + [s for (s, _m) in rest])
         if snapshot:
             b.advance(7000).candidate_snapshot(stop[1], stop[2], metres=metres)
+            for (s, m) in rest:
+                b.candidate_snapshot(s[1], s[2], metres=m)
         if not in_trip:
             # The flow runs between rides; the trip that follows is what the
             # held finding is filed on.
@@ -5840,8 +5953,10 @@ class TestOnboardAnchorBehindRider(RuleTestCase):
         b.advance(1000).position()
         # A candidate dated ten minutes in the past AND anchored 4.8 km away.
         stop = ("1:56026", "Union Depot Station", T0 - 600000)
-        b.advance(3000).onboard_optimize([stop])
+        tail = ("1:56027", "Capitol / Rice St Station", T0 - 540000)
+        b.advance(3000).onboard_optimize([stop, tail])
         b.advance(7000).candidate_snapshot(stop[1], stop[2], metres=4760.0)
+        b.candidate_snapshot(tail[1], tail[2], metres=3230.0)
         b.advance(2000).start()
         watch = self.run_stream(b, finalize=False)
         self.assertEqual(
@@ -6253,6 +6368,847 @@ class TestRide0909LateNote(unittest.TestCase):
             req = json.load(f)
         self.assertEqual(req["notesCount"], 1)
         self.assertIn("finish a trip on auto", req["riderNotes"][0]["text"])
+
+
+REAL_LOG_0915 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-15.jsonl")
+
+
+class TestRoutePreservingSwap(RuleTestCase):
+    """17.9a: the boarded-earlier splice is not the route walking away.
+
+    2026-09-15 15:36:33, six seconds after SET_RIDING: START_REROUTE
+    {autoApply: true, reason: "boarded-earlier", keepRouteId: "1:902"} and a
+    replacement itinerary with the same two route ids in the same order
+    (1:904 then 1:902) and the same 16:32:43 arrival. It dropped the spent
+    walk leg and re-anchored leg 0 onto the bus actually boarded. The rule
+    paged the rider about it.
+    """
+
+    def aboard(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding()
+        b.advance(59000).vehicle_match()
+        return b
+
+    def test_a_swap_that_keeps_the_routes_and_the_arrival_is_not_a_swap(self):
+        """Fails on the old rule: it had no idea what the old plan was."""
+        b = self.aboard()
+        b.advance(1000).start()          # the same plan, re-installed
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "aboard-swap"), [],
+                         self.rules(watch))
+
+    def test_dropping_the_spent_walk_leg_is_not_a_swap(self):
+        """The exact shape of 15:36:33: same routes, same arrival, one fewer
+        leg because the walk to the stop is behind the rider."""
+        b = self.aboard()
+        b.advance(1000).swap(drop_first_walk=True)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "aboard-swap"), [],
+                         self.rules(watch))
+
+    def test_a_different_route_still_pages(self):
+        b = self.aboard()
+        b.advance(1000).swap(route_id="1:21", short="21")
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "aboard-swap")), 1)
+
+    def test_the_same_routes_arriving_later_still_pages(self):
+        """Routes held, arrival moved: the rider's journey did change."""
+        b = self.aboard()
+        b.advance(1000).swap(route_id="1:5", short="5", end_offset=2400000)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "aboard-swap")), 1)
+
+    def test_a_summarized_payload_is_judged_not_excused(self):
+        """Over the debug-log size cap the itinerary arrives as
+        `{__summary: true}` and summarize_itinerary returns None. Nothing can
+        be compared, so the swap is judged as it was before — the exemption
+        fails closed."""
+        b = self.aboard()
+        b.advance(1000).action("START_GO_MODE",
+                               {"__summary": True, "chars": 157697})
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "aboard-swap")), 1)
+
+    def test_a_walk_only_replacement_is_not_exempt(self):
+        """Two plans with no transit leg compare equal on an empty route
+        signature; that must not read as 'the plan was preserved'."""
+        walk_only = {"itinerary": {"startTime": T0, "endTime": T0 + 1800000,
+                                   "duration": 1800,
+                                   "legs": [{"mode": "WALK",
+                                             "transitLeg": False,
+                                             "from": {"name": "A"},
+                                             "to": {"name": "B"}}]}}
+        b = self.aboard()
+        b.advance(1000).action("START_GO_MODE", walk_only)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "aboard-swap")), 1)
+
+
+class TestOnboardPickIsARiderAction(RuleTestCase):
+    """17.9b: CLEAR_ONBOARD then START_GO_MODE is a finger, not the app.
+
+    2026-09-15 15:43:28.647 CLEAR_ONBOARD, 15:43:28.650 START_GO_MODE — 3 ms
+    — 22 s after SET_ONBOARD_RESULT rendered five options. The pair runs only
+    from confirmOnboardAlightStop, whose sole caller is
+    AlightRecommendation.tsx's onSelect. The previous rider action was the
+    reroute button at 15:42:54.408, 34.2 s earlier and so just outside
+    RIDER_ACTION_WINDOW_MS, which is why the rule fired.
+    """
+
+    def aboard(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding()
+        b.advance(59000).vehicle_match()
+        return b
+
+    def test_an_onboard_commit_is_not_an_aboard_swap(self):
+        """Fails on the old rule: the commit carries no reroute marker, so a
+        rider tap read as automatic."""
+        b = self.aboard()
+        b.advance(1000).onboard_commit(route_id="1:21", short="21")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "aboard-swap"), [],
+                         self.rules(watch))
+
+    def test_the_window_is_the_commit_not_the_whole_flow(self):
+        """A CLEAR_ONBOARD the rider abandoned minutes ago shields nothing —
+        otherwise one visit to the picker would excuse every later swap."""
+        b = self.aboard()
+        b.advance(1000).action("CLEAR_ONBOARD")
+        b.advance(ride_watch.ONBOARD_COMMIT_WINDOW_MS + 60000)
+        b.swap(route_id="1:21", short="21")
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "aboard-swap")), 1)
+
+    def test_the_commit_also_counts_as_a_gesture_for_a_later_note(self):
+        """The same record answers note-unverifiable's gesture half: it is in
+        RIDER_GESTURE_TYPES, which is what keeps 15:57:02's note quiet."""
+        b = self.aboard()
+        b.advance(1000).onboard_commit(route_id="1:21", short="21")
+        watch = self.run_stream(b, finalize=False)
+        last = watch.session_last_gesture[SESSION]
+        self.assertEqual(last[1], "START_GO_MODE")
+
+
+class TestRerouteStormCountsOnlyAutoReroutes(RuleTestCase):
+    """17.9d: a rider pressing the button four times is not a storm.
+
+    2026-09-15 15:47:30 fired "4 reroutes within 5 min" on START_REROUTE
+    records at 15:42:54.408, 15:43:49.052, 15:46:02.060 and 15:47:30.719 —
+    every one `autoApply: false`, `reason: "rider-reroute"`. The ride's one
+    automatic reroute (15:36:33 `boarded-earlier`) had already left the
+    five-minute window. (The ride report blamed the onboard commits at
+    15:43:28 and 15:47:53; those are START_GO_MODE and never reached this
+    counter at all.)
+    """
+
+    def reroutes(self, auto, n=4):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for _ in range(n):
+            b.advance(45000).action("START_REROUTE",
+                                    {"autoApply": auto,
+                                     "reason": ("boarded-earlier" if auto
+                                                else "rider-reroute")})
+        return self.run_stream(b)
+
+    def test_four_rider_reroutes_are_not_a_storm(self):
+        """Fails on the old rule, which counted every START_REROUTE."""
+        watch = self.reroutes(False)
+        self.assertEqual(self.find(watch, "reroute-storm"), [],
+                         self.rules(watch))
+
+    def test_four_automatic_reroutes_still_are(self):
+        watch = self.reroutes(True)
+        found = self.find(watch, "reroute-storm")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["context"]["count"], 4)
+
+    def test_rider_reroutes_do_not_pad_an_automatic_storm(self):
+        """Three automatic re-plans plus five rider taps is not four."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for i in range(8):
+            auto = i % 3 == 0          # 3 of the 8
+            b.advance(30000).action("START_REROUTE",
+                                    {"autoApply": auto, "reason": "x"})
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "reroute-storm"), [])
+
+    def test_a_rider_reroute_still_feeds_the_convergence_rules(self):
+        """Only the storm counter is narrowed. _note_replan still sees every
+        reroute, which is what replan-not-converging is built on."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5, dest=1700.0)
+        b.advance(1000).action("START_REROUTE",
+                               {"autoApply": False, "reason": "rider-reroute"})
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.trips[SESSION].dest_replans_since_gain, 1)
+
+
+class TestOnboardAnchorNeedsADirection(RuleTestCase):
+    """17.9c: distance alone cannot establish "behind".
+
+    2026-09-15 15:46:02 the rider was at 44.86543, -93.30193 — 103 m past
+    Knox Ave & 76th St — and the anchor was I-35W & 66th St Station, 2044 m
+    NORTH, with the Orange Line running northbound. The anchor was 2 km
+    AHEAD. The tell is the rest of the list: the next candidate (I-35W & Lake
+    St) was 9.5 km out, so the list recedes. On 09-13's true positive the
+    next candidate (Capitol / Rice St, 3230 m) was NEARER than the anchor
+    (Union Depot, 4760 m): the list walked back toward the rider.
+    """
+
+    ANCHOR = ("1:48084", "I-35W & 66th St Station", T0 + 60000)
+    TAIL_AHEAD = ("1:17780", "I-35W & Lake St Station", T0 + 120000)
+    TAIL_BEHIND = ("1:56027", "Capitol / Rice St Station", T0 + 120000)
+
+    def flow(self, anchor_m, tail, tail_m, place_tail=True):
+        b = StreamBuilder()
+        b.start().advance(1000).progress(leg=1, prog=10.0)
+        b.advance(1000).position()
+        b.advance(3000).onboard_optimize([self.ANCHOR, tail])
+        b.advance(7000).candidate_snapshot(self.ANCHOR[1], self.ANCHOR[2],
+                                           metres=anchor_m)
+        if place_tail:
+            b.candidate_snapshot(tail[1], tail[2], metres=tail_m)
+        return self.run_stream(b, finalize=False)
+
+    def test_an_anchor_ahead_of_the_rider_says_nothing(self):
+        """Fails on the old rule, which fired on 2044 m alone."""
+        watch = self.flow(2044.0, self.TAIL_AHEAD, 9500.0)
+        self.assertEqual(self.find(watch, "onboard-anchor-behind-rider"), [],
+                         self.rules(watch))
+
+    def test_an_anchor_behind_the_rider_still_fires(self):
+        watch = self.flow(4760.0, self.TAIL_BEHIND, 3230.0)
+        found = self.find(watch, "onboard-anchor-behind-rider")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["nearestLaterStop"], "Capitol / Rice St Station")
+        self.assertAlmostEqual(ctx["nearestLaterDistanceM"], 3230.0, delta=5.0)
+
+    def test_an_unplaced_tail_convicts_nobody(self):
+        """No snapshot came back for any later candidate, so there is no
+        direction test to run. Fails closed rather than guessing."""
+        watch = self.flow(4760.0, self.TAIL_BEHIND, 3230.0, place_tail=False)
+        self.assertEqual(self.find(watch, "onboard-anchor-behind-rider"), [])
+
+    def test_a_later_snapshot_can_still_convict_the_anchor(self):
+        """Snapshots come back in plan-completion order, not list order — on
+        09-13 Capitol / Rice St landed 349 ms BEFORE Union Depot and Prospect
+        Park five seconds after. A first tail that looks 'ahead' must not
+        latch the verdict shut."""
+        b = StreamBuilder()
+        b.start().advance(1000).progress(leg=1, prog=10.0)
+        b.advance(1000).position()
+        far = ("1:56040", "Prospect Park Station", T0 + 180000)
+        b.advance(3000).onboard_optimize(
+            [self.ANCHOR, self.TAIL_BEHIND, far])
+        b.advance(7000).candidate_snapshot(self.ANCHOR[1], self.ANCHOR[2],
+                                           metres=4760.0)
+        b.advance(100).candidate_snapshot(far[1], far[2], metres=9000.0)
+        b.advance(100).candidate_snapshot(self.TAIL_BEHIND[1],
+                                          self.TAIL_BEHIND[2], metres=3230.0)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "onboard-anchor-behind-rider")),
+                         1, self.rules(watch))
+
+    def test_the_margin_keeps_a_near_tie_quiet(self):
+        """A later stop a hundred metres nearer is stop spacing and GPS, not
+        a list built from the wrong end."""
+        watch = self.flow(4760.0, self.TAIL_BEHIND, 4700.0)
+        self.assertEqual(self.find(watch, "onboard-anchor-behind-rider"), [])
+
+
+class TestSessionRestartWhileAboard(RuleTestCase):
+    """17.7: the app relaunched under a rider who was on the bus.
+
+    2026-09-15 15:49:45 (and 15:47:11 before it): `record-mode` / `start` /
+    `resumed-session`, RESUME_GO_MODE, `bundle_hold`, then `bundle_health` /
+    `bundle_apply` five seconds later — the crash-recovery path.
+    STOP_GO_MODE came 24 s after the second one.
+    """
+
+    def resumed_session(self):
+        return {"kind": "session", "event": "resumed-session"}
+
+    def ride(self, riding=True, marker="resumed-session", both=False):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        if riding:
+            b.advance(1000).riding().vehicle_match()
+        b.advance(60000)
+        if marker == "resumed-session" or both:
+            b._envelope(kind="session", event="resumed-session")
+        if marker == "RESUME_GO_MODE" or both:
+            b.advance(3).action("RESUME_GO_MODE", transit_itinerary())
+        return self.run_stream(b, finalize=False)
+
+    def test_a_relaunch_while_aboard_pages(self):
+        """Fails on the old rules: nothing watched for this at all."""
+        watch = self.ride()
+        found = self.find(watch, "session-restart-while-aboard")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "page")
+        self.assertEqual(found[0]["context"]["marker"], "resumed-session")
+        self.assertEqual(found[0]["context"]["restartCount"], 1)
+
+    def test_resume_go_mode_alone_is_enough(self):
+        """The app keeps its session id across the relaunch, so the action is
+        sometimes the only marker that reaches a rule."""
+        watch = self.ride(marker="RESUME_GO_MODE")
+        found = self.find(watch, "session-restart-while-aboard")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["context"]["marker"], "RESUME_GO_MODE")
+
+    def test_one_relaunch_reported_twice_is_one_finding(self):
+        """`resumed-session` and RESUME_GO_MODE land 3 ms apart."""
+        watch = self.ride(both=True)
+        self.assertEqual(len(self.find(watch, "session-restart-while-aboard")),
+                         1)
+
+    def test_a_relaunch_with_no_riding_fact_says_nothing(self):
+        """The rider is on a bike or standing at a stop; a resume there is
+        the app doing its job."""
+        watch = self.ride(riding=False)
+        self.assertEqual(self.find(watch, "session-restart-while-aboard"), [])
+
+    def test_the_second_relaunch_is_filed_but_does_not_page(self):
+        """09-15 ride A relaunched at 15:47:11 and again at 15:49:45. The
+        second is news for the report; it is not worth the ride's other
+        interrupt."""
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding().vehicle_match()
+        b.advance(60000)._envelope(kind="session", event="resumed-session")
+        b.advance(150000)._envelope(kind="session", event="resumed-session")
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "session-restart-while-aboard")
+        self.assertEqual([f["severity"] for f in found], ["page", "warn"])
+        self.assertEqual(found[1]["context"]["restartCount"], 2)
+        self.assertIn("2 in this ride", found[1]["summary"])
+
+    def test_resumed_trip_does_not_also_fire(self):
+        """`resumed-trip` is about a ride that arrives with no START_GO_MODE
+        anywhere and is reached only from _maybe_adopt. This one arrives
+        inside a trip the daemon opened itself, so the two cannot collide."""
+        watch = self.ride()
+        self.assertEqual(self.find(watch, "resumed-trip"), [])
+
+    def test_it_says_nothing_after_arrival(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding().vehicle_match()
+        b.advance(1000).action("SET_ARRIVED", {})
+        b.advance(60000)._envelope(kind="session", event="resumed-session")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "session-restart-while-aboard"), [])
+
+
+class TestNoteUnverifiable(RuleTestCase):
+    """17.11: "Clicking does nothing", and nothing records a click.
+
+    2026-09-15 15:53:50.965, six seconds after a cold start and twenty before
+    BEGIN_ONBOARD_FLOW, with a screenshot. Everything around it is machinery:
+    LOCATION_CHANGE 15:53:41 (to /feedback, which is the note being written),
+    `bundle_apply` 15:53:44. And FIND_FEEDS_ERROR at 15:53:59.330 says
+    "Request timed out after 20000 ms", so a request issued 15:53:39.330 was
+    still hanging when the rider tapped.
+    """
+
+    def timeout_error(self, b, ms=20000, typ="FIND_FEEDS_ERROR"):
+        return b.action(typ, {"__error": True,
+                              "message": "Request timed out after %d ms" % ms,
+                              "name": "Error"})
+
+    def tick(self, watch, ms=None):
+        watch.clock_ms += (ride_watch.NOTE_EVIDENCE_GRACE_MS + 1000
+                           if ms is None else ms)
+        watch.check_timers()
+        return watch
+
+    def test_a_note_with_no_gesture_behind_it_is_a_finding(self):
+        """Fails on the old rules: nothing correlated a note with what the
+        rider had been touching."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(120000).note("Clicking does nothing")
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        found = self.find(watch, "note-unverifiable")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        ctx = found[0]["context"]
+        self.assertTrue(ctx["noGestureRecord"])
+        self.assertIsNone(ctx["inFlightTimeout"])
+        self.assertEqual(ctx["tapInstrumentation"], "absent")
+
+    def test_a_note_inside_a_timeout_window_is_a_finding_even_with_a_gesture(self):
+        """The other half: the rider had touched something, and the app was
+        stalled on a 20 s request while they did."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).action("SET_MAP_FOLLOW", False)
+        b.advance(5000).note("Clicking does nothing")
+        b.advance(5000)
+        self.timeout_error(b)
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        found = self.find(watch, "note-unverifiable")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        ctx = found[0]["context"]
+        self.assertFalse(ctx["noGestureRecord"])
+        self.assertEqual(ctx["inFlightTimeout"]["type"], "FIND_FEEDS_ERROR")
+        self.assertEqual(ctx["inFlightTimeout"]["timeoutMs"], 20000)
+
+    def test_a_note_with_a_recent_gesture_and_no_timeout_says_nothing(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).action("SET_GO_MODE_ACTIVE_LEG", {"index": 1})
+        b.advance(22000).note("Why a 30 minute wait for the green line???")
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        self.assertEqual(self.find(watch, "note-unverifiable"), [])
+
+    def test_a_tap_record_the_client_does_not_send_yet_would_silence_it(self):
+        """The rule retires itself. A parallel change is adding tap records to
+        the client; any of them counts as a gesture, so once they land this
+        stops firing without another daemon change."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).action("GO_MODE_UI_TAP", {"control": "alight-row"})
+        b.advance(5000).note("Clicking does nothing")
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        self.assertEqual(self.find(watch, "note-unverifiable"), [])
+
+    def test_the_feedback_navigation_is_not_a_gesture(self):
+        """SET_GO_MODE_BACKGROUNDED + SET_MOBILE_SCREEN + a LOCATION_CHANGE to
+        /feedback precede every note in both 09-15 rides. Counting them would
+        make this rule dead on arrival."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(120000).action("SET_GO_MODE_BACKGROUNDED", True)
+        b.action("SET_MOBILE_SCREEN", 8).location("/feedback")
+        b.advance(5000).note("Clicking does nothing")
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        self.assertEqual(len(self.find(watch, "note-unverifiable")), 1)
+
+    def test_it_fires_once_a_ride(self):
+        """A ride's notes come in fours and the statement is the same one
+        every time."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(120000).note("Clicking does nothing")
+        b.advance(30000).note("Still nothing")
+        b.advance(30000).note("Nothing again")
+        watch = self.run_stream(b, finalize=False)
+        for _ in range(4):
+            self.tick(watch, ms=20000)
+        self.assertEqual(len(self.find(watch, "note-unverifiable")), 1)
+
+    def test_a_note_before_the_ride_is_held_for_the_trip_that_follows(self):
+        """The 15:53:50 note landed 2m23s before its ride's START_GO_MODE, so
+        every trip guess in _on_rider_note came back empty and until now the
+        note was only logged."""
+        b = StreamBuilder()
+        b.advance(1000).note("Clicking does nothing",
+                             image="/home/rwt/otp-debug-logs/feedback/x.jpg")
+        b.advance(5000)
+        self.timeout_error(b)
+        b.advance(ride_watch.NOTE_EVIDENCE_GRACE_MS + 1000)
+        b.position()                      # a tick, to resolve the note
+        b.advance(120000).start()
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "note-unverifiable")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["session"], SESSION)
+        self.assertEqual(found[0]["context"]["image"],
+                         "/home/rwt/otp-debug-logs/feedback/x.jpg")
+
+    def test_a_held_note_does_not_fire_again_on_its_new_trip(self):
+        b = StreamBuilder()
+        b.advance(1000).note("Clicking does nothing")
+        b.advance(5000)
+        self.timeout_error(b)
+        b.advance(ride_watch.NOTE_EVIDENCE_GRACE_MS + 1000).position()
+        b.advance(120000).start().advance(1000).progress(stops=5)
+        b.advance(120000).note("And again")
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        self.assertEqual(len(self.find(watch, "note-unverifiable")), 1)
+
+    def test_replay_eof_resolves_a_note_still_inside_its_window(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(120000).note("Clicking does nothing")
+        watch = self.run_stream(b)            # finalize_replay
+        self.assertEqual(len(self.find(watch, "note-unverifiable")), 1)
+
+    def test_a_timeout_that_ended_before_the_note_is_not_in_flight(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).action("SET_MAP_FOLLOW", False)
+        self.timeout_error(b)                 # window ends here
+        b.advance(5000).note("Clicking does nothing")
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        self.assertEqual(self.find(watch, "note-unverifiable"), [])
+
+    def test_an_error_that_did_not_time_out_is_not_a_window(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).action("SET_MAP_FOLLOW", False)
+        b.advance(5000).note("Clicking does nothing")
+        b.advance(5000).action("FIND_TRIP_ERROR",
+                               {"__error": True, "message": "Load failed",
+                                "name": "TypeError"})
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        self.assertEqual(self.find(watch, "note-unverifiable"), [])
+
+    def test_the_structured_timeout_shape_is_read_too(self):
+        """ROUTING_ERROR carries {timedOut, timeoutMs, url} rather than a
+        message; both shapes are in the 09-15 stream."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).action("SET_MAP_FOLLOW", False)
+        b.advance(5000).note("Clicking does nothing")
+        b.advance(5000).action("ROUTING_ERROR", {
+            "error": {"timedOut": True, "timeoutMs": 20000,
+                      "url": "https://api.transit-nav.com:9966/otp/gtfs/v1"},
+            "searchId": "e1c8rn6xf"})
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        found = self.find(watch, "note-unverifiable")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["context"]["inFlightTimeout"]["type"],
+                         "ROUTING_ERROR")
+
+    def test_the_note_itself_is_still_an_ordinary_finding(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(120000).note("Clicking does nothing")
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        self.assertEqual(len(self.find(watch, "rider-note")), 1)
+
+    def test_it_never_costs_the_rider_a_page(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(120000).note("Clicking does nothing")
+        watch = self.run_stream(b, finalize=False)
+        self.tick(watch)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+
+class TestPromotionGate(RuleTestCase):
+    """15.8's second mechanism: a wrap-up is not done when the file appears.
+
+    Until 2026-09-17 _check_report_deadlines took os.path.exists(reportPath)
+    as the wrap-up being over and scheduled the reap in the same tick, so the
+    promotion step — which both prompts put after the report — had
+    THREAD_REAP_GRACE_MS, 120 s. On 09-15 ng2uqc's report landed 15:53:04 and
+    the pane went at 15:55:05; 8lyyq1's went the same way; neither plan file
+    was touched after 13:42.
+    """
+
+    def ended_ride(self, real_bugs=1):
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        # A backlog and a record file of our own: a test must never read or
+        # write the rider's real plan.
+        self.plan = os.path.join(self.tmp, "backlog.md")
+        self.record = os.path.join(self.tmp, "record.md")
+        for p in (self.plan, self.record):
+            with open(p, "w") as f:
+                f.write("# open rows\n")
+        watch.plan_paths = [self.plan, self.record]
+        # Re-arm so the entry carries digests of those files rather than of
+        # the rider's real ones.
+        watch.report_deadlines[0]["planDigests"] = watch._plan_digests()
+        self.report = watch.report_deadlines[0]["reportPath"]
+        self.thread = thread
+        self.real_bugs = real_bugs
+        return watch
+
+    def write_report(self, n=1):
+        with open(self.report, "w") as f:
+            f.write("# Ride report\n\n")
+            for i in range(n):
+                f.write("## %d. Something went wrong — REAL BUG\n\n"
+                        "evidence\n\n" % (i + 1))
+            if not n:
+                f.write("## 1. Surprising but fine"
+                        " — app-behaved-correctly\n")
+
+    def promote(self, path=None):
+        with open(path or self.plan, "a") as f:
+            f.write("\n| 18.1 | **a new row** | evidence |\n")
+
+    def fallbacks(self, watch):
+        return [p for p in watch.push_log
+                if p["kind"] in ("fallback", "promotion")]
+
+    def test_the_report_landing_no_longer_ends_the_wrap_up(self):
+        """Fails on the old code, which cleared the deadline and scheduled the
+        reap on the same tick the file appeared."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(len(watch.report_deadlines), 1)
+        self.assertEqual(watch.thread_reaps, [])
+        self.assertEqual(watch.report_deadlines[0]["realBugs"], 1)
+
+    def test_the_console_survives_the_old_two_minute_grace(self):
+        """The whole of the failure: 120 s was the promotion window."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        watch.clock_ms += ride_watch.THREAD_REAP_GRACE_MS + 60000
+        watch.check_timers()
+        self.assertEqual(self.thread.kills, [])
+        self.assertEqual(len(watch.report_deadlines), 1)
+
+    def test_a_backlog_that_moves_settles_the_wrap_up(self):
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.promote()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertEqual([r["why"] for r in watch.thread_reaps],
+                         ["wrap-up landed and promoted"])
+        self.assertEqual(self.fallbacks(watch), [])
+
+    def test_the_record_file_counts_as_promotion_too(self):
+        """A wrap-up whose findings all dedupe onto existing rows edits the
+        backlog; one that closes a row moves it into the record. Both are the
+        step doing its job."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.promote(self.record)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertEqual(self.fallbacks(watch), [])
+
+    def test_a_report_with_nothing_to_promote_settles_at_once(self):
+        """The terminating condition that matters most: a clean ride must not
+        hold a console open for eight minutes."""
+        watch = self.ended_ride()
+        self.write_report(n=0)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertEqual([r["why"] for r in watch.thread_reaps],
+                         ["wrap-up landed, nothing to promote"])
+        self.assertEqual(self.fallbacks(watch), [])
+
+    def test_the_window_expires_and_pages_once(self):
+        watch = self.ended_ride()
+        self.write_report(n=3)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        watch.clock_ms += ride_watch.PROMOTION_DEADLINE_MS + 1000
+        watch.check_timers()
+        pages = self.fallbacks(watch)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["kind"], "promotion")
+        self.assertIn("3 real bug(s)", pages[0]["body"])
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertEqual([r["why"] for r in watch.thread_reaps],
+                         ["promotion deadline expired"])
+
+    def test_it_pages_once_not_every_tick(self):
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()               # the report lands; window opens
+        watch.clock_ms += ride_watch.PROMOTION_DEADLINE_MS + 1000
+        watch.check_timers()
+        for _ in range(5):
+            watch.clock_ms += 60000
+            watch.check_timers()
+        self.assertEqual(len(self.fallbacks(watch)), 1)
+
+    def test_it_never_pages_about_a_pane_this_daemon_killed(self):
+        """The same protection the missing-report page already carries: the
+        thread never had the window the deadline claims to have given it."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        pane = watch.report_deadlines[0]["tmux"]
+        watch._panes_killed[pane] = watch.clock_ms
+        watch.clock_ms += ride_watch.PROMOTION_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(self.fallbacks(watch), [])
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_a_missing_report_still_pages_on_its_own_deadline(self):
+        """The first gate is unchanged: no report at all is still the
+        8/28 page, and the promotion window never opens."""
+        watch = self.ended_ride()
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        pages = self.fallbacks(watch)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["kind"], "fallback")
+        self.assertIn("Report pending", pages[0]["body"])
+
+    def test_an_entry_from_an_older_daemon_settles_on_the_report_alone(self):
+        """state.json survives a restart, so an entry armed before this code
+        existed has no baseline. It must not be held open forever."""
+        watch = self.ended_ride()
+        del watch.report_deadlines[0]["planDigests"]
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertEqual([r["why"] for r in watch.thread_reaps],
+                         ["wrap-up landed"])
+
+    def test_the_gate_survives_a_daemon_restart(self):
+        """Restart-on-commit happens to this process mid-evening, and the
+        baseline has to outlive it — which is why it is a digest in
+        state.json rather than an in-memory mtime."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        restarted = quiet_watch(self.tmp)
+        restarted.plan_paths = [self.plan, self.record]
+        self.assertEqual(len(restarted.report_deadlines), 1)
+        self.assertEqual(restarted.report_deadlines[0]["planDigests"],
+                         restarted._plan_digests())
+        self.promote()
+        restarted.clock_ms = watch.clock_ms + 1000
+        restarted.check_timers()
+        self.assertEqual(restarted.report_deadlines, [])
+
+    def test_the_real_bug_count_reads_both_report_dialects(self):
+        watch = self.ended_ride()
+        for text, want in (
+                ("# r\n\n## 1. x — REAL BUG\n## 2. y — REAL BUG\n", 2),
+                ("# r\n\n## 1. x — **real-bug**\n", 1),
+                ("# r\n\n### 15:46 — aboard-swap (page) -> **real-bug**\n", 1),
+                ("# r\n\n## 1. x — app-behaved-correctly\n", 0),
+                ("# r\n\nno verdict anywhere\n", 0)):
+            with open(self.report, "w") as f:
+                f.write(text.replace("\n", "\n"))
+            self.assertEqual(watch._report_real_bugs(self.report), want, text)
+
+
+class TestRide0915(unittest.TestCase):
+    """Tier 17's daemon rows, replayed against the two afternoon rides.
+
+    Ride A `mu346i5y-ng2uqc` 15:34:52-15:50:09, ride B `mu35fwv5-8lyyq1`
+    15:53:39-16:03:33, both on dev bundle 2026.0915.1. Four rules mis-fired
+    (17.9) and two events nothing watched for (17.7, 17.11).
+    """
+
+    RIDE_A = (1789504400000, 1789505420000)        # 15:33:20-15:50:20
+    RIDE_B = (1789505600000, 1789505900000)        # 15:53:20-15:58:20
+
+    def replay_window(self, window):
+        tmp = tempfile.mkdtemp(prefix="ride-watch-0915-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        with open(REAL_LOG_0915) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                t = obj.get("t") or 0
+                if window[0] <= t <= window[1]:
+                    watch.process(obj)
+        watch.finalize_replay()
+        return watch
+
+    def hits(self, watch, rule):
+        return [f for f in watch.all_findings if f["rule"] == rule]
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0915),
+                         "%s not present" % REAL_LOG_0915)
+    def test_neither_aboard_swap_fires_any_more(self):
+        """15:36:33 was the route-preserving boarded-earlier splice (17.9a);
+        15:43:28 was the rider's own onboard pick (17.9b). Both paged."""
+        watch = self.replay_window(self.RIDE_A)
+        self.assertEqual(self.hits(watch, "aboard-swap"), [],
+                         [f["time"] for f in watch.all_findings])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0915),
+                         "%s not present" % REAL_LOG_0915)
+    def test_the_anchor_two_kilometres_ahead_is_not_called_behind(self):
+        """15:46:02: I-35W & 66th St Station, 2044 m north of a rider on a
+        northbound Orange Line bus, with the next candidate 9.5 km further
+        on. The list runs away from the rider (17.9c)."""
+        watch = self.replay_window(self.RIDE_A)
+        self.assertEqual(self.hits(watch, "onboard-anchor-behind-rider"), [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0915),
+                         "%s not present" % REAL_LOG_0915)
+    def test_the_rider_s_four_reroutes_are_not_a_storm(self):
+        """15:47:30 counted 15:42:54, 15:43:49, 15:46:02 and 15:47:30, all
+        `autoApply: false` / `rider-reroute` (17.9d)."""
+        watch = self.replay_window(self.RIDE_A)
+        self.assertEqual(self.hits(watch, "reroute-storm"), [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0915),
+                         "%s not present" % REAL_LOG_0915)
+    def test_both_mid_ride_relaunches_are_caught(self):
+        """15:47:11.805 and 15:49:45.066, `riding` set across both (17.7).
+        One page, one warn."""
+        watch = self.replay_window(self.RIDE_A)
+        found = self.hits(watch, "session-restart-while-aboard")
+        self.assertEqual([f["tsMs"] for f in found],
+                         [1789505231805, 1789505385066])
+        self.assertEqual([f["severity"] for f in found], ["page", "warn"])
+        self.assertEqual(found[0]["context"]["riding"]["tripId"], "1:1346665")
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0915),
+                         "%s not present" % REAL_LOG_0915)
+    def test_the_hanging_request_behind_a_note_is_named(self):
+        """15:46:42.801 "Why'd you lose my bus??" sits inside the window of
+        the REALTIME_VEHICLE_POSITIONS_ERROR that gave up at 15:46:42.988
+        after 20 000 ms (17.11, 17.8)."""
+        watch = self.replay_window(self.RIDE_A)
+        found = self.hits(watch, "note-unverifiable")
+        self.assertEqual(len(found), 1,
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["tsMs"], 1789505202801)
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["inFlightTimeout"]["type"],
+                         "REALTIME_VEHICLE_POSITIONS_ERROR")
+        self.assertEqual(ctx["inFlightTimeout"]["timeoutMs"], 20000)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0915),
+                         "%s not present" % REAL_LOG_0915)
+    def test_clicking_does_nothing_reaches_a_report_at_all(self):
+        """15:53:50.965, 2m23s before its ride's START_GO_MODE. Before this
+        the daemon logged "rider note outside any trip" and that was the end
+        of it; now it is held for the trip that follows, with both halves of
+        the evidence (17.11)."""
+        watch = self.replay_window(self.RIDE_B)
+        found = self.hits(watch, "note-unverifiable")
+        self.assertEqual(len(found), 1,
+                         [f["rule"] for f in watch.all_findings])
+        self.assertEqual(found[0]["tsMs"], 1789505630965)
+        self.assertEqual(found[0]["session"], "mu35fwv5-8lyyq1")
+        ctx = found[0]["context"]
+        self.assertTrue(ctx["noGestureRecord"])
+        self.assertEqual(ctx["inFlightTimeout"]["type"], "FIND_FEEDS_ERROR")
+        self.assertEqual(
+            ctx["image"],
+            "/home/rwt/otp-debug-logs/feedback/mu35fwv5-8lyyq1-1789505630965.jpg")
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0915),
+                         "%s not present" % REAL_LOG_0915)
+    def test_ride_a_costs_the_rider_one_page_not_two(self):
+        """Two aboard-swap pages before; one relaunch page now."""
+        watch = self.replay_window(self.RIDE_A)
+        pages = [f for f in watch.all_findings if f["severity"] == "page"]
+        self.assertEqual([f["rule"] for f in pages],
+                         ["session-restart-while-aboard"])
 
 
 if __name__ == "__main__":

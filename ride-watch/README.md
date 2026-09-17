@@ -66,14 +66,14 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | --- | --- | --- |
 | `stop-count-collapse` | `stopsRemaining` drops to 1 below 60% of a transit leg | page |
 | `stop-count-increase` | `stopsRemaining` rises with no itinerary swap | warn |
-| `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby | page |
+| `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby, and the new plan is not the same routes arriving at the same time | page |
 | `riding-flip` | `SET_RIDING` tripId changes on the same transit leg | page |
 | `missed-bus-while-riding` | `MISSED_BUS` notification while riding is held | page |
 | `notification-repeat` | the same alert (id stem + title) twice in 5 minutes | page |
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
 | `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip | warn |
 | `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m | warn |
-| `reroute-storm` | more than 3 `START_REROUTE` in 5 minutes | warn |
+| `reroute-storm` | more than 3 **`autoApply: true`** `START_REROUTE` in 5 minutes | warn |
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
 | `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
 | `unreachable-but-routable` | ...and a `REROUTE_SNAPSHOT` in the last 3 min ends within 100m of the destination it gave up on | page |
@@ -89,8 +89,10 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `panel-torn-down` | a settings/detail screen unmounted by the rider's own query change (one finding per episode, with the count) | warn |
 | `access-leg-transit-speed` | `riderSpeedMps` >= 12 for >= 20 s on a WALK/BICYCLE leg with no riding fact | warn |
 | `boarding-prompt-empty` | "I'm on the bus" with no vehicle search behind it while the route feed held a vehicle in range | info |
-| `onboard-anchor-behind-rider` | the alight candidates are anchored >2 km from the rider's last fix | warn |
+| `onboard-anchor-behind-rider` | the alight candidates are anchored >2 km from the rider's last fix **and a later candidate in the list is nearer** | warn |
 | `same-route-transfer` | two consecutive transit legs, same `routeId`, different `tripId` | warn |
+| `session-restart-while-aboard` | `resumed-session` / `RESUME_GO_MODE` inside a live trip while the riding fact is held | page (warn from the second in a ride) |
+| `note-unverifiable` | a rider note with no rider-gesture record in the previous minute, or one that arrived while a request was hanging on its way to a timeout | warn, once a ride |
 | `boot-crash` | the app threw before it could run (`boot-error` / `boot-rejection`) | page |
 | `bundle-health` | the 5s health gate withheld its verdict, so the bundle rolls back | page (info when confirmed) |
 
@@ -723,7 +725,7 @@ The two halves are now one state machine:
 * at trip end, a pane that owes a wrap-up is held by its deadline; a pane that
   owes nothing — no findings, so no request — is scheduled for retirement
   straight away;
-* when the deadline settles, either way (the report landed, or the window
+* when the deadline settles, either way (the wrap-up is done, or the window
   expired), the pane is scheduled for retirement too. That is the second sweep
   a spared pane never had;
 * `_reap_due_threads` runs on the same 5 s tick as the deadlines and closes
@@ -741,6 +743,53 @@ ride interrupts and used to arrive while the rider was on the next bus. Before
 it comes to that, an orphaned wrap-up — one whose pane is known to be gone — is
 handed **once** to whichever ride thread is alive, with its deadline restarted:
 same session, same rider, and that thread is running anyway.
+
+### A wrap-up is not done when the report file appears
+
+That state machine had one word wrong in it, and the word cost two rides
+(backlog 15.8, second mechanism). "The deadline settles" used to mean
+`os.path.exists(reportPath)` — and the reap was scheduled in the same tick. But
+the wrap-up's **last** step is promoting the ride's real bugs into the one
+backlog: both prompts put it after the report (`ride-thread-sysprompt.md` step
+3, `report-prompt.md`'s *Promote the findings to the backlog*), and the daemon's
+own trip-end line says *"WRITE THE REPORT FIRST"*. So the promotion step ran
+inside `THREAD_REAP_GRACE_MS`: **120 seconds**, for a report with eight
+findings.
+
+The 2026-09-13 prompt fix — which named the backlog path, allowed writes under
+`~/.claude/plans/` and granted the `Edit()` permission — therefore did not take.
+On 09-15 `mu346i5y-ng2uqc`'s report landed **15:53:04** and its pane wrapped up
+**15:55:05**; `mu35fwv5-8lyyq1`'s landed ~16:00 and went the same way. Neither
+plan file was touched after 13:42 that day. Eleven rows' worth of evidence sat
+unpromoted for two days — the eighth miss in this family (12.4).
+
+So the gate is now in two stages. `_arm_report_deadline` records a **sha256 of
+each plan file** (`PLAN_PATHS`: the backlog and the record file beside it) in the
+deadline entry, and a report that lands opens a promotion window rather than
+closing the wrap-up:
+
+* **a plan file changed** — that is the promotion. Reap, no page. Either file
+  counts: a wrap-up whose findings all dedupe onto existing rows edits the
+  backlog, and one that also closes a row moves it into the record;
+* **the report named no real bugs** — nothing to promote, so the wrap-up is
+  complete the moment the file exists, exactly as before. This is the
+  terminating condition that matters most: a clean ride must never hold a
+  console open. "Real bug" is counted off the verdict the report prompt makes
+  mandatory (`REAL_BUG_RE` over the section headings, falling back to the whole
+  file), so a report triaged down to *app-behaved-correctly* settles at once;
+* **`PROMOTION_DEADLINE_MS` (8 min) after the report landed** and still nothing
+  — reap anyway, and page **once**: *"Report written, backlog not updated — N
+  real bug(s)."* Eight minutes rather than two is long enough to read both plan
+  files, dedupe a ride's findings against sixteen tiers and write them, and
+  short enough that the console still closes inside twenty minutes of the ride.
+
+While the window is open the deadline entry stays on `self.report_deadlines`,
+which is what already spares the pane in both `_kill_previous_threads` and
+`_reap_due_threads` — the promotion gets a live console, not a dead one. The
+digest lives in `state.json` with the rest of the entry, so a restart-on-commit
+inside the window still knows what the backlog looked like when the ride ended.
+And the promotion page carries the same protection as the missing-report page:
+never about a pane this daemon killed itself.
 
 `RIDE_THREAD_ENABLED=0` (set in the systemd unit) disables the whole thing: the
 daemon then behaves exactly as it did before threads existed.

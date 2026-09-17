@@ -211,6 +211,17 @@ The steps:
    deploy / OTA / store build. Update the "Open — N rows" list at the top. Never
    rewrite a row that is not yours. `ride-watch/report-prompt.md`'s *Promote the
    findings to the backlog* section is the long form of this step.
+
+   **You have time for this and the daemon knows it.** This console is kept open
+   until that file actually changes — the daemon digests it when the ride ends and
+   compares — for up to eight minutes after your report lands. Before 2026-09-17
+   it was not: the pane went two minutes after the report file appeared, and on
+   09-15 two rides' reports (15:53:04 and ~16:00) were written and promoted
+   nothing because of it. If you write the report and stop, the rider gets paged
+   about the rows you did not queue. A report with nothing to promote — every
+   finding triaged *app-behaved-correctly* or *watcher-false-positive* — closes
+   the console straight away and pages nobody, so do not invent a row to satisfy
+   the gate.
 3b. **Score the rehearsal, if the backlog has one.** If the backlog file has a
    `## Rehearsal ride — <date>` section whose date is this ride's, go through its
    table: for every row it names, write one sentence into that row's Note —

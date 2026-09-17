@@ -425,6 +425,136 @@ ONBOARD_ANCHOR_FAR_M = 2000.0
 # A fix this old cannot convict an anchor: the rider may have moved. The real
 # one was 3.3 s old.
 ONBOARD_ANCHOR_FIX_MAX_AGE_MS = 3 * 60 * 1000
+# ...and distance alone was never enough. On 2026-09-15 at 15:46:02 this rule
+# fired on an anchor 2044 m away and the claim was simply wrong: the rider was
+# at 44.86543, -93.30193 (103 m past Knox Ave & 76th St), the anchor was I-35W
+# & 66th St Station 2044 m NORTH, and the Orange Line runs northbound there —
+# the anchor was 2 km AHEAD, which is what an alight list is supposed to be
+# built from (17.9c).
+#
+# The direction test, and why it is this one. The candidate list is the trip's
+# REMAINING stops in trip order: candidates[0] is the stop `findAnchorIndex`
+# decided the rider is at, and everything after it is further along the line.
+# If the anchor really is ahead, the rest of the list recedes — 09-15's second
+# candidate (I-35W & Lake St) sat 9.5 km out against the anchor's 2.0 km. If
+# the anchor is BEHIND, the list walks back toward the rider and past them —
+# 09-13's second candidate (Capitol / Rice St) was 3.23 km against Union
+# Depot's 4.76 km. So: fire only when some later candidate is meaningfully
+# NEARER the rider than the anchor is.
+#
+# Rejected — the rider's own motion, which is the obvious direction test and
+# cannot work here. At 11:38:38 on 09-13, the flow this rule was written for,
+# the rider was stationary: speed 0.0 and twenty-odd byte-identical fixes, so a
+# "receding from the anchor" test would have suppressed the only true positive
+# on record. GPS `heading` is no better: at 15:46:02 the bus was crossing 76th
+# St eastbound at heading 88.5° with the anchor bearing 14.8° — a 73.7°
+# difference, "ahead" under a 90° test but only just, and a bus mid-curve would
+# flip it. Stop order is the one signal in this stream that survives a
+# stationary rider.
+ONBOARD_ANCHOR_AHEAD_MARGIN_M = 250.0
+# It fails closed: a list with no later candidate placed on the map cannot be
+# judged either way and says nothing. On both recorded flows every candidate
+# got its ONBOARD_CANDIDATE_SNAPSHOT within ~12 s, so that costs nothing real.
+#
+# aboard-swap exemptions (17.9a, 17.9b).
+#
+# (a) A swap that keeps the rider's plan is not "the on-screen route no longer
+# matches your bus". 2026-09-15 15:36:33: START_REROUTE `boarded-earlier`,
+# autoApply: true, 6 s after SET_RIDING, replaced
+#   WALK > BUS 1:904 trip 1:1346556 > WALK > TRAM 1:902 trip 1:890194 > WALK
+# with
+#   BUS 1:904 trip 1:1346665 > WALK > TRAM 1:902 trip 1:890194 > WALK
+# — the same two route ids in the same order and the same 16:32:43 arrival. It
+# dropped the spent walk leg and re-anchored leg 0 onto the bus actually
+# boarded, which is the designed splice. Note what is deliberately NOT
+# compared: the bus tripId changed (1:1346556 -> 1:1346665), because boarding
+# an earlier bus of the same route is the whole point of `boarded-earlier`. The
+# ride report read that as "the same Orange Line trip"; it was not, and a
+# tripId test would have left this false positive standing. Route ids plus
+# arrival time is the test.
+#
+# (b) The onboard picker's commit emits no reroute marker at all, so a rider
+# tap read as automatic. 15:43:28.647 CLEAR_ONBOARD -> 15:43:28.650
+# START_GO_MODE, 3 ms apart, 22 s after SET_ONBOARD_RESULT rendered 5 options.
+# That pair runs only from confirmOnboardAlightStop (lib/actions/go-mode.ts),
+# whose sole caller is AlightRecommendation.tsx's onSelect. Keyed on the action
+# sequence rather than on which control produced it, deliberately: the client is
+# growing a preview screen where a tap only opens the preview and a separate
+# Confirm commits, and the commit will still be CLEAR_ONBOARD + START_GO_MODE.
+ONBOARD_COMMIT_WINDOW_MS = 5 * 1000
+#
+# session-restart-while-aboard (17.7). 2026-09-15 15:49:45: `record-mode` /
+# `start` / `resumed-session`, RESUME_GO_MODE (duration 2439.981, end
+# 16:28:33), `bundle_hold`, then `bundle_health` / `bundle_apply` five seconds
+# later — bundle_hold at relaunch followed by a health verdict is the
+# crash-recovery path, not a normal resume. STOP_GO_MODE came 24 s after. The
+# same session did it once before at 15:47:11, and `riding` was set across
+# both. No rule covered it: `resumed-trip` keys on a ride that arrives with no
+# START_GO_MODE at all, and both of these arrived inside a trip the daemon had
+# opened itself.
+#
+# `resumed-session` and RESUME_GO_MODE land 3 ms apart and are one relaunch, so
+# the second marker inside this window is folded into the first.
+SESSION_RESTART_DEDUP_MS = 5 * 1000
+#
+# note-unverifiable (17.11). Ride B, 15:53:50, rider note "Clicking does
+# nothing" with a screenshot — and nothing in the stream records that a tap
+# happened, so the claim could be neither confirmed nor contradicted. Two
+# independent things make a note unanswerable, and either is the finding:
+#
+#   * no rider-gesture record in the minute before it. RIDER_GESTURE_TYPES
+#     below is the allowlist; it deliberately excludes the act of writing the
+#     note itself (SET_GO_MODE_BACKGROUNDED + SET_MOBILE_SCREEN + a
+#     LOCATION_CHANGE to /feedback precede every single note in both rides, so
+#     counting those would make the rule dead on arrival).
+#   * a request that timed out was in flight across the note. 15:53:50.965
+#     sits inside FIND_FEEDS_ERROR's window: the error landed 15:53:59.330
+#     saying "Request timed out after 20000 ms", so the request was issued
+#     15:53:39.330 and the app was stalled on it while the rider tapped.
+#
+# The timeout half can only be known once the error arrives, which is up to its
+# own timeout later, so the decision waits this long and is resolved on the
+# 5 s tick. Findings are not pages; nothing is lost by deciding 30 s late.
+NOTE_GESTURE_LOOKBACK_MS = 60 * 1000
+NOTE_EVIDENCE_GRACE_MS = 30 * 1000
+# Once per ride. The statement the finding makes — "the client emits no tap
+# records, so a claim about a control cannot be checked" — is the same
+# statement whichever note it hangs on, and a ride's notes come in fours.
+#
+# Action types only a rider gesture produces. Checked against every action type
+# in the two 09-15 sessions, and against the call sites in otprr: e.g.
+# SET_GO_MODE_ACTIVE_LEG comes from TripSheet.tsx handleLegClick/handleClose and
+# nothing else. Excluded on purpose: SET_MOBILE_SCREEN and
+# @@router/LOCATION_CHANGE (both fire on boot — 15:49:45 and 15:53:39 — and on
+# the way to the feedback screen), SET_LOCATION and SET_QUERY_PARAM (the
+# relaunch path dispatches both from POSITION_RESPONSE), SET_ONBOARD_VEHICLE /
+# SET_ONBOARD_TRIP / SET_ONBOARD_STATUS (all three follow automatically from a
+# reroute) and SET_GO_MODE_BACKGROUNDED (the note-writing act).
+# One entry is not airtight: START_GO_MODE is also how an auto-reroute installs
+# its replacement (15:36:33). It stays, because a false gesture can only make
+# note-unverifiable quieter and never noisier, and dropping it would let a
+# genuine "I picked this itinerary" tap read as no action at all.
+RIDER_GESTURE_TYPES = frozenset((
+    "SET_ACTIVE_ITINERARY", "SET_VISIBLE_ITINERARY", "SET_ITINERARY_VIEW",
+    "UPDATE_ITINERARY_FILTER", "SET_GO_MODE_ACTIVE_LEG", "SET_ACTIVE_LEG",
+    "SET_MAP_FOLLOW", "SET_MAP_PICK_MODE", "SET_VIEWED_STOP",
+    "BEGIN_ONBOARD_FLOW", "CLEAR_ONBOARD", "DISMISS_BOARDING_PROMPT",
+    "SHOW_BOARDING_PROMPT", "ADD_LOCATION_SEARCH", "CLEAR_LOCATION",
+    "REMEMBER_LOCAL_USER_PLACE", "SET_EARLY_ALIGHT", "SET_DEPARTURE_OVERRIDE",
+    "START_GO_MODE", "STOP_GO_MODE",
+))
+# ...and the tap records the client does not emit yet. A parallel change is
+# adding them; when it lands they will satisfy the gesture half by themselves
+# and this rule goes quiet on its own, which is the point. Matched by shape
+# rather than by an exact name nobody has chosen yet.
+TAP_RECORD_RE = re.compile(r"(^|_)(TAP|TAPPED|PRESS|PRESSED|CLICK|CLICKED"
+                           r"|GESTURE|LONG_PRESS)($|_)")
+TAP_RECORD_KINDS = frozenset(("tap", "gesture", "ui", "interaction"))
+# "Request timed out after 20000 ms" (every FIND_*/REALTIME_* error on 09-15)
+# and the structured form ROUTING_ERROR carries, {timedOut, timeoutMs, url}.
+TIMEOUT_MESSAGE_RE = re.compile(r"timed out after (\d+)\s*ms", re.I)
+# A window this wide is not evidence of anything; the real ones were 20 000 ms.
+TIMEOUT_WINDOW_MAX_MS = 120 * 1000
 #
 # same-route-transfer. Two consecutive transit legs on the same routeId with
 # different tripIds is the rider getting off their own vehicle to wait for the
@@ -452,6 +582,59 @@ REPORT_DEADLINE_MS = 10 * 60 * 1000
 # and is writing its last lines into a console the rider may still be reading;
 # retiring the pane in the same tick as "wrap-up landed" would cut that off.
 THREAD_REAP_GRACE_MS = 2 * 60 * 1000
+
+# ...and two minutes is all the promotion step ever got, which is the second
+# half of 15.8. The prompt fix of 2026-09-13 made the wrap-up responsible for
+# promoting its findings into the backlog, and it did not take, because
+# _check_report_deadlines landed the wrap-up on `os.path.exists(reportPath)`
+# alone and scheduled the reap in the same tick. Both prompts ask for the
+# promotion AFTER the report is written (ride-thread-sysprompt.md step 3,
+# report-prompt.md "Promote the findings to the backlog") and the daemon's own
+# wrap-up line says "WRITE THE REPORT FIRST" — so the promotion window was
+# THREAD_REAP_GRACE_MS: 120 seconds for a report with eight findings.
+#
+# 2026-09-15 is the evidence, twice in seven minutes. ng2uqc's report landed
+# 15:53:04 and the pane wrapped up 15:55:05; 8lyyq1's landed ~16:00 and went
+# the same way. Neither plan file was touched after 13:42 that day. Two rides,
+# eleven rows' worth of evidence, nothing promoted — the eighth miss in the
+# wrap-up family (see 12.4).
+#
+# So a wrap-up is not done when the file appears. It is done when the backlog
+# has changed. PLAN_PATHS is digested when the deadline is armed and compared
+# on every tick; while the report exists and no plan file has moved, the pane
+# is kept alive and the deadline entry is kept in report_deadlines, which is
+# what spares the pane in _kill_previous_threads and _reap_due_threads alike.
+#
+# The terminating condition, because "keep it alive until the backlog moves"
+# on its own is a pane that never closes:
+#   * a plan file changes            -> settled, reap, no page;
+#   * this long after the report      -> give up, reap, and page ONCE if the
+#     landed and still nothing        report named at least one real bug;
+#   * the report named no real bugs   -> settled immediately, reap, no page.
+#     (nothing to promote)
+# Eight minutes rather than two: long enough for a wrap-up to read both plan
+# files, dedupe eleven rows against sixteen tiers and write them, and short
+# enough that the console still closes inside twenty minutes of the ride. A
+# report with nothing to promote never enters the window at all.
+PROMOTION_DEADLINE_MS = 8 * 60 * 1000
+# The one backlog, and the record file beside it. Either moving counts: a
+# wrap-up whose findings all dedupe onto existing rows edits the backlog, and
+# one that also closes a row moves it into the record — both are the promotion
+# step doing its job. Instance-level (self.plan_paths) so a test can point this
+# at a temp file and never read or write the rider's real plan.
+PLAN_PATHS = (
+    os.path.join(os.path.expanduser("~"), ".claude", "plans",
+                 "please-make-a-centralized-sharded-petal.md"),
+    os.path.join(os.path.expanduser("~"), ".claude", "plans",
+                 "transitnav-backlog-record.md"),
+)
+# How the daemon knows the report had something to promote: the verdict the
+# report prompt makes mandatory per finding. Both 09-15 reports used a section
+# heading — `## 1. ... — REAL BUG` (ng2uqc) and `## 1. ... — **real-bug**`
+# (8lyyq1) — and the prompt's own template puts it in one too
+# (`### <time> — <rule> (<severity>) -> **real-bug**`), so headings are read
+# first and the whole file only if no heading carries a verdict at all.
+REAL_BUG_RE = re.compile(r"real[-\s]?bug", re.I)
 
 # console.error lines that are known-inert and cost a findings slot every ride.
 # Substring match against the first console argument, deliberately narrow.
@@ -794,6 +977,13 @@ PAGE_RANK = {
     "unreachable-but-routable": 37,
     "notification-repeat": 35,
     "aboard-swap": 30,
+    # session-restart-while-aboard  the app relaunched under a seated rider,
+    #                               so the screen they were navigating by went
+    #                               away. Nothing to do about it, but it
+    #                               explains the blank screen in front of them
+    #                               — below aboard-swap, which is about the
+    #                               route being wrong, and above riding-flip.
+    "session-restart-while-aboard": 28,
     "riding-flip": 20,
     "deviated-streak": 10,
 }
@@ -1208,6 +1398,19 @@ class Trip:
         self.snapshots_since_gain = 0              # cadence, not re-plans
         self.unreachable_routable_fired = False
         self.last_rider_action_ms = 0
+        # The onboard picker's commit is CLEAR_ONBOARD immediately followed by
+        # START_GO_MODE (3 ms on 09-15) and carries no reroute marker, so this
+        # is the only thing that tells the swap it came from a rider's finger.
+        # See ONBOARD_COMMIT_WINDOW_MS (17.9b).
+        self.clear_onboard_ms = 0
+        # App relaunches seen inside this trip while the rider was aboard.
+        # Counted because 09-15 ride A had two (15:47:11, 15:49:45) and the
+        # second is news; only the first is worth one of two ride interrupts.
+        self.restart_aboard_ms = 0
+        self.restart_aboard_count = 0
+        # note-unverifiable fires once a ride: the statement is about the
+        # instrumentation, not about the note (17.11).
+        self.note_unverifiable_fired = False
         # legIndex -> {"polls", "matched", "firstMs", "lastMs", "bestConfidence"}
         # for legs the itinerary calls transit. Read once, at trip end, by
         # _rule_vehicle_match_never: "did the live matcher ever succeed on this
@@ -1307,6 +1510,23 @@ class RideWatch:
         # stopId -> (lat, lon), learned from ONBOARD_CANDIDATE_SNAPSHOT
         # requests. The optimize payload names stops and never places them.
         self.stop_coords = {}
+        # session -> (ms, type) of the last record only a rider's finger
+        # produces (RIDER_GESTURE_TYPES, plus any tap record the client grows).
+        # Read by note-unverifiable, which is about the absence of these.
+        self.session_last_gesture = {}
+        # session -> deque of (startMs, endMs, type) for requests that came
+        # back saying they had timed out. Reconstructed backwards from the
+        # error, which is the only record that carries the timeout: the window
+        # is [errorMs - timeoutMs, errorMs].
+        self.session_timeouts = {}
+        # Rider notes whose "could anyone check this?" verdict is still
+        # pending: the timeout half of note-unverifiable cannot be known until
+        # the request that swallowed the tap comes back. See
+        # NOTE_EVIDENCE_GRACE_MS and _check_pending_notes.
+        self.pending_notes = []
+        # The one backlog and its record file. Instance-level so a test never
+        # reads or writes the rider's real plan. See PLAN_PATHS.
+        self.plan_paths = list(PLAN_PATHS)
         # Wrap-ups that have been asked for and not yet appeared. Deliberately
         # NOT keyed off self.trips: _end_trip deletes the Trip, which is how
         # the missing-report case escaped every timer in this file. Restored
@@ -1582,6 +1802,17 @@ class RideWatch:
             if not trip.device:
                 trip.device = obj.get("device")
 
+        # Two per-session ledgers, fed from every record and stealing none of
+        # them: note-unverifiable (17.11) asks what the rider had touched
+        # before they typed, and whether a request was hanging while they did.
+        # Deliberately NOT branches of the chain below — a `*_ERROR` elif here
+        # would shadow whatever rule wants those types next — and deliberately
+        # above `elif trip is not None`, because ride B's whole note window
+        # (15:53:39 cold start to the 15:53:59 FIND_FEEDS_ERROR) happened two
+        # minutes before START_GO_MODE opened a trip.
+        self._note_rider_gesture(session, t, kind, typ, obj)
+        self._note_request_timeout(session, t, typ, obj)
+
         if typ == "START_GO_MODE":
             self._on_start_go_mode(session, t, obj)
         elif typ == "STOP_GO_MODE":
@@ -1599,6 +1830,14 @@ class RideWatch:
             # and onboard branches, because a boot crash is by definition
             # outside a ride: the app never got far enough to have one.
             self._rule_boot_crash(session, t, obj, trip)
+        elif (typ == "RESUME_GO_MODE"
+              or (kind == "session" and obj.get("event") == "resumed-session")):
+            # The crash-recovery relaunch (17.7). Above the `trip is not None`
+            # chain because a session record has no `typ` for that chain to
+            # key on — the same blind spot the bundle branch below was opened
+            # for — and because both halves of one relaunch must reach the
+            # same rule: they land 3 ms apart and are folded together there.
+            self._rule_session_restart_while_aboard(session, t, obj, trip)
         elif kind == "session" and obj.get("event") in ("bundle",
                                                         "bundle_health"):
             # Same blind spot, other half: `typ` is left None for every
@@ -1618,6 +1857,14 @@ class RideWatch:
                                               obj.get("payload"), trip)
             if typ == "START_ONBOARD_OPTIMIZE":
                 self._note_onboard_anchor(session, t, obj.get("payload"))
+        elif typ == "CLEAR_ONBOARD":
+            # Half of the onboard picker's commit; START_GO_MODE is the other
+            # half, 3 ms later. Above the trip chain for the same reason as the
+            # branch above — the flow runs between rides as often as inside one
+            # — and stamped on the trip because that is who aboard-swap asks.
+            if trip is not None:
+                trip.clear_onboard_ms = t
+                self._mark_dirty()
         elif typ == "ONBOARD_CANDIDATE_SNAPSHOT":
             # The only record in the stream that places a candidate stop on
             # the map. Same reason it sits here: on 09-13 every one of these
@@ -1730,6 +1977,25 @@ class RideWatch:
             self._begin_ride_thread(trip, t)
         else:
             # Itinerary replacement mid-trip.
+            #
+            # Read before it is overwritten: aboard-swap's route-preserving
+            # exemption (17.9a) compares the plan going out with the plan
+            # coming in, and `trip.itinerary = summary` below is the moment the
+            # old one stops existing.
+            prev_summary = trip.itinerary
+            # The onboard picker's commit, which emits no reroute marker of its
+            # own: CLEAR_ONBOARD 3 ms ago means a rider's finger did this
+            # (17.9b). Stamped as a rider action before _rule_aboard_swap
+            # reads last_rider_action_ms, which is the gate it already has for
+            # every other explicit pick.
+            if (trip.clear_onboard_ms
+                    and 0 <= t - trip.clear_onboard_ms
+                    <= ONBOARD_COMMIT_WINDOW_MS):
+                trip.last_rider_action_ms = t
+                self.log.info(
+                    "itinerary swap is a rider onboard pick: session=%s "
+                    "CLEAR_ONBOARD %d ms before START_GO_MODE"
+                    % (session, t - trip.clear_onboard_ms))
             self._clear_arrival(trip, t, "itinerary swap")
             trip.swap_seq += 1
             trip.swap_times.append(t)
@@ -1747,7 +2013,7 @@ class RideWatch:
             # in the ledger so the next digest explains the new itinerary.
             self._thread_event(trip, t, "itinerary swap #%d -> %s" % (
                 trip.swap_seq, itinerary_one_liner(summary)))
-            self._rule_aboard_swap(trip, t)
+            self._rule_aboard_swap(trip, t, prev_summary, summary)
             # An applied re-plan. This is the signal the client's own
             # noteReplanAttempt fires on, one step downstream: the daemon
             # cannot see an attempt, only the itinerary it produced — which
@@ -2455,6 +2721,11 @@ class RideWatch:
         """Emit onboard-flow findings that had no trip to hang on yet."""
         for (ts, rule, severity, summary, ctx) in self.pending_onboard.pop(
                 trip.session, []):
+            if rule == "note-unverifiable":
+                # Held before this trip existed, so the once-a-ride latch could
+                # not be set then. Set it now, or ride B's 15:53:50 note and
+                # its 15:57:02 note would both land on the 15:56 trip.
+                trip.note_unverifiable_fired = True
             self._finding(trip, ts, rule, severity, summary, ctx)
 
     def _rule_itinerary_backwards(self, trip, t, summary):
@@ -2604,7 +2875,8 @@ class RideWatch:
         self.session_fix = dict((k, v) for k, v in self.session_fix.items()
                                 if k in keep)
         for cache in (self.route_vehicles, self.nearby_vehicles_ms,
-                      self.onboard_anchor):
+                      self.onboard_anchor, self.session_last_gesture,
+                      self.session_timeouts):
             for key in [k for k in cache if k not in keep]:
                 del cache[key]
 
@@ -2650,6 +2922,15 @@ class RideWatch:
             "realtime": first.get("realtime"),
             "candidates": len(candidates),
             "fix": fix,
+            # Every candidate AFTER the anchor, in list order — which is trip
+            # order, which is the only thing in this stream that can say
+            # whether the anchor is ahead of the rider or behind them (17.9c).
+            # Coordinates arrive later, with each candidate's snapshot; these
+            # are the joins that will claim them.
+            "rest": [{"stopId": c.get("stopId"),
+                      "stopName": c.get("stopName"),
+                      "busArrivalEpoch": c.get("busArrivalEpoch")}
+                     for c in candidates[1:] if isinstance(c, dict)],
         }
         self._check_onboard_anchor(session, None)
 
@@ -2673,17 +2954,38 @@ class RideWatch:
         pending = self.onboard_anchor.get(session)
         if not pending:
             return
-        same = (pending.get("busArrivalEpoch") is not None
-                and req.get("busArrivalEpoch") == pending["busArrivalEpoch"])
-        if not same:
-            same = (bool(pending.get("stopName"))
-                    and frm.get("name") == pending["stopName"])
-        if not same:
+        coords = (float(lat), float(lon))
+
+        def joins(cand):
+            if (cand.get("busArrivalEpoch") is not None
+                    and req.get("busArrivalEpoch") == cand["busArrivalEpoch"]):
+                return True
+            return (bool(cand.get("stopName"))
+                    and frm.get("name") == cand["stopName"])
+
+        # Every candidate is placed, not only the anchor. The direction test
+        # (17.9c) asks where the stops AFTER the anchor are, and until this
+        # change a snapshot that did not join the anchor was thrown away — so
+        # the rest of the list had no coordinates anywhere in the daemon.
+        if joins(pending):
+            if pending.get("stopId"):
+                self.stop_coords[pending["stopId"]] = coords
+            pending["coords"] = coords
+            self._check_onboard_anchor(session, trip, detected_ms=t)
             return
-        if pending.get("stopId"):
-            self.stop_coords[pending["stopId"]] = (float(lat), float(lon))
-        pending["coords"] = (float(lat), float(lon))
-        self._check_onboard_anchor(session, trip, detected_ms=t)
+        for cand in pending.get("rest") or []:
+            if not joins(cand):
+                continue
+            if cand.get("stopId"):
+                self.stop_coords[cand["stopId"]] = coords
+            cand["coords"] = coords
+            # A later candidate can be the record that decides the anchor, so
+            # the check runs on it too. Both 09-13 and 09-15 resolved this way:
+            # the snapshots arrive in whatever order the plans came back, and
+            # on 09-13 Capitol / Rice St (11:38:44.885) beat Union Depot
+            # (11:38:45.234) by 349 ms.
+            self._check_onboard_anchor(session, trip, detected_ms=t)
+            return
 
     def _check_onboard_anchor(self, session, trip, detected_ms=None):
         """onboard-anchor-behind-rider: the alight list built from elsewhere.
@@ -2711,18 +3013,60 @@ class RideWatch:
         dist = meters_between((fix[0], fix[1]), coords)
         if dist <= ONBOARD_ANCHOR_FAR_M:
             return
+        # Far is not behind. The direction test: is any stop further down the
+        # trip nearer the rider than this one? If it is, the list starts behind
+        # the rider and walks back toward them; if every later stop is further
+        # out, the anchor is simply the next stop ahead on a long leg and the
+        # list is right. Fails closed — an unplaced tail convicts nobody.
+        # See ONBOARD_ANCHOR_AHEAD_MARGIN_M for both recorded flows.
+        nearer = None
+        for cand in pending.get("rest") or []:
+            c = cand.get("coords")
+            if c is None and cand.get("stopId"):
+                c = self.stop_coords.get(cand["stopId"])
+            if c is None:
+                continue
+            d = meters_between((fix[0], fix[1]), c)
+            if nearer is None or d < nearer[0]:
+                nearer = (d, cand.get("stopName") or cand.get("stopId"))
+        if nearer is None:
+            return                        # tail not placed yet: wait, or drop
+        if nearer[0] + ONBOARD_ANCHOR_AHEAD_MARGIN_M >= dist:
+            # Deliberately NOT latched. Snapshots come back in whatever order
+            # the plans finish, not in list order — on 09-13 Capitol / Rice St
+            # beat Union Depot by 349 ms and Prospect Park trailed by five
+            # seconds — so "no later candidate is nearer YET" is not a verdict.
+            # More coordinates can only make `nearer` smaller, so the decision
+            # is monotone toward firing and re-running it is always safe.
+            if not pending.get("aheadLogged"):
+                pending["aheadLogged"] = True
+                self.log.info(
+                    "onboard anchor %s is %.0fm out but the nearest placed"
+                    " candidate after it (%s) is %.0fm: the list runs away"
+                    " from the rider, so the anchor is ahead. Not filing."
+                    % (pending.get("stopName") or pending.get("stopId"),
+                       dist, nearer[1], nearer[0]))
+            return
         pending["fired"] = True
         name = pending.get("stopName") or pending.get("stopId") or "a stop"
         summary = ("onboard alight list anchored at %s, %.1f km from the "
-                   "rider's last fix %s earlier — the candidates are built "
-                   "from the wrong end of the line"
-                   % (name, dist / 1000.0, fmt_ms_span(age)))
+                   "rider's last fix %s earlier, with %s only %.1f km away "
+                   "further down the trip — the candidates are built from the "
+                   "wrong end of the line"
+                   % (name, dist / 1000.0, fmt_ms_span(age),
+                      nearer[1], nearer[0] / 1000.0))
         ctx = {"stopId": pending.get("stopId"), "stopName": name,
                "distanceM": round(dist, 1),
                "candidates": pending.get("candidates"),
                "realtime": pending.get("realtime"),
                "fixMs": fix[2], "fixAgeMs": int(age),
                "fix": [fix[0], fix[1]], "anchor": [coords[0], coords[1]],
+               # The direction test's own evidence: the nearest stop AFTER the
+               # anchor, which is what makes "behind" a measurement rather
+               # than an assumption (17.9c).
+               "nearestLaterStop": nearer[1],
+               "nearestLaterDistanceM": round(nearer[0], 1),
+               "aheadMarginM": ONBOARD_ANCHOR_AHEAD_MARGIN_M,
                "optimizeMs": pending["tMs"]}
         if detected_ms is not None:
             ctx["detectedMs"] = int(detected_ms)
@@ -2987,8 +3331,16 @@ class RideWatch:
             # permission prompt at 09:31:21, and the report was never written.
             # An audit that dies with the pane costs the ride its record; one
             # that runs after the report is written costs nothing.
-            line += (" — wrap-up now: WRITE THE REPORT FIRST, investigate"
-                     " anything else after; request: %s" % req_path)
+            # ...then the promotion, which is what the ride is FOR, and the
+            # line says so because before 2026-09-17 the pane went two minutes
+            # after the report file appeared and two rides' findings reached no
+            # backlog (15.8). Kept to a clause: THREAD_LINE_MAX is 400 and it
+            # truncates from the right, which would take the request path with
+            # it. The long form is sysprompt step 3.
+            line += (" — wrap-up now: WRITE THE REPORT FIRST, then PROMOTE its"
+                     " real bugs to the backlog (console held %d min for that),"
+                     " investigate anything else after; request: %s"
+                     % (PROMOTION_DEADLINE_MS // 60000, req_path))
         self._thread_event(trip, t, line)
         # The one line that must land. Everything else is a milestone the
         # digest repeats anyway; this one is the whole wrap-up, so it waits
@@ -3064,6 +3416,12 @@ class RideWatch:
             # and wrote nothing" from "this daemon killed the pane".
             "armedMs": self.now_ms(),
             "findings": findings_n,
+            # The backlog as it stood when the promise was made. A wrap-up is
+            # not done until this has changed; see PROMOTION_DEADLINE_MS and
+            # _check_report_deadlines. Digested rather than stat'ed because an
+            # mtime can be bumped by anything, and because the digest is the
+            # one comparison that survives a daemon restart inside the window.
+            "planDigests": self._plan_digests(),
             "requestPath": self._report_request_path(trip),
             # Which pane was asked. _kill_previous_threads reads this: the
             # next ride's thread must not kill the one still writing.
@@ -3072,14 +3430,65 @@ class RideWatch:
         self.log.info("wrap-up expected at %s by %s" % (path, fmt_hms(due)))
         self._save_state()
 
-    def _check_report_deadlines(self, now):
-        """Has each promised wrap-up appeared? Page for the ones that have not.
+    def _plan_digests(self):
+        """sha256 of each plan file, or None where there is no file.
 
-        Deliberately checks the file rather than the thread: the question the
-        rider cares about is whether the report exists, and a pane that looks
+        None is a real value and is compared like any other: a backlog that
+        did not exist and now does has moved.
+        """
+        out = {}
+        for path in self.plan_paths:
+            try:
+                with open(path, "rb") as f:
+                    out[path] = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                out[path] = None
+        return out
+
+    def _plans_moved(self, entry):
+        """Has the backlog changed since this wrap-up was asked for?
+
+        The whole of 15.8's second mechanism. Either file counts: a wrap-up
+        whose findings all dedupe onto existing rows edits the backlog, and one
+        that also closes a row moves it into the record. Both are the promotion
+        step doing its job.
+        """
+        before = entry.get("planDigests")
+        if not isinstance(before, dict) or not before:
+            # Nothing was recorded (an entry from a daemon older than this
+            # code, restored out of state.json). There is no baseline to
+            # compare against, so the gate cannot be applied and the old
+            # behaviour — the report file is the whole test — stands.
+            return None
+        after = self._plan_digests()
+        for path, digest in before.items():
+            if after.get(path) != digest:
+                return path
+        return False
+
+    def _check_report_deadlines(self, now):
+        """Has each promised wrap-up appeared, and has it been promoted?
+
+        Deliberately checks files rather than the thread: the question the
+        rider cares about is whether the record exists, and a pane that looks
         alive has already been shown to prove nothing. reportPath is the exact
         string handed to the thread in the request file, so this cannot drift
         into watching for a name nobody was asked to write.
+
+        Two gates, in series, because the first one alone was 15.8's second
+        mechanism. Until 2026-09-17 this method took `os.path.exists(reportPath)`
+        as the wrap-up being over and scheduled the reap in the same tick, so
+        the promotion step — which both prompts put AFTER the report, and which
+        the daemon's own wrap-up line puts after it too ("WRITE THE REPORT
+        FIRST") — had THREAD_REAP_GRACE_MS to run in: 120 seconds. On 09-15
+        ng2uqc's report landed 15:53:04 and the pane went at 15:55:05;
+        8lyyq1's landed ~16:00 and went the same way; neither plan file was
+        touched after 13:42. Eleven rows' worth of evidence sat unpromoted for
+        two days, the eighth miss in this family (12.4).
+
+        So: report exists -> the promotion window opens rather than closes.
+        See PROMOTION_DEADLINE_MS for the terminating condition, which is the
+        part that keeps a pane from living forever.
         """
         if not self.report_deadlines:
             return
@@ -3091,12 +3500,17 @@ class RideWatch:
             except OSError:
                 landed = False
             if landed:
-                self.log.info("wrap-up landed for %s: %s"
-                              % (entry.get("session"), path))
-                changed = True
-                # The pane has done the one thing it was being kept alive for.
-                self._schedule_thread_reap(entry.get("tmux"), now,
-                                           "wrap-up landed")
+                if entry.get("reportLandedMs") is None:
+                    entry["reportLandedMs"] = int(now)
+                    entry["realBugs"] = self._report_real_bugs(path)
+                    changed = True
+                    self.log.info(
+                        "wrap-up landed for %s: %s (%s real bug(s) named)"
+                        % (entry.get("session"), path, entry["realBugs"]))
+                if self._settle_promotion(entry, now):
+                    changed = True
+                    continue
+                keep.append(entry)
                 continue
             if now < entry.get("dueMs", 0):
                 # Still inside the window — but if the pane that was asked has
@@ -3131,6 +3545,137 @@ class RideWatch:
         if changed:
             self.report_deadlines = keep
             self._save_state()
+
+    def _report_real_bugs(self, path):
+        """How many findings this report calls real bugs. 0 = nothing to promote.
+
+        Section headings first, then the whole file if no heading carries a
+        verdict at all. Both 09-15 reports put it in a heading — `## 1. Alight
+        ranking is scored on a phantom arrival time — REAL BUG` and `## 1.
+        "Just viewing switched..." — **real-bug**` — as does the prompt's own
+        per-finding template. The whole-file fallback exists so a report with
+        an unexpected layout is judged as having something to promote rather
+        than nothing; the failure this gate must never have is letting a real
+        report out of the window silently.
+        """
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError as exc:
+            self.log.error("could not read %s to count real bugs: %r"
+                           % (path, exc))
+            return 0
+        heads = [ln for ln in lines if ln.lstrip().startswith("#")]
+        n = sum(1 for ln in heads if REAL_BUG_RE.search(ln))
+        if n:
+            return n
+        # No heading names a verdict. Count the arrow form the template uses
+        # anywhere, then fall back to the bare phrase.
+        arrows = [ln for ln in lines if "->" in ln and REAL_BUG_RE.search(ln)]
+        if arrows:
+            return len(arrows)
+        return 1 if any(REAL_BUG_RE.search(ln) for ln in lines) else 0
+
+    def _settle_promotion(self, entry, now):
+        """Is this wrap-up over? True when the deadline entry can be dropped.
+
+        Three ways out, and no fourth — this is PROMOTION_DEADLINE_MS's
+        terminating condition in code:
+
+        1. The report named no real bugs. There is nothing to promote, so the
+           wrap-up is complete the moment the file exists and the pane is
+           reaped exactly as it was before this gate existed. A clean ride must
+           never hold a console open, and a report the agent triaged down to
+           "app behaved correctly" three times over is a clean ride.
+        2. A plan file changed. That is the promotion, done. Reap, no page.
+        3. The window ran out. Reap either way — the pane cannot be held
+           indefinitely on the strength of a step that is evidently not
+           happening — and page ONCE, because a report naming real bugs whose
+           rows reached no backlog is exactly the failure nobody noticed twice
+           on 09-15. Never page about a pane this daemon killed itself: the
+           thread never had the window the deadline claims to have given it,
+           and that protection is the same one the report deadline already
+           carries below.
+        """
+        moved = self._plans_moved(entry)
+        if moved is None:
+            # No baseline (an entry restored from an older daemon's state).
+            self.log.info("wrap-up for %s has no backlog baseline; settling on"
+                          " the report alone" % entry.get("session"))
+            self._schedule_thread_reap(entry.get("tmux"), now,
+                                       "wrap-up landed")
+            return True
+        if not entry.get("realBugs"):
+            self.log.info(
+                "wrap-up for %s named no real bugs: nothing to promote"
+                % entry.get("session"))
+            self._schedule_thread_reap(entry.get("tmux"), now,
+                                       "wrap-up landed, nothing to promote")
+            return True
+        if moved:
+            self.log.info(
+                "wrap-up for %s promoted: %s changed since %s"
+                % (entry.get("session"), os.path.basename(moved),
+                   fmt_hms(entry.get("armedMs"))))
+            self._schedule_thread_reap(entry.get("tmux"), now,
+                                       "wrap-up landed and promoted")
+            return True
+        due = entry.get("reportLandedMs", now) + PROMOTION_DEADLINE_MS
+        if now < due:
+            if not entry.get("promotionLogged"):
+                entry["promotionLogged"] = True
+                self.log.info(
+                    "wrap-up for %s wrote its report (%d real bug(s)) but the"
+                    " backlog has not moved; holding its console until %s"
+                    % (entry.get("session"), entry.get("realBugs"),
+                       fmt_hms(due)))
+            return False
+        killed = self._panes_killed.get(entry.get("tmux"))
+        if killed is not None and killed >= entry.get("armedMs", 0):
+            self.log.error(
+                "nothing promoted for %s and none was possible: this daemon"
+                " killed its pane %s at %s. Not paging the rider about a"
+                " promotion it prevented."
+                % (entry.get("session"), entry.get("tmux"), fmt_hms(killed)))
+        else:
+            self.log.warn(
+                "no promotion for %s %d min after the report landed with %d"
+                " real bug(s); paging (backlog unchanged since %s)"
+                % (entry.get("session"), PROMOTION_DEADLINE_MS // 60000,
+                   entry.get("realBugs"), fmt_hms(entry.get("armedMs"))))
+            self._promotion_fallback_push(entry.get("realBugs") or 0)
+        self._schedule_thread_reap(entry.get("tmux"), now,
+                                   "promotion deadline expired")
+        return True
+
+    def _promotion_fallback_push(self, real_bugs):
+        """One page: the report is written and its rows reached no backlog.
+
+        Charged to the same budget as the missing-report page and for the same
+        reason — it is the only notice the rider gets that a ride's evidence
+        did not make it into the one place open work is tracked, and it fires
+        long after the ride itself is over.
+        """
+        now = self.now_ms()
+        if (self.last_report_page_ms
+                and now - self.last_report_page_ms
+                < REPORT_PAGE_MIN_INTERVAL_MS):
+            self.log.info(
+                "promotion page suppressed (one per %d min): %d real bug(s)"
+                % (REPORT_PAGE_MIN_INTERVAL_MS // 60000, real_bugs))
+            self.push_log.append({
+                "tsMs": now, "title": "Ride watch",
+                "body": "Report written — %d real bug(s) not in the backlog."
+                        % real_bugs,
+                "sent": False, "kind": "promotion",
+                "suppressed": "report-page-budget"})
+            return False
+        self.last_report_page_ms = now
+        return self._send_push(
+            "Ride watch",
+            "Report written, backlog not updated — %d real bug(s). Open Claude"
+            " and say 'promote the ride report'." % real_bugs,
+            kind="promotion", bypass_rate_limit=True)
 
     def _deadline_for_pane(self, name):
         if not name:
@@ -3236,6 +3781,10 @@ class RideWatch:
         # phone that has gone home and stopped talking still gets its deadline
         # checked.
         self._check_report_deadlines(now)
+        # Same shape, same reason: a note whose verdict is waiting on an error
+        # that may never come has no trip to be ticked by, and on 2026-09-15
+        # the note that needed this arrived two minutes before its ride began.
+        self._check_pending_notes(now)
         # Outside the loop as well, and for a stronger reason: a panel
         # teardown burst is keyed by session and can be open with no trip
         # behind it at all (the rider on the settings tab from the search
@@ -3842,8 +4391,284 @@ class RideWatch:
              "thresholdPct": EARLY_TRANSITION_PROGRESS_PCT,
              "leg": self._leg_label(trip, leg_index)})
 
-    def _rule_aboard_swap(self, trip, t):
+    def _rule_session_restart_while_aboard(self, session, t, obj, trip):
+        """The app relaunched itself under a rider who was on the bus. (17.7)
+
+        2026-09-15 ride A did it twice. At 15:49:45: `record-mode`, `start`,
+        `resumed-session`, RESUME_GO_MODE (duration 2439.981, end 16:28:33),
+        `bundle_hold` — then `bundle_health` / `bundle_apply` five seconds
+        later, which is the crash-recovery path and not a normal resume.
+        STOP_GO_MODE came at 15:50:09, 24 s afterwards, so the relaunch is
+        plausibly why the rider quit. The same thing had happened at 15:47:11.
+        `riding` was set across both, on Orange Line trip 1:1346665 with a
+        confirmed vehicle match.
+
+        No rule covered it and `resumed-trip` never could: that one is about a
+        ride which arrives with no START_GO_MODE anywhere, reached only from
+        _maybe_adopt, and both of these arrived inside a trip this daemon had
+        opened itself. Nothing here can make it fire twice — different rule,
+        different door.
+
+        A page, not a warn: the rider is aboard and the screen they were
+        navigating by has just gone away, so "the app restarted" is the one
+        sentence that explains what they are looking at. Once per ride,
+        though. The second relaunch is news for the report and is filed, but
+        it is not worth the ride's other interrupt.
+
+        Known gap, stated rather than guessed at: if a relaunch mints a NEW
+        session id, RESUME_GO_MODE arrives before _maybe_adopt has aliased the
+        old trip onto it, `self.trips.get(session)` is None and this says
+        nothing. Both recorded relaunches kept the id
+        (`mu346i5y-ng2uqc` throughout), so there is no evidence for how to
+        bridge that and no rule written on a guess.
+        """
+        if trip is None or trip.riding is None:
+            return
+        if trip.arrived_ms is not None:
+            return
+        # `resumed-session` and RESUME_GO_MODE are one relaunch reported twice,
+        # 3 ms apart on the real stream.
+        if (trip.restart_aboard_ms
+                and t - trip.restart_aboard_ms <= SESSION_RESTART_DEDUP_MS):
+            return
+        trip.restart_aboard_ms = t
+        trip.restart_aboard_count += 1
+        first = trip.restart_aboard_count == 1
+        route = (trip.riding.get("headsign") or trip.riding.get("routeId")
+                 or "bus")
+        marker = ("RESUME_GO_MODE" if obj.get("type") == "RESUME_GO_MODE"
+                  else "resumed-session")
+        nth = "" if first else " (%d in this ride)" % trip.restart_aboard_count
+        summary = ("the app relaunched mid-ride while aboard %s (trip %s):"
+                   " %s%s" % (route, trip.riding.get("tripId"), marker, nth))
+        ctx = {"marker": marker,
+               "riding": {k: trip.riding.get(k) for k in
+                          ("tripId", "vehicleId", "routeId", "legIndex")},
+               "restartCount": trip.restart_aboard_count,
+               "legIndex": (trip.progress or {}).get("currentLegIndex"),
+               "legProgressPct": (trip.progress or {}).get("currentLegProgress"),
+               "bundle": (self.device_bundles.get(trip.device) or {}).get("version"),
+               "swapSeq": trip.swap_seq}
+        self._finding(
+            trip, t, "session-restart-while-aboard",
+            "page" if first else "warn", summary, ctx,
+            push_body=("The app restarted while you were on %s. Check the trip"
+                       " sheet still shows your bus." % route) if first else None)
+
+    # -- what the rider had touched, and what was hanging while they did ----
+    #
+    # Both ledgers are per session and fed from every record (see _process).
+    # note-unverifiable is the only reader; it exists because on 2026-09-15 the
+    # note "Clicking does nothing" could be neither confirmed nor contradicted.
+
+    def _note_rider_gesture(self, session, t, kind, typ, obj):
+        """Remember the last record only a rider's finger could have produced.
+
+        Two vocabularies, on purpose. RIDER_GESTURE_TYPES is today's stream,
+        every entry checked against its otprr call site. TAP_RECORD_RE /
+        TAP_RECORD_KINDS are the tap records the client does not emit yet: a
+        parallel change is adding them, and when they land they satisfy this by
+        themselves and note-unverifiable stops firing — which is the whole
+        point of the rule rather than a hole in it.
+        """
+        gesture = None
+        if kind in TAP_RECORD_KINDS:
+            gesture = kind
+        elif isinstance(typ, str):
+            if typ in RIDER_GESTURE_TYPES:
+                gesture = typ
+            elif TAP_RECORD_RE.search(typ):
+                gesture = typ
+            elif typ == "START_REROUTE" and \
+                    (obj.get("payload") or {}).get("autoApply") is False:
+                # The reroute BUTTON. autoApply true is the app's own re-plan
+                # and says nothing about the rider (17.9d, same distinction).
+                gesture = "START_REROUTE"
+        if gesture is None:
+            return
+        if len(self.session_last_gesture) > SESSION_CACHE_MAX and \
+                session not in self.session_last_gesture:
+            self._prune_session_caches()
+        prior = self.session_last_gesture.get(session)
+        if prior is not None and prior[0] > t:
+            return                        # buffered replay of an older record
+        self.session_last_gesture[session] = (int(t), gesture)
+
+    def _note_request_timeout(self, session, t, typ, obj):
+        """Reconstruct the window of a request that came back timed out.
+
+        Only the ERROR carries the timeout, so the window is worked backwards
+        from it: [errorMs - timeoutMs, errorMs]. Two shapes in the stream, both
+        from 2026-09-15 — `{"error": {"timedOut": true, "timeoutMs": 20000,
+        "url": ...}}` on ROUTING_ERROR, and `{"__error": true, "message":
+        "Request timed out after 20000 ms"}` on FIND_FEEDS_ERROR,
+        FIND_TRIP_ERROR and REALTIME_VEHICLE_POSITIONS_ERROR.
+        """
+        if not isinstance(typ, str) or not typ.endswith("_ERROR"):
+            return
+        p = obj.get("payload")
+        if not isinstance(p, dict):
+            return
+        ms = None
+        err = p.get("error")
+        if isinstance(err, dict) and err.get("timedOut"):
+            cand = err.get("timeoutMs")
+            if isinstance(cand, (int, float)) and cand > 0:
+                ms = int(cand)
+        if ms is None:
+            m = TIMEOUT_MESSAGE_RE.search(p.get("message") or "")
+            if m:
+                ms = int(m.group(1))
+        if not ms or ms > TIMEOUT_WINDOW_MAX_MS:
+            return
+        if len(self.session_timeouts) > SESSION_CACHE_MAX and \
+                session not in self.session_timeouts:
+            self._prune_session_caches()
+        ring = self.session_timeouts.setdefault(
+            session, collections.deque(maxlen=64))
+        ring.append((int(t) - ms, int(t), typ, ms))
+
+    def _arm_note_evidence(self, session, t, text, image):
+        """Hold the "could anyone check this?" verdict until the errors land.
+
+        The gesture half is decidable now; the timeout half is not, because the
+        request that swallowed the tap only reports itself when it gives up —
+        15:53:59.330 for a note at 15:53:50.965. So the whole decision waits
+        NOTE_EVIDENCE_GRACE_MS and is taken on the 5 s tick.
+        """
+        last = self.session_last_gesture.get(session)
+        self.pending_notes.append({
+            "session": session,
+            "tMs": int(t),
+            "dueMs": int(t) + NOTE_EVIDENCE_GRACE_MS,
+            "text": text,
+            "image": image,
+            "lastGestureMs": last[0] if last else None,
+            "lastGesture": last[1] if last else None,
+        })
+
+    def _check_pending_notes(self, now, force=False):
+        """File note-unverifiable for the notes nothing can corroborate. (17.11)"""
+        if not self.pending_notes:
+            return
+        keep, changed = [], False
+        for entry in self.pending_notes:
+            if not force and now < entry["dueMs"]:
+                keep.append(entry)
+                continue
+            changed = True
+            self._resolve_pending_note(entry)
+        if changed:
+            self.pending_notes = keep
+
+    def _resolve_pending_note(self, entry):
+        session, t = entry["session"], entry["tMs"]
+        gesture_ms = entry.get("lastGestureMs")
+        blind = (gesture_ms is None
+                 or t - gesture_ms > NOTE_GESTURE_LOOKBACK_MS)
+        hung = None
+        for (start, end, typ, ms) in self.session_timeouts.get(session, ()):
+            if start <= t <= end:
+                hung = (typ, ms, end)
+                break
+        if not blind and hung is None:
+            return
+        trip = self.trips.get(session) or self._recently_ended_trip(session, t)
+        if trip is not None and trip.note_unverifiable_fired:
+            return
+        if trip is not None:
+            trip.note_unverifiable_fired = True
+        reasons = []
+        if blind:
+            reasons.append(
+                "no rider-gesture record in the %d s before it (last was %s)"
+                % (NOTE_GESTURE_LOOKBACK_MS // 1000,
+                   ("%s at %s" % (entry.get("lastGesture"),
+                                  fmt_hms(gesture_ms)))
+                   if gesture_ms else "none in this session"))
+        if hung is not None:
+            reasons.append(
+                "a request that timed out after %d ms was in flight across it"
+                " (%s at %s)" % (hung[1], hung[0], fmt_hms(hung[2])))
+        summary = ("rider note \"%s\" cannot be checked against the telemetry:"
+                   " %s" % (entry["text"][:80], "; and ".join(reasons)))
+        ctx = {"text": entry["text"], "noteMs": t,
+               "lastGestureMs": gesture_ms,
+               "lastGesture": entry.get("lastGesture"),
+               "gestureLookbackMs": NOTE_GESTURE_LOOKBACK_MS,
+               "noGestureRecord": blind,
+               "inFlightTimeout": ({"type": hung[0], "timeoutMs": hung[1],
+                                    "errorMs": hung[2]} if hung else None),
+               # Named so a report can say what would fix it: the client emits
+               # no tap or gesture record anywhere, which is the defect the
+               # rule is really about.
+               "tapInstrumentation": "absent"}
+        if entry.get("image"):
+            ctx["image"] = entry["image"]
+        self._hold_onboard_finding(session, trip, t, "note-unverifiable",
+                                   "warn", summary, ctx)
+
+    @staticmethod
+    def _transit_route_signature(summary):
+        """The route ids of a plan's transit legs, in order. None = unknown.
+
+        Route ids, not trip ids, and not the walk/bike legs between them: this
+        is "the journey the rider agreed to", which is exactly what a
+        route-preserving swap keeps and a real swap does not. See
+        ONBOARD_ANCHOR_AHEAD_MARGIN_M's block for why tripId is the wrong test
+        — a `boarded-earlier` splice changes it by design.
+        """
+        if not summary:
+            return None
+        legs = summary.get("legs")
+        if not isinstance(legs, list):
+            return None
+        sig = []
+        for leg in legs:
+            if not isinstance(leg, dict) or not leg.get("transit"):
+                continue
+            sig.append(leg.get("routeId") or leg.get("route")
+                       or leg.get("headsign"))
+        return tuple(sig)
+
+    def _swap_preserves_the_plan(self, prev_summary, new_summary):
+        """Same transit routes in the same order, same arrival. (17.9a)
+
+        Fails closed on a summarized payload: if either plan is unavailable —
+        `__summary: true` over the debug-log size cap — there is nothing to
+        compare and the swap is judged as before rather than excused.
+        """
+        if not prev_summary or not new_summary:
+            return False
+        old_sig = self._transit_route_signature(prev_summary)
+        new_sig = self._transit_route_signature(new_summary)
+        if old_sig is None or new_sig is None or old_sig != new_sig:
+            return False
+        # A plan with no transit leg at all is not a route the rule protects,
+        # and two of them would compare equal on an empty tuple.
+        if not old_sig:
+            return False
+        old_end, new_end = prev_summary.get("endTime"), new_summary.get("endTime")
+        if not isinstance(old_end, (int, float)) or \
+                not isinstance(new_end, (int, float)):
+            return False
+        return int(old_end) == int(new_end)
+
+    def _rule_aboard_swap(self, trip, t, prev_summary=None, new_summary=None):
         if trip.riding is None:
+            return
+        # A swap that kept every route id and the arrival time is the designed
+        # boarded-earlier splice, not the on-screen route walking away from the
+        # rider's bus (17.9a). Checked first: it is the cheapest gate and the
+        # one that was wrong on 2026-09-15 15:36:33.
+        if self._swap_preserves_the_plan(prev_summary, new_summary):
+            self.log.info(
+                "itinerary swap #%d preserved the plan (routes %s, arrival"
+                " %s): not an aboard-swap"
+                % (trip.swap_seq,
+                   " > ".join(str(r) for r in
+                              self._transit_route_signature(new_summary)),
+                   fmt_hms(new_summary.get("endTime"))))
             return
         # Being "aboard" has to mean aboard NOW. The sticky fact alone was the
         # bug: on 8/2 it was still set 53 minutes after the rider got off, so
@@ -3943,6 +4768,22 @@ class RideWatch:
     def _on_start_reroute(self, trip, t, p):
         if p.get("autoApply") is False:
             trip.last_rider_action_ms = t  # explicit reroute button
+        # Only the app's own re-plans count toward a storm (17.9d). The rule is
+        # "the app is re-planning in circles"; a rider pressing the reroute
+        # button four times is a rider fighting the answer they were given,
+        # which is a different finding and not this one.
+        #
+        # 2026-09-15 15:47:30 fired "4 reroutes within 5 min" on
+        # 15:42:54.408, 15:43:49.052, 15:46:02.060 and 15:47:30.719 — every
+        # one of them `autoApply: false`, `reason: "rider-reroute"`. The
+        # ride's only automatic reroute, 15:36:33's `boarded-earlier`, had
+        # already aged out of the window, so the storm was 100% the rider.
+        # (The ride report attributed three of the four to the onboard-picker
+        # commits at 15:43:28 and 15:47:53 instead; those are START_GO_MODE
+        # records and never reached this counter at all.)
+        if p.get("autoApply") is not True:
+            self._note_replan(trip, t, p.get("reason") or "reroute")
+            return
         trip.reroute_times.append(t)
         while trip.reroute_times and t - trip.reroute_times[0] > REROUTE_STORM_WINDOW_MS:
             trip.reroute_times.popleft()
@@ -4605,6 +5446,18 @@ class RideWatch:
         if not isinstance(text, str) or not text.strip():
             return
         text = text.strip()[:RIDER_NOTE_MAX_CHARS]
+        image = obj.get("image")
+        # Armed here, before any of the trip-guessing below: 17.11's note is
+        # the case where every one of those guesses comes back empty. The
+        # 15:53:50 "Clicking does nothing" landed 2m23s before its ride's
+        # START_GO_MODE, so `trip` is None, _recently_ended_trip finds nothing
+        # and the note itself is only logged — and until now that was the end
+        # of it. The verdict resolves on the tick and is held for whichever
+        # trip this session opens next.
+        self._arm_note_evidence(
+            session, t, text,
+            image.strip()[:512] if isinstance(image, str) and image.strip()
+            else None)
         if trip is None:
             # This session's ride has just ended. A note typed in the minutes
             # after a ride is about that ride — on 2026-09-09 the 09:03:42
@@ -5161,7 +6014,20 @@ class RideWatch:
             self.log.error("digest write failed: %r" % exc)
             digest = self._digest_path(trip)
         # Detail lives in the file; the line says only what changed.
-        text = one_line("[ride-watch] %s — digest: %s" % (line, digest))
+        #
+        # The digest path is bounded separately, because one_line() cuts from
+        # the RIGHT and the path is the rightmost thing here — so a long
+        # message used to eat it, the pusher then handed the thread a line
+        # ending in "…", and in the test harness (which opens the path it is
+        # given) the push was dropped outright with only a log line to show
+        # for it. RIDER_NOTE_MAX_CHARS is 500 against a THREAD_LINE_MAX of
+        # 400, so the rider only had to type a paragraph; adding a clause to
+        # the wrap-up line on 2026-09-17 came within 21 characters of the same
+        # thing. Whatever gets cut, it is never the two paths the thread needs
+        # in order to go and read anything.
+        suffix = " — digest: %s" % digest
+        text = one_line("[ride-watch] %s" % line,
+                        limit=max(1, THREAD_LINE_MAX - len(suffix))) + suffix
         trip.thread_cursor = len(trip.thread_events)
         trip.last_thread_push_ms = self.now_ms()
         trip.thread_pushes += 1
@@ -5601,9 +6467,12 @@ class RideWatch:
     def _panes_awaiting_wrap_up(self):
         """tmux panes that were asked for a wrap-up and have not delivered.
 
-        Emptied by _check_report_deadlines the moment the report lands or the
-        deadline expires, so a pane is protected for at most REPORT_DEADLINE_MS
-        and a dead one cannot pin the namespace forever.
+        Emptied by _check_report_deadlines when the wrap-up settles or its
+        deadline expires, so a pane is protected for at most
+        REPORT_DEADLINE_MS + PROMOTION_DEADLINE_MS and a dead one cannot pin
+        the namespace forever. The promotion half of that bound is deliberate:
+        the backlog write needs a live console, and the pane it needs is the
+        one this set spares (15.8).
         """
         return set(e.get("tmux") for e in self.report_deadlines
                    if e.get("tmux"))
@@ -5908,6 +6777,10 @@ class RideWatch:
 
     def finalize_replay(self):
         """End any still-active trips at replay EOF."""
+        # Before the trips close, so a note still inside its grace window can
+        # still be filed on the ride it belongs to. EOF is the end of every
+        # window there is; an error that has not arrived by now never will.
+        self._check_pending_notes(self.now_ms(), force=True)
         for trip in self._active_trips():
             self._end_trip(trip, trip.last_event_ms, "replay-eof")
         # Bursts that never had a trip to be closed by. EOF is the end of the
