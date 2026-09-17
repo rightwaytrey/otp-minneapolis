@@ -25,6 +25,32 @@
 # expired on 2026-08-09 taking address search and trip planning with it. That one
 # was caught eventually by check-cert-expiry.sh — but only weeks later, and only
 # as a symptom. This watches the cause.
+#
+# 2026-09-17 — TWO THINGS ABOVE ARE NO LONGER TRUE, and this script paged the
+# rider 34 times before anyone noticed:
+#
+#   1. THE ROUTER IS NOT IN THE PATH ANY MORE. api.transit-nav.com resolves to
+#      172.238.175.38, which is the Linode's own public IP — no home forward, no
+#      hairpin NAT problem. The page text told the rider to "check the :9966
+#      forward first", which is now advice about a machine that cannot be the
+#      cause. (rwtpc4 still has an /etc/hosts line pointing the name at the
+#      Tailscale address, which is why a local curl proves nothing — that part
+#      of the premise survives.)
+#
+#   2. A FREE CORS RELAY IS A BAD TELESCOPE FOR A NON-STANDARD PORT. Both relays
+#      sit behind Cloudflare, and Cloudflare answers their fetch of :9966 with
+#      `error code: 520` / `522` / `Oops... Request Timeout` — errors about the
+#      RELAY's fetch, not about our origin. The old code read exactly that as
+#      "the relay is fine and could not reach us. That is a real answer." It is
+#      not: on 2026-09-17 the endpoint returned 200 with `"features"` in 2.0 s
+#      over the public internet throughout, the phone's own check-ins were
+#      landing, and a bundle had just been verified over the same public URL.
+#
+# So the rule now is: a relay error is never evidence about us (the body is
+# classified, not just the control URL); two different relays must agree before
+# we call it unreachable; and before paging we ask the ORIGIN, from outside the
+# house, whether it is answering on its public IP. Only when that fails too is
+# this "the server is down" — and only then does it page at priority 1.
 
 set -u
 
@@ -102,6 +128,17 @@ TARGET_URL="https://${TARGET_HOST}${TARGET_PATH}&_cb=$(date +%s)"
 reachable=""      # yes | no | unknown
 via=""
 detail=""
+ours_failed=0     # how many DIFFERENT relays fetched the control fine but not us
+
+# A relay answering with its own error page tells us nothing about our origin.
+# Cloudflare 520/522 ("Web server is returning an unknown error" / "connection
+# timed out") is what both relays return for a TLS fetch on :9966 when their
+# own fetcher gives up; codetabs answers "Oops... Request Timeout". Matching the
+# body is deliberate: these come back with a 200-shaped response, so curl's exit
+# status and the HTTP code are both useless here.
+looks_like_relay_error() {
+    printf '%s' "$1" | grep -qiE 'error code: 5[0-9][0-9]|Request Timeout|cloudflare|<title>5[0-9][0-9]|Server-side requests are not allowed'
+}
 
 for relay in "${RELAYS[@]}"; do
     encoded="$(urlencode "$TARGET_URL")"
@@ -110,17 +147,63 @@ for relay in "${RELAYS[@]}"; do
         reachable="yes"; via="$relay"; break
     fi
 
-    # Our fetch failed through this relay. Is the relay itself alive?
+    if [ -z "$body" ] || looks_like_relay_error "$body"; then
+        # The telescope is broken, not the sky. Try the next one.
+        reachable="unknown"; via="$relay"
+        detail="$(printf '%s' "$body" | head -c 200)"
+        continue
+    fi
+
+    # Our fetch came back with something that is neither our data nor a known
+    # relay failure. Is the relay itself alive?
     control="$(curl -s --max-time 20 "${relay}$(urlencode "$CONTROL_URL")" 2>/dev/null || true)"
     if [ -n "$control" ] && printf '%s' "$control" | grep -q -- "$CONTROL_EXPECT"; then
-        # Relay is fine and could not reach us. That is a real answer.
-        reachable="no"; via="$relay"
+        # This relay is fine and could not reach us. ONE relay saying so is a
+        # suspicion, not a verdict (2026-09-17: allorigins served example.com
+        # while 520-ing us for hours). Keep looking.
+        ours_failed=$(( ours_failed + 1 ))
+        via="$relay"
         detail="$(printf '%s' "$body" | head -c 200)"
-        break
+        continue
     fi
-    # Relay is broken or blocked; try the next one before concluding anything.
     reachable="unknown"; via="$relay"
 done
+
+# Two independent relays fetched the control and not us: that is corroborated.
+if [ "$reachable" != "yes" ] && [ "$ours_failed" -ge 2 ]; then
+    reachable="no"
+fi
+
+# Does the ORIGIN answer on its public IP, asked from outside the house? This is
+# the check that distinguishes "the server is down" (page hard) from "the path
+# from some networks is unhappy" (say so quietly). It runs ON the Linode and
+# dials the public A record with --resolve, so it exercises nginx, TLS and the
+# public address — everything except the rider's own ISP. No ssh, no answer, no
+# veto: an unreachable Linode is itself the outage.
+ORIGIN_SSH="${API_REACHABLE_ORIGIN_SSH:-rwt@100.126.171.72}"
+origin_answers() {
+    local ip
+    ip="$(dig +short "${TARGET_HOST%%:*}" @8.8.8.8 2>/dev/null | head -1)"
+    [ -n "$ip" ] || return 1
+    timeout 45 ssh -o BatchMode=yes -o ConnectTimeout=10 "$ORIGIN_SSH" \
+        "curl -s --max-time 20 --resolve '${TARGET_HOST}:${ip}' 'https://${TARGET_HOST}${TARGET_PATH}' | grep -q -- '${EXPECT}'" \
+        >/dev/null 2>&1
+}
+
+# Has the rider's phone itself reached this host recently? The app reports its
+# bundle on every launch, from whatever network it is on, which is the only
+# truly end-to-end evidence available. `ship-web-check` is our own ship script
+# and does not count.
+phone_reached_recently() {
+    local age
+    age="$(timeout 45 ssh -o BatchMode=yes -o ConnectTimeout=10 "$ORIGIN_SSH" \
+        "grep -v ship-web-check app-bundles-dev/checks.jsonl 2>/dev/null | tail -1" 2>/dev/null \
+        | python3 -c 'import sys,json,time
+line=sys.stdin.read().strip()
+print(int(time.time()-json.loads(line)["t"]) if line else 10**9)' 2>/dev/null || echo 1000000000)"
+    case "$age" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$age" -lt 7200 ]
+}
 
 mkdir -p "$(dirname "$STATE_FILE")"
 streak="$(cat "$STATE_FILE" 2>/dev/null || echo 0)"
@@ -138,11 +221,24 @@ case "$reachable" in
     no)
         streak=$(( streak + 1 ))
         echo "$streak" > "$STATE_FILE"
-        echo "FAIL (${streak}): ${TARGET_HOST} not reachable from the internet"
+        echo "FAIL (${streak}): ${TARGET_HOST} not reachable via ${ours_failed} relays"
         [ -n "$detail" ] && echo "  relay said: $detail"
         if [ "$streak" -eq "$FAIL_THRESHOLD" ]; then
-            notify "App cannot reach the server" \
-"${TARGET_HOST} is not answering from the public internet, though it is healthy on the box itself. That pattern is the router's port forward: it is what broke on 2026-08-14 (silent for four days) and on 2026-07-12. Check the :9966 forward first." 1
+            if origin_answers; then
+                # The origin is serving its own public IP. Whatever the relays
+                # cannot do, the server is not down — so this is a quiet note,
+                # never a priority-1 page.
+                if phone_reached_recently; then
+                    echo "  SUSPECT relays only: origin answers on its public IP and the phone checked in within 2h — not paging"
+                else
+                    echo "  SUSPECT network path: origin answers on its public IP but no phone check-in in 2h — quiet note"
+                    notify "Server up, path suspect" \
+"${TARGET_HOST} answers on its own public IP from outside the house, but ${ours_failed} relays could not reach it and the phone has not checked in for 2h. Nothing to fix on the box; this is a routing or ISP suspicion." 0
+                fi
+            else
+                notify "App cannot reach the server" \
+"${TARGET_HOST} is not answering from the public internet, and the origin does not answer on its own public IP either. api.transit-nav.com is the LINODE (no home router in this path since the migration) — check nginx :9966 and the cert on the Linode, then its firewall. Relay detail: ${detail:-none}." 1
+            fi
         fi
         exit 1
         ;;
@@ -150,5 +246,6 @@ case "$reachable" in
         # Every relay unusable. Say so in the cron mail and change nothing:
         # a check that cannot see is not a check that found a problem.
         echo "INCONCLUSIVE: no relay could be reached; reachability unknown this run"
+        [ -n "$detail" ] && echo "  last relay said: $detail"
         ;;
 esac
