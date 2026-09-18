@@ -1409,13 +1409,14 @@ class TestPageRanking(RuleTestCase):
                       "missed-bus-while-riding", "replan-not-converging",
                       "unreachable-but-routable", "notification-repeat",
                       "aboard-swap", "session-restart-while-aboard",
-                      "riding-flip", "deviated-streak"}
+                      "riding-flip", "position-teleport", "deviated-streak"}
         self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
         self.assertEqual(
             ["stop-count-collapse", "itinerary-backwards",
              "missed-bus-while-riding", "replan-not-converging",
              "unreachable-but-routable", "notification-repeat", "aboard-swap",
-             "session-restart-while-aboard", "riding-flip", "deviated-streak"],
+             "session-restart-while-aboard", "riding-flip",
+             "position-teleport", "deviated-streak"],
             sorted(ride_watch.PAGE_RANK, key=ride_watch.PAGE_RANK.get,
                    reverse=True))
 
@@ -7339,6 +7340,492 @@ class TestRide0915(unittest.TestCase):
         pages = [f for f in watch.all_findings if f["severity"] == "page"]
         self.assertEqual([f["rule"] for f in pages],
                          ["session-restart-while-aboard"])
+
+
+REAL_LOG_0917 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-17.jsonl")
+REAL_LOG_0918 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-18.jsonl")
+
+
+class TestSwapOntoTheRiddenTrip(RuleTestCase):
+    """17.9a2: a replan onto the bus the rider is sitting in is not a swap.
+
+    2026-09-17 17:59:24, six seconds after SET_RIDING trip 1:1346874:
+    START_REROUTE {reason: "boarded-earlier", autoApply: true} and a plan whose
+    BUS leg IS trip 1:1346874 — same route 1:904, same alight stop — arriving
+    18:33:30 instead of 18:35:19. The arrival IMPROVED, so 17.9a's "routes and
+    arrival unchanged" test failed open and the rule paged; that page was the
+    ride's only one (`pagesSent: 1`).
+    """
+
+    def aboard(self, trip_id="1:100"):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding(trip_id=trip_id)
+        b.advance(59000).vehicle_match(trip_id=trip_id)
+        return b
+
+    def test_a_replan_onto_the_ridden_trip_with_a_better_arrival_is_quiet(self):
+        """The 17:59:24 shape, and it fails on 17.9a alone: routes held, the
+        ridden trip held, and the arrival two minutes EARLIER."""
+        b = self.aboard()
+        b.advance(1000).swap(route_id="1:5", short="5", trip_id="1:100",
+                             end_offset=1690000)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "aboard-swap"), [],
+                         self.rules(watch))
+
+    def test_it_also_covers_the_first_sighting(self):
+        """2026-09-15 15:36:33 measured in the day file: SET_RIDING carried
+        trip 1:1346665 and the incoming plan's bus leg was trip 1:1346665. One
+        test, both sightings — here with the arrival moved as well, so only the
+        ridden-trip half can be what excuses it."""
+        b = self.aboard(trip_id="1:1346665")
+        b.advance(1000).swap(route_id="1:5", short="5", trip_id="1:1346665",
+                             end_offset=2400000)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "aboard-swap"), [],
+                         self.rules(watch))
+
+    def test_a_replan_onto_a_different_trip_still_pages(self):
+        """The thing the rule is FOR: same route, but the plan now names a bus
+        the rider is not on."""
+        b = self.aboard()
+        b.advance(1000).swap(route_id="1:5", short="5", trip_id="1:400",
+                             end_offset=2400000)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "aboard-swap")), 1)
+
+    def test_a_plan_with_no_trip_ids_is_judged_not_excused(self):
+        """An itinerary whose transit leg carries no tripId cannot be matched
+        against the rider's vehicle, so the exemption fails closed."""
+        b = self.aboard()
+        itin = replacement_itinerary(route_id="1:5", short="5",
+                                     end_offset=2400000)
+        itin["itinerary"]["legs"][1]["tripId"] = None
+        b.advance(1000).action("START_GO_MODE", itin)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "aboard-swap")), 1)
+
+    def test_the_ridden_trip_on_a_non_transit_leg_does_not_excuse(self):
+        """Only a transit leg can carry the rider's vehicle. A walk leg that
+        happens to have the id stamped on it is not the rider's bus."""
+        b = self.aboard()
+        itin = replacement_itinerary(route_id="1:21", short="21",
+                                     trip_id="1:400", end_offset=2400000)
+        itin["itinerary"]["legs"][2]["tripId"] = "1:100"
+        b.advance(1000).action("START_GO_MODE", itin)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "aboard-swap")), 1)
+
+    def test_any_transit_leg_counts_not_only_the_first(self):
+        """The splice does not always make the ridden trip leg 0 — on
+        2026-08-31 17:15:01 it did, on 09-15 15:36:33 it did, but the daemon
+        should care that the plan still contains the rider's vehicle, not
+        where."""
+        b = self.aboard()
+        itin = replacement_itinerary(route_id="1:21", short="21",
+                                     trip_id="1:400", end_offset=2400000)
+        itin["itinerary"]["legs"].append(
+            {"mode": "BUS", "transitLeg": True, "routeId": "1:5",
+             "tripId": "1:100", "headsign": "Downtown",
+             "from": {"name": "Stop B"}, "to": {"name": "Work"}})
+        b.advance(1000).action("START_GO_MODE", itin)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "aboard-swap"), [],
+                         self.rules(watch))
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0917),
+                         "%s not present" % REAL_LOG_0917)
+    def test_the_real_1759_swap_costs_the_ride_no_page(self):
+        """The whole of ride 1 through the real code path: the only page it
+        ever sent is gone and the ride ends with its budget intact."""
+        tmp = tempfile.mkdtemp(prefix="ride-watch-0917-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        with open(REAL_LOG_0917) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("session") == "mu63yfrb-ekv1fl":
+                    watch.process(obj)
+        watch.finalize_replay()
+        self.assertEqual(self.find(watch, "aboard-swap"), [],
+                         self.rules(watch))
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+
+class TestPositionTeleport(RuleTestCase):
+    """18.3a: nothing watched the position stream itself.
+
+    2026-09-17 ride `mu63yfrb-ekv1fl`: ten consecutive-fix jumps over 100 m,
+    seven of them over 150 m, the fixes alternating between two tracks 200-310
+    m apart that each advanced at bike speed and each stopped at the same red
+    light. Everything downstream was computed off whichever one arrived, and
+    the only rule that ever noticed was progress-without-motion at 18:28:04 —
+    2m24s after the first jump.
+    """
+
+    def moving(self):
+        """A trip with one honest fix behind it, so the first jump has a
+        previous fix to be judged against."""
+        b = StreamBuilder().start().advance(1000).progress(leg=1)
+        self._offset = 0.0
+        return b.advance(1000).position()
+
+    def jump(self, b, metres=200.0, gap_ms=1000, accuracy=12.0):
+        """One fix `metres` from the LAST one, `gap_ms` later.
+
+        The two-track shape: the stream flips back and forth between a line
+        and a parallel one, so each hop is the same distance in the opposite
+        direction.
+        """
+        b.advance(gap_ms)
+        self._offset = 0.0 if self._offset else metres
+        return b.position_metres_north(self._offset, accuracy=accuracy)
+
+    def test_two_jumps_in_a_minute_warn(self):
+        b = self.moving()
+        self.jump(b, 200.0)
+        self.jump(b, 200.0)
+        watch = self.run_stream(b)
+        hits = self.find(watch, "position-teleport")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        self.assertEqual(hits[0]["severity"], "warn")
+        self.assertEqual(hits[0]["context"]["countInWindow"], 2)
+        self.assertEqual(len(hits[0]["context"]["jumps"]), 2)
+
+    def test_one_jump_is_not_a_finding(self):
+        """08-28 17:20:35 (184 m), 09-01 10:39:52 (320 m) and 09-04 15:44:56
+        (179 m) are each a lone pair in a whole ride: a GPS artefact the
+        matcher is built to absorb, not a stream that is not one stream."""
+        b = self.moving()
+        self.jump(b, 320.0)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "position-teleport"), [],
+                         self.rules(watch))
+
+    def test_a_jump_under_the_threshold_does_not_count(self):
+        """126 m at 17:50:22 and 133 m at 18:23:04 are in the ride report's
+        table and are not separable from a fast bus."""
+        b = self.moving()
+        self.jump(b, 130.0)
+        self.jump(b, 130.0)
+        self.jump(b, 130.0)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "position-teleport"), [],
+                         self.rules(watch))
+
+    def test_an_untrusted_fix_does_not_count(self):
+        """The case rests on neither fix admitting to being uncertain. One end
+        over TELEPORT_MAX_ACCURACY_M and there is nothing to say."""
+        b = self.moving()
+        self.jump(b, 200.0, accuracy=45.0)
+        self.jump(b, 200.0, accuracy=45.0)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "position-teleport"), [],
+                         self.rules(watch))
+
+    def test_a_fix_with_no_accuracy_does_not_count(self):
+        """A missing accuracy is not a claim of accuracy: fail closed."""
+        b = self.moving()
+        b.advance(1000).action("UPDATE_POSITION", {
+            "coords": {"latitude": b.LAT + 200 * 9.0e-6, "longitude": b.LON},
+            "timestamp": b.t})
+        b.advance(1000).action("UPDATE_POSITION", {
+            "coords": {"latitude": b.LAT, "longitude": b.LON},
+            "timestamp": b.t})
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "position-teleport"), [],
+                         self.rules(watch))
+
+    def test_a_gap_longer_than_two_seconds_is_a_gps_gap_not_a_teleport(self):
+        b = self.moving()
+        self.jump(b, 200.0, gap_ms=5000)
+        self.jump(b, 200.0, gap_ms=5000)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "position-teleport"), [],
+                         self.rules(watch))
+
+    def test_jumps_more_than_a_minute_apart_do_not_accumulate(self):
+        """09-15's fourth jump is at 09:42:09, five minutes after the cluster;
+        the window is what keeps a ride-long tally from maturing."""
+        b = self.moving()
+        self.jump(b, 200.0)
+        self.jump(b, 200.0, gap_ms=ride_watch.TELEPORT_WINDOW_MS + 5000)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "position-teleport"), [],
+                         self.rules(watch))
+
+    def test_five_in_a_minute_pages(self):
+        """Above anything on record — the worst recorded minute is 4, on
+        2026-09-17 at 18:26:17 — so the page is deliberately reserved."""
+        b = self.moving()
+        for _ in range(ride_watch.TELEPORT_PAGE_COUNT):
+            self.jump(b, 200.0)
+        watch = self.run_stream(b)
+        hits = self.find(watch, "position-teleport")
+        self.assertEqual([h["severity"] for h in hits], ["warn", "page"])
+        self.assertTrue(any("Position tracking is jumping" in p["body"]
+                            for p in watch.push_log))
+
+    def test_one_finding_per_episode(self):
+        """The 09-17 cluster is ten jumps in 2m06s and is one defect."""
+        b = self.moving()
+        for _ in range(4):
+            self.jump(b, 200.0)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "position-teleport")), 1)
+
+    def test_the_rank_is_below_riding_flip_and_above_deviated_streak(self):
+        self.assertLess(ride_watch.PAGE_RANK["position-teleport"],
+                        ride_watch.PAGE_RANK["riding-flip"])
+        self.assertGreater(ride_watch.PAGE_RANK["position-teleport"],
+                           ride_watch.PAGE_RANK["deviated-streak"])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0917),
+                         "%s not present" % REAL_LOG_0917)
+    def test_the_real_1825_cluster_is_named_before_the_symptom(self):
+        """Fires at 18:25:48, 2m16s before progress-without-motion at 18:28:04
+        and 67 s before the deviation replan the first flip drove."""
+        tmp = tempfile.mkdtemp(prefix="ride-watch-teleport-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        with open(REAL_LOG_0917) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("session") == "mu63yfrb-ekv1fl":
+                    watch.process(obj)
+        watch.finalize_replay()
+        hits = self.find(watch, "position-teleport")
+        self.assertEqual([h["time"] for h in hits], ["18:25:48"])
+        self.assertEqual(hits[0]["severity"], "warn")
+        self.assertEqual(hits[0]["context"]["countInWindow"], 2)
+        motion = self.find(watch, "progress-without-motion")
+        self.assertTrue(motion and motion[0]["tsMs"] - hits[0]["tsMs"] > 120000,
+                        "the symptom should still be minutes downstream")
+
+
+class TestArrivedNeverEnded(RuleTestCase):
+    """18.3b: the rider arrived and the app never closed the trip.
+
+    2026-09-17 ride 2 `mu69yw00-bo98a0`: SET_ARRIVED 21:41:31, STOP_GO_MODE
+    21:56:03 — 14m32s — and the ride's own report says `endReason: arrived`,
+    because this daemon closed the trip itself at 21:46:31. Our close is what
+    hid the client's failure to close.
+    """
+
+    def arrived(self, session=SESSION):
+        b = StreamBuilder(session=session).start().advance(1000).progress(leg=1)
+        b.advance(1000).position()
+        b.advance(1000).action("SET_ARRIVED", {})
+        return b
+
+    def idle(self, b, ms, step=30000):
+        """Time passing with the app talking but not producing fixes — the
+        21:42:43-21:55:07 shape, thirteen POSITION_FETCHING and no response."""
+        done = 0
+        while done < ms:
+            b.advance(step)
+            b.action("POSITION_FETCHING", {})
+            done += step
+        return b
+
+    def test_it_fires_when_the_app_never_closes(self):
+        b = self.arrived()
+        self.idle(b, ride_watch.ARRIVED_NEVER_ENDED_MS + 30000)
+        watch = self.run_stream(b)
+        hits = self.find(watch, "arrived-never-ended")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        self.assertEqual(hits[0]["severity"], "warn")
+
+    def test_it_says_when_the_fixes_have_stopped(self):
+        """13.5's case: the client's dwell timer lives in the arrived branch of
+        handlePositionUpdate, so with no fixes it has nothing to tick on."""
+        b = self.arrived()
+        self.idle(b, ride_watch.ARRIVED_NEVER_ENDED_MS + 30000)
+        watch = self.run_stream(b)
+        hit = self.find(watch, "arrived-never-ended")[0]
+        self.assertFalse(hit["context"]["positionFixesStillArriving"])
+        self.assertIn("tick-driven", hit["summary"])
+
+    def test_it_says_when_the_fixes_are_still_arriving(self):
+        """The other case, and it has a different fix: the timer is running
+        and failing. 08-27 15:00:53 and 08-29 22:08:37 are this shape."""
+        b = self.arrived()
+        for _ in range((ride_watch.ARRIVED_NEVER_ENDED_MS + 30000) // 5000):
+            b.advance(5000).position()
+        watch = self.run_stream(b)
+        hit = self.find(watch, "arrived-never-ended")[0]
+        self.assertTrue(hit["context"]["positionFixesStillArriving"])
+        self.assertIn("still arriving", hit["summary"])
+
+    def test_a_client_that_closes_in_time_is_quiet(self):
+        """2026-09-15 10:28:06 closed at 243 s — a timer a tick or two late,
+        which is what the slack is for."""
+        b = self.arrived()
+        self.idle(b, ride_watch.ARRIVED_NEVER_ENDED_MS - 60000)
+        b.advance(1000).stop()
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "arrived-never-ended"), [],
+                         self.rules(watch))
+
+    def test_a_stop_after_the_threshold_does_not_unsay_it(self):
+        """21:56:03 arrived eventually. The finding is about the window the
+        rider spent looking at a finished trip, not about the app never
+        closing at all."""
+        b = self.arrived()
+        self.idle(b, ride_watch.ARRIVED_NEVER_ENDED_MS + 30000)
+        b.advance(1000).stop()
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "arrived-never-ended")), 1)
+
+    def test_it_fires_once(self):
+        b = self.arrived()
+        self.idle(b, ride_watch.ARRIVED_NEVER_ENDED_MS * 3)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "arrived-never-ended")), 1)
+
+    def test_a_ride_that_resumed_after_arrival_says_nothing(self):
+        """Arrival is an inference; _clear_arrival unwinds it, and a rule
+        hanging off a retracted arrival would be a finding about nothing."""
+        b = self.arrived()
+        b.advance(5000).progress(leg=2)
+        self.idle(b, ride_watch.ARRIVED_NEVER_ENDED_MS + 30000)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "arrived-never-ended"), [],
+                         self.rules(watch))
+
+    def test_our_own_close_cannot_suppress_it(self):
+        """The ordering that makes the rule possible, asserted rather than
+        trusted: ARRIVED_END_MS deletes the trip, so a threshold at or above it
+        would mean the rule never ran on a live ride. The margin is six live
+        ticks."""
+        self.assertLess(ride_watch.ARRIVED_NEVER_ENDED_MS,
+                        ride_watch.ARRIVED_END_MS)
+        self.assertGreaterEqual(
+            ride_watch.ARRIVED_END_MS - ride_watch.ARRIVED_NEVER_ENDED_MS,
+            5 * 5000)
+
+    def test_the_finding_names_our_close_so_a_report_cannot_confuse_them(self):
+        """The whole reason this went unseen: `endReason: arrived` reads like
+        the app ended the trip. 2026-09-17 ride 1's own report even dates the
+        arrival to 18:34:53, which is SET_ARRIVED 18:29:53 plus our five
+        minutes."""
+        b = self.arrived()
+        self.idle(b, ride_watch.ARRIVED_NEVER_ENDED_MS + 30000)
+        watch = self.run_stream(b)
+        ctx = self.find(watch, "arrived-never-ended")[0]["context"]
+        self.assertEqual(ctx["watcherClosedAtMs"],
+                         ctx["arrivedMs"] + ride_watch.ARRIVED_END_MS)
+        self.assertEqual(ctx["clientAutoEndMs"], 3 * 60 * 1000)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0918),
+                         "%s not present" % REAL_LOG_0918)
+    def test_the_real_ride_2_gap(self):
+        """The ride the row is about, through the real code path."""
+        tmp = tempfile.mkdtemp(prefix="ride-watch-arrived-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = quiet_watch(tmp)
+        with open(REAL_LOG_0918) as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("session") == "mu69yw00-bo98a0":
+                    watch.process(obj)
+        watch.finalize_replay()
+        hits = self.find(watch, "arrived-never-ended")
+        self.assertEqual([h["time"] for h in hits], ["21:46:20"])
+        self.assertFalse(hits[0]["context"]["positionFixesStillArriving"])
+
+
+class TestRealBugCountReadsTheTriageTable(RuleTestCase):
+    """18.5: the verdicts were in a table and the gate counted one.
+
+    2026-09-17 ride 1's report carries three `| n | time | source |
+    **real-bug** (...) | ... |` rows and no verdict in any heading, so the
+    heading scan found 0, the arrow scan found 0, and the fallback returned 1 —
+    which is the number the 18:44:09 page gave the rider.
+    """
+
+    TABLE = (
+        "# Ride report\n\n"
+        "## Triage\n\n"
+        "| # | When | Source | Verdict | What decided it |\n"
+        "|---|---|---|---|---|\n"
+        "| 1 | 17:57:39 | rider note | **real-bug** (UX) | See §1. |\n"
+        "| 2 | 17:59:24 | daemon aboard-swap | **watcher-false-positive** |"
+        " See §2. |\n"
+        "| 3 | 18:28:04 | daemon | **real-bug** (rule correct) | See §3. |\n"
+        "| 4 | 18:26:55 | thread observation | **real-bug** (same cause) |"
+        " See §4. |\n")
+
+    def setUp(self):
+        super(TestRealBugCountReadsTheTriageTable, self).setUp()
+        self.watch = quiet_watch(self.tmp)
+        self.report = os.path.join(self.tmp, "report.md")
+
+    def count(self, text):
+        with open(self.report, "w") as f:
+            f.write(text)
+        return self.watch._report_real_bugs(self.report)
+
+    def test_a_triage_table_is_counted(self):
+        """Fails on master: the answer there is 1."""
+        self.assertEqual(self.count(self.TABLE), 3)
+
+    def test_a_prose_cell_does_not_vote(self):
+        """The "what decided it" column mentions the verdict of a row already
+        open elsewhere; only a cell the verdict STARTS is a verdict.
+
+        Asserted on the scan and on the count together, because the count has
+        a floor: three rows that merely MENTION the phrase must come back as
+        the fallback's 1, never as 3.
+        """
+        row = ("| 1 | **app-behaved-correctly** | already a real-bug on 17.9,"
+               " so not counted again |")
+        self.assertFalse(self.watch._is_real_bug_table_row(row))
+        text = ("# r\n\n| # | Verdict | What decided it |\n|---|---|---|\n"
+                + "\n".join([row] * 3) + "\n")
+        self.assertEqual(self.count(text), 1)
+
+    def test_a_row_is_counted_once_however_many_cells_match(self):
+        text = ("# r\n\n| # | Verdict | Class |\n|---|---|---|\n"
+                "| 1 | **real-bug** | real-bug (UX) |\n")
+        self.assertEqual(self.count(text), 1)
+
+    def test_the_separator_row_is_not_a_verdict(self):
+        self.assertEqual(self.count("# r\n\n|---|---|---|\n"), 0)
+
+    def test_headings_still_win_when_they_carry_the_verdicts(self):
+        """The 09-15 dialect is untouched, and a report carrying its verdicts
+        in BOTH places is not counted twice."""
+        text = ("# r\n\n## 1. x — **real-bug**\n## 2. y — **real-bug**\n\n"
+                "| # | Verdict |\n|---|---|\n| 1 | **real-bug** |\n")
+        self.assertEqual(self.count(text), 2)
+
+    def test_the_whole_file_fallback_is_untouched(self):
+        """The failure this gate must never have is judging an odd layout as
+        'nothing to promote'."""
+        self.assertEqual(self.count("# r\n\nthis was a real bug\n"), 1)
+        self.assertEqual(self.count("# r\n\nnothing to see\n"), 0)
+
+    @unittest.skipUnless(
+        os.path.exists(os.path.join(
+            os.path.expanduser("~"), "obsidian-vault", "Claude", "ride-watch",
+            "2026-09-17-ekv1fl.md")),
+        "the 2026-09-17 ride 1 report is not present")
+    def test_the_real_report_counts_three(self):
+        path = os.path.join(os.path.expanduser("~"), "obsidian-vault",
+                            "Claude", "ride-watch", "2026-09-17-ekv1fl.md")
+        self.assertEqual(self.watch._report_real_bugs(path), 3)
 
 
 if __name__ == "__main__":

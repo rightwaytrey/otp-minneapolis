@@ -66,12 +66,13 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | --- | --- | --- |
 | `stop-count-collapse` | `stopsRemaining` drops to 1 below 60% of a transit leg | page |
 | `stop-count-increase` | `stopsRemaining` rises with no itinerary swap | warn |
-| `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby, and the new plan is not the same routes arriving at the same time | page |
+| `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby, and the new plan neither keeps the same routes arriving at the same time **nor lands the rider on the trip they are riding** | page |
 | `riding-flip` | `SET_RIDING` tripId changes on the same transit leg | page |
 | `missed-bus-while-riding` | `MISSED_BUS` notification while riding is held | page |
 | `notification-repeat` | the same alert (id stem + title) twice in 5 minutes | page |
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
 | `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip | warn |
+| `position-teleport` | consecutive fixes >150m apart within 2s with **both** accuracies <30m, twice in a rolling minute | warn (page at 5 in a minute) |
 | `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m | warn |
 | `reroute-storm` | more than 3 **`autoApply: true`** `START_REROUTE` in 5 minutes | warn |
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
@@ -82,6 +83,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `wake-lock-denied` | the screen wake lock was refused during a trip (one finding per launch/resume, with the count) | warn |
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
 | `session-churn` | the app re-mounted mid-ride and minted a new session id | warn |
+| `arrived-never-ended` | `SET_ARRIVED` latched and no `STOP_GO_MODE` 4m30s later — the client's own 3-minute auto-end plus slack | warn, once an arrival |
 | `resumed-trip` | a ride that began with no `START_GO_MODE` **anywhere in the stream**, so it has no replay fixture | warn (info when it is the daemon that restarted) |
 | `missed-start` | the ride's `START_GO_MODE` was in the stream and the follower never delivered it; the trip is opened from it rather than adopted | warn |
 | `vehicle-match-never` | a transit leg polled >=30 times and the live matcher never named a vehicle | warn |
@@ -389,6 +391,7 @@ post-ride report covers that):
 | 30 | `aboard-swap` | the on-screen route no longer matches their bus |
 | 28 | `session-restart-while-aboard` | the screen they were navigating by went away under them |
 | 20 | `riding-flip` | board state suspect, but they are on the right vehicle |
+| 12 | `position-teleport` | the phone's own position stream is unusable, so every distance and turn on screen is suspect |
 | 10 | `deviated-streak` | tracking looks off; nothing to do about it |
 
 Rules absent from `PAGE_RANK` get `PAGE_RANK_DEFAULT` (25, mid-pack) so a new
@@ -796,8 +799,18 @@ closing the wrap-up:
   complete the moment the file exists, exactly as before. This is the
   terminating condition that matters most: a clean ride must never hold a
   console open. "Real bug" is counted off the verdict the report prompt makes
-  mandatory (`REAL_BUG_RE` over the section headings, falling back to the whole
-  file), so a report triaged down to *app-behaved-correctly* settles at once;
+  mandatory (`REAL_BUG_RE` over the section headings **and over the triage
+  table's verdict column**, falling back to the whole file), so a report
+  triaged down to *app-behaved-correctly* settles at once. The table half is
+  backlog 18.5: on 2026-09-17 ride 1 put all three of its verdicts in the
+  triage table and none in a heading, so the scan found 0 and the whole-file
+  fallback returned 1 — the gate held the console correctly, but the page told
+  the rider "1 real bug(s)" about a report naming three. A cell counts only
+  when the verdict *starts* it (`**real-bug** (UX)` yes, a "what decided it"
+  cell that merely mentions the phrase no), the larger of the two scans wins
+  so a report carrying its verdicts in both places is not counted twice, and
+  the whole-file fallback is untouched — an odd layout must never be judged as
+  "nothing to promote";
 * **`PROMOTION_DEADLINE_MS` (8 min) after the report landed** and still nothing
   — reap anyway, and page **once**: *"Report written, backlog not updated — N
   real bug(s)."* Eight minutes rather than two is long enough to read both plan
@@ -1047,7 +1060,8 @@ somewhere else. It prints every finding with its local time and the pushes that
 Thresholds are module constants at the top of `ride_watch.py` —
 `STOP_COLLAPSE_MAX_PROGRESS`, `DEVIATED_STREAK_MS`, `GPS_GAP_MS`,
 `REROUTE_STORM_COUNT`, `DISTANCE_SPIKE_FAR_M`, `NOTIFICATION_REPEAT_COUNT`,
-`MOTION_PROGRESS_PCT`, `MOTION_DISPLACEMENT_M`, `MAX_PAGES_PER_TRIP`,
+`MOTION_PROGRESS_PCT`, `MOTION_DISPLACEMENT_M`, `TELEPORT_MIN_M`,
+`TELEPORT_WARN_COUNT`, `ARRIVED_NEVER_ENDED_MS`, `MAX_PAGES_PER_TRIP`,
 `PUSH_MIN_INTERVAL_MS`, `PAGE_COALESCE_MS`, `PAGE_RANK`, and so on.
 
 The honest workflow for changing one: replay a real ride before and after,
@@ -1077,7 +1091,7 @@ states the convention outright.
 python3 ride-watch/test_ride_watch.py
 ```
 
-500 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
+535 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
 (both the firing case and the case that must stay quiet), the state machine, and
 page ranking (supersession inside the window, tie-breaking, flush on a quiet log,
 flush on trip end).

@@ -233,6 +233,34 @@ SESSION_TIMEOUT_MS = 15 * 60 * 1000        # trip ends after this much silence
 # Five minutes, not one: the rider typed their note at the destination three
 # minutes after arrival that evening, and it belongs to the ride.
 ARRIVED_END_MS = 5 * 60 * 1000
+# arrived-never-ended (18.3b). The close above is a WATCHER close, and it has
+# been quietly covering for the client: on 2026-09-17 ride `mu69yw00-bo98a0`
+# SET_ARRIVED landed at 21:41:31 and the app's own STOP_GO_MODE did not arrive
+# until 21:56:03 — 14m32s — yet the ride's report says `endReason: arrived`,
+# because this daemon had already closed the trip itself at 21:46:31 and
+# nothing anywhere said the client had failed to. The masking is the reason the
+# gap went unseen for the whole of Tier 13.
+#
+# The client's own dwell timer is AUTO_END_AFTER_ARRIVAL_MS = 3 min
+# (otprr lib/actions/go-mode.ts, the arrived branch of handlePositionUpdate).
+# Three minutes plus ninety seconds of slack, which still leaves half a minute
+# — six live ticks — before ARRIVED_END_MS takes the trip away. The ordering is
+# asserted, not assumed: see the test that reads both constants.
+#
+# The slack is measured, and the measurement is itself the finding. Across
+# every arrival in the 24 day files on disk (08-25..09-18, 12 arrivals), the
+# app's own STOP_GO_MODE landed at 243 s, 289 s, 298 s, 322 s, 359 s, 468 s,
+# 873 s, 2951 s, 5308 s and 10451 s after SET_ARRIVED, and twice never at all
+# (08-31 18:52, the double-mount). NOT ONE came in under the 180 s the client
+# gives itself. There is no clean gap to put a threshold in, so it goes just
+# above the single fastest close on record: 270 s excuses 09-15's 243 s (a
+# timer that is merely a tick or two late — tracking drops to a 30 s interval
+# at arrival, so "late" is cheap) and reports the other ten. A rule that fires
+# on ten rides in twelve would normally be a rule with no discriminating power;
+# here it is the honest count, this is a `warn` and costs the rider nothing,
+# and when 13.5 lands the rule should go quiet — which makes it that fix's
+# regression test.
+ARRIVED_NEVER_ENDED_MS = 270 * 1000
 # One ride, two session ids. The app re-mounted at 18:52:55 and minted
 # `mthw8o2w-i8z1i6` 41 s after `mthw7svy-s4msqc` — same phone, same itinerary,
 # same frozen leg, seconds apart. The daemon read them as two rides: two
@@ -315,6 +343,57 @@ NOTIFICATION_REPEAT_COUNT = 2              # fires on the 2nd
 MOTION_PROGRESS_PCT = 5.0                  # percentage points gained
 MOTION_DISPLACEMENT_M = 15.0               # ...while the fix stayed this close
 MOTION_COOLDOWN_MS = 5 * 60 * 1000
+# position-teleport (18.3a). progress-without-motion measures the MATCH, which
+# is downstream of the app's continuity gate and therefore lags the input it
+# ought to be reporting: on 2026-09-17 ride `mu63yfrb-ekv1fl` the position
+# stream began flipping between two tracks at 18:25:40 and the only rule that
+# ever noticed fired at 18:28:04 — 2m24s later, about the frozen progress bar
+# the gate produced while absorbing the jumps. Nothing in this file watched the
+# position stream itself. This rule does.
+#
+# A "teleport" is a pair of CONSECUTIVE fixes that cannot both be true: far
+# apart, moments apart, and both claiming good accuracy. All three clauses
+# carry weight and the thresholds are measured, not guessed — the numbers below
+# are from a scan of every UPDATE_POSITION pair in all 24 day files on disk
+# (08-25..09-18, ~60k fixes):
+#
+#   >150 m  the fastest thing the rider rides is the Orange Line at ~30 m/s, so
+#           150 m in a second is five times any real speed, and the smallest
+#           jump in the 09-17 cluster was 196.6 m. Below 150 m the scan starts
+#           picking up ordinary freeway fixes: the same ride has jumps of 126 m
+#           (17:50:22), 107 m (17:51:39) and 133 m (18:23:04) that the ride
+#           report listed but which are not separable from a fast bus.
+#   <=2 s   the fixes arrive at 1 Hz; two seconds allows one dropped tick and
+#           no more. A longer gap is a GPS gap, which gps-gap already covers.
+#   <30 m   both ends, because the whole point is that neither fix admits to
+#           being uncertain. The 09-17 cluster's accuracies are 9-22 m.
+#
+# One jump is not a finding: 08-28 17:20:35 (184 m), 09-01 10:39:52 (320 m) and
+# 09-04 15:44:56 (179 m) are each a single isolated pair in a whole ride, and a
+# lone outlier is a GPS artefact the matcher is built to absorb. What is
+# diagnostic is the RATE — two tracks alternating means a jump every few
+# seconds — so the rule counts jumps in a rolling minute.
+TELEPORT_MIN_M = 150.0
+TELEPORT_MAX_GAP_MS = 2 * 1000
+TELEPORT_MAX_ACCURACY_M = 30.0
+TELEPORT_WINDOW_MS = 60 * 1000
+# Measured on the same scan: a rolling minute reaches 2 on exactly three
+# recorded rides, all three of which are the two-stream defect (09-15
+# `mu2rh9og-fw6prf` 09:36:55, 09-17 `mu63yfrb-ekv1fl` 18:25:48, 09-17 evening
+# `mu69yw00-bo98a0` 21:01:04), and reaches 5 on none of them: the worst minute
+# on record is 4 (ride 1, at 18:26:17). So `warn` at 2 names the cause of
+# 09-17's deviation replan 67 s before it happened, and `page` at 5 is
+# deliberately above everything ever recorded — a phone whose position stream
+# is unusable five times a minute is a different event from the one measured
+# here, and the rider's two interrupts are not spent on a diagnosis they cannot
+# act on. If 5 ever fires, it is new.
+TELEPORT_WARN_COUNT = 2
+TELEPORT_PAGE_COUNT = 5
+# One finding per episode, not one per jump: the 09-17 cluster is ten jumps in
+# 2m06s and is one defect. The cooldown is the same 5 minutes
+# progress-without-motion uses, and an escalation to `page` is allowed through
+# it once — a worsening stream is news even mid-cooldown.
+TELEPORT_COOLDOWN_MS = 5 * 60 * 1000
 # replan-not-converging (8/28 afternoon). The destination was inside the State
 # Fairgrounds, where the street graph stops at the fence. The app re-planned
 # into the venue interior for 32 minutes, never got inside 427 m, and told the
@@ -469,9 +548,35 @@ ONBOARD_ANCHOR_AHEAD_MARGIN_M = 250.0
 # boarded, which is the designed splice. Note what is deliberately NOT
 # compared: the bus tripId changed (1:1346556 -> 1:1346665), because boarding
 # an earlier bus of the same route is the whole point of `boarded-earlier`. The
-# ride report read that as "the same Orange Line trip"; it was not, and a
-# tripId test would have left this false positive standing. Route ids plus
-# arrival time is the test.
+# ride report read that as "the same Orange Line trip"; it was not, and
+# comparing the OLD plan's tripId with the NEW plan's would have left this
+# false positive standing. Route ids plus arrival time is one test.
+#
+# (a2) It is not the only one, and on its own (a) fails OPEN. 2026-09-17
+# 17:59:24, ride `mu63yfrb-ekv1fl`: SET_RIDING trip 1:1346874 at 17:59:18,
+# START_REROUTE `boarded-earlier` autoApply: true six seconds later, and a plan
+#   BUS 1:904 trip 1:1346874 (98th St -> Lake St) > BICYCLE
+# — the same route 1:904 and the same alight stop as the plan going out, but
+# the arrival moved 18:35:19 -> 18:33:30, an improvement of 1m49s. (a) demands
+# the arrival be unchanged, so it let this through and the rule paged — and
+# that page was the ride's ONLY page (`pagesSent: 1`), spent on the app doing
+# exactly the right thing.
+#
+# So the second exemption, and it is the stronger of the two: the new plan's
+# transit leg carries the tripId the rider is ON. A replan that lands the rider
+# on the vehicle they are physically sitting in cannot be "the on-screen route
+# no longer matches your bus", whatever it does to the arrival time.
+#
+# The comparison that matters is riding.tripId against the NEW plan, never old
+# plan against new plan — which is also why it covers 2026-09-15 15:36:33, the
+# first sighting, measured in the day file: SET_RIDING at 15:36:27 carried trip
+# 1:1346665 (the earlier bus the rider had just boarded) and the incoming plan
+# was BUS 1:904 trip 1:1346665. One test, both sightings. (a) is kept as well
+# rather than replaced, because the two catch different things: (a) covers a
+# swap that changes no plan at all while there is no transit leg to match the
+# rider's vehicle against (2026-08-31 17:38:11, a byte-identical replacement),
+# and (a2) covers a swap that improves the plan while keeping the rider's
+# vehicle. Either one is enough to excuse the swap.
 #
 # (b) The onboard picker's commit emits no reroute marker at all, so a rider
 # tap read as automatic. 15:43:28.647 CLEAR_ONBOARD -> 15:43:28.650
@@ -635,6 +740,10 @@ PLAN_PATHS = (
 # (`### <time> — <rule> (<severity>) -> **real-bug**`), so headings are read
 # first and the whole file only if no heading carries a verdict at all.
 REAL_BUG_RE = re.compile(r"real[-\s]?bug", re.I)
+# The same verdict, but anchored at the start of a triage-table cell so a
+# "what decided it" cell that merely mentions the phrase does not vote
+# (18.5). Leading "(" and Markdown bold/italic markers are skipped.
+VERDICT_CELL_RE = re.compile(r"^[(\[]?[*_]*\s*real[-\s]?bug\b", re.I)
 
 # console.error lines that are known-inert and cost a findings slot every ride.
 # Substring match against the first console argument, deliberately narrow.
@@ -993,6 +1102,16 @@ PAGE_RANK = {
     #                               route being wrong, and above riding-flip.
     "session-restart-while-aboard": 28,
     "riding-flip": 20,
+    # position-teleport  the phone's own position stream is unusable, so every
+    #                    distance and turn on screen is suspect. Above
+    #                    deviated-streak because it explains what the rider is
+    #                    looking at (a turn card that just changed under them)
+    #                    rather than only reporting that tracking looks off,
+    #                    and below riding-flip because there is still nothing
+    #                    to do about it but distrust the screen. It takes
+    #                    TELEPORT_PAGE_COUNT jumps in a minute to get here,
+    #                    which no recorded ride has ever reached.
+    "position-teleport": 12,
     "deviated-streak": 10,
 }
 PAGE_RANK_DEFAULT = 25
@@ -1346,6 +1465,15 @@ class Trip:
         self.gps_gap_started_ms = None            # last_pos_ms when the gap opened
         self.arrived_ms = None                    # SET_ARRIVED; the trip is over
         self.arrived_leg = None                   # leg index when it latched
+        self.arrived_source = None                # which evidence latched it
+        self.arrived_never_ended_fired = False    # 18.3b, once per arrival
+        # The last position fix with its metadata: (tMs, lat, lon, accuracy).
+        # last_fix above is the coordinate alone and is reset by rules that do
+        # not care when it arrived; position-teleport needs the pair.
+        self.last_fix_meta = None
+        self.teleports = collections.deque()      # ms of each jump, pruned
+        self.teleport_fired_ms = 0
+        self.teleport_paged = False
         self.notification_times = collections.defaultdict(collections.deque)
         self.notification_repeat_last = {}        # key -> ms of last finding
         self.motion_anchor = None                 # where progress was last real
@@ -1911,7 +2039,7 @@ class RideWatch:
                 if self.now_ms() - t < GPS_GAP_MS:
                     trip.gps_gap_open = False
                     trip.gps_gap_started_ms = None
-                self._on_position(trip, obj.get("payload") or {})
+                self._on_position(trip, t, obj.get("payload") or {})
             elif typ == "SET_ARRIVED":
                 # The client now latches arrival (otp-react-redux
                 # progress-calculator hasArrivedAtDestination) and dispatches
@@ -2787,9 +2915,73 @@ class RideWatch:
             return
         trip.arrived_ms = t
         trip.arrived_leg = (trip.progress or {}).get("currentLegIndex")
+        trip.arrived_source = source
+        trip.arrived_never_ended_fired = False
         self.log.info("arrived (%s): session=%s" % (source, trip.session))
         self._thread_event(trip, t, "arrived at destination")
         self._mark_dirty()
+
+    def _rule_arrived_never_ended(self, trip, t, ending=None):
+        """The rider arrived and the app never closed the trip. (18.3b)
+
+        The client auto-ends AUTO_END_AFTER_ARRIVAL_MS (3 min) after arrival.
+        When it does not, this daemon closes the trip itself at ARRIVED_END_MS
+        (5 min) and writes `endReason: arrived` — which reads exactly like the
+        app having ended it. That is what hid this for a month: on 2026-09-17
+        the app's STOP_GO_MODE came at 21:56:03, 14m32s after SET_ARRIVED at
+        21:41:31, and the ride's own report says the ride ended on arrival.
+
+        So the rule runs from TWO places and is latched to fire once:
+
+        - check_timers, ABOVE the ARRIVED_END_MS close and at a threshold
+          thirty seconds — six live ticks — below it, so our own close cannot
+          pre-empt it. This is the path that fires on a live ride.
+        - _end_trip, for the tail cases the timer cannot reach: a replay whose
+          clock only advances on events, a stream that falls silent, a trip
+          closed by the 15-minute timeout. Reaching _end_trip with an arrival
+          latched and a reason that is not `stop` IS the proof — STOP_GO_MODE
+          is the only thing that ends a trip with reason `stop`.
+
+        The finding says whether fixes are still arriving, because the two
+        cases have different fixes and only the stream can tell them apart:
+        no fixes means the client's dwell timer is starved (it lives in the
+        arrived branch of handlePositionUpdate and is therefore tick-driven,
+        which is 13.5); fixes still arriving means the timer is running and
+        failing, which is a different bug in a different place.
+        """
+        if trip.arrived_ms is None or trip.arrived_never_ended_fired:
+            return
+        if ending == "stop":
+            return                      # STOP_GO_MODE: the client did close it
+        open_ms = t - trip.arrived_ms
+        if open_ms < ARRIVED_NEVER_ENDED_MS:
+            return
+        trip.arrived_never_ended_fired = True
+        since_fix_ms = t - trip.last_pos_ms
+        # "Still arriving" means inside the gps-gap threshold: a fix a minute
+        # old is not a stream, it is the last thing the phone said.
+        fixes_live = since_fix_ms <= GPS_GAP_MS
+        self._finding(
+            trip, t, "arrived-never-ended", "warn",
+            "arrived %s and the app never ended the trip (%dm%02ds open;"
+            " %s)" % (fmt_hms(trip.arrived_ms), open_ms // 60000,
+                      (open_ms // 1000) % 60,
+                      ("position fixes still arriving, last %ds ago"
+                       % (since_fix_ms // 1000)) if fixes_live
+                      else ("no position fix for %ds — the client's dwell"
+                            " timer is tick-driven and has nothing to tick"
+                            " on (13.5)" % (since_fix_ms // 1000))),
+            {"arrivedMs": trip.arrived_ms,
+             "arrivedSource": trip.arrived_source,
+             "openMs": open_ms,
+             "thresholdMs": ARRIVED_NEVER_ENDED_MS,
+             "clientAutoEndMs": 3 * 60 * 1000,   # otprr AUTO_END_AFTER_ARRIVAL_MS
+             "lastFixMs": trip.last_pos_ms,
+             "msSinceLastFix": since_fix_ms,
+             "positionFixesStillArriving": fixes_live,
+             # Named so a report cannot mistake our close for the app's.
+             "watcherClosedAtMs": (trip.arrived_ms + ARRIVED_END_MS),
+             "endedBy": ending})
 
     def _clear_arrival(self, trip, t, why):
         """The ride demonstrably resumed after we decided it had finished.
@@ -2805,6 +2997,8 @@ class RideWatch:
         self.log.info("arrival cleared (%s): session=%s" % (why, trip.session))
         trip.arrived_ms = None
         trip.arrived_leg = None
+        trip.arrived_source = None
+        trip.arrived_never_ended_fired = False
         self._thread_event(trip, t, "ride resumed after arrival (%s)" % why)
         self._mark_dirty()
 
@@ -3381,6 +3575,11 @@ class RideWatch:
         # answered once the ride is over, and the report request quotes
         # len(trip.findings).
         self._rule_vehicle_match_never(trip, t)
+        # ...and the arrival that the app never closed. Reaching here with an
+        # arrival latched and a reason other than `stop` is itself the evidence
+        # (18.3b); in replay this is usually the path that fires, because the
+        # clock only advances on events.
+        self._rule_arrived_never_ended(trip, t, ending=reason)
         # ...and a refusal burst still inside its quiet window: the ride ending
         # is the end of that launch by definition.
         self._flush_wake_lock(trip, t, force=True)
@@ -3656,14 +3855,32 @@ class RideWatch:
     def _report_real_bugs(self, path):
         """How many findings this report calls real bugs. 0 = nothing to promote.
 
-        Section headings first, then the whole file if no heading carries a
-        verdict at all. Both 09-15 reports put it in a heading — `## 1. Alight
-        ranking is scored on a phantom arrival time — REAL BUG` and `## 1.
-        "Just viewing switched..." — **real-bug**` — as does the prompt's own
-        per-finding template. The whole-file fallback exists so a report with
-        an unexpected layout is judged as having something to promote rather
-        than nothing; the failure this gate must never have is letting a real
-        report out of the window silently.
+        Section headings and the triage table, then the whole file if neither
+        carries a verdict at all. Both 09-15 reports put it in a heading — `##
+        1. Alight ranking is scored on a phantom arrival time — REAL BUG` and
+        `## 1. "Just viewing switched..." — **real-bug**` — as does the
+        prompt's own per-finding template.
+
+        The table scan is 18.5. `report-prompt.md` also asks for a triage
+        table, and 2026-09-17's ride 1 put its verdicts ONLY there — three rows
+        of `| 3 | 18:28:04 | daemon ... | **real-bug** (rule correct) | ... |`
+        with no verdict in any heading. The heading scan found 0, the arrow
+        scan found 0, and the fallback returned 1: the 18:44:09 page told the
+        rider "1 real bug(s)" about a report naming three. The gate itself
+        behaved (any non-zero count holds the console), but the count is the
+        only number the rider is given and it was a third of the truth.
+
+        A cell counts only when the verdict STARTS it, bold markers and a
+        trailing qualifier allowed — `**real-bug** (UX)` yes, `... already open
+        as a real-bug on 17.9` no. That is what keeps the "what decided it"
+        column from voting, and the row is counted once however many of its
+        cells match. The larger of the two scans wins rather than their sum, so
+        a report that carries its verdicts in BOTH places is not counted twice.
+
+        The whole-file fallback stays exactly as it was: a report with an
+        unexpected layout must be judged as having something to promote rather
+        than nothing, because the failure this gate must never have is letting
+        a real report out of the window silently.
         """
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
@@ -3674,14 +3891,29 @@ class RideWatch:
             return 0
         heads = [ln for ln in lines if ln.lstrip().startswith("#")]
         n = sum(1 for ln in heads if REAL_BUG_RE.search(ln))
+        n = max(n, sum(1 for ln in lines if self._is_real_bug_table_row(ln)))
         if n:
             return n
-        # No heading names a verdict. Count the arrow form the template uses
-        # anywhere, then fall back to the bare phrase.
+        # Neither headings nor the table name a verdict. Count the arrow form
+        # the template uses anywhere, then fall back to the bare phrase.
         arrows = [ln for ln in lines if "->" in ln and REAL_BUG_RE.search(ln)]
         if arrows:
             return len(arrows)
         return 1 if any(REAL_BUG_RE.search(ln) for ln in lines) else 0
+
+    @staticmethod
+    def _is_real_bug_table_row(line):
+        """One Markdown table row whose verdict cell says real-bug. (18.5)
+
+        Three pipes minimum, so the `|---|---|` separator and a one-cell line
+        cannot qualify, and the match must begin the cell — see
+        _report_real_bugs for why.
+        """
+        row = line.strip()
+        if not row.startswith("|") or row.count("|") < 3:
+            return False
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        return any(VERDICT_CELL_RE.match(c) for c in cells)
 
     def _settle_promotion(self, entry, now):
         """Is this wrap-up over? True when the deadline entry can be dropped.
@@ -3854,6 +4086,11 @@ class RideWatch:
             # never did, and the ride got no report at all. Ended at `now`
             # rather than at the arrival five minutes back so a note typed at
             # the destination is still inside the ride it belongs to.
+            # Before the close below, and at a lower threshold, on purpose:
+            # our own close is what has been masking the client's failure to
+            # close, so it must not also be what suppresses the finding about
+            # it (18.3b).
+            self._rule_arrived_never_ended(trip, now)
             if (trip.arrived_ms is not None
                     and now - trip.arrived_ms > ARRIVED_END_MS):
                 self._end_trip(trip, now, "arrived")
@@ -4015,7 +4252,7 @@ class RideWatch:
 
         self._check_progress_without_motion(trip, t, p)
 
-    def _on_position(self, trip, p):
+    def _on_position(self, trip, t, p):
         """Remember where the rider actually is.
 
         The real payload is `{coords: {latitude, longitude, accuracy, …},
@@ -4030,6 +4267,8 @@ class RideWatch:
             return
         lat, lon = coords.get("latitude"), coords.get("longitude")
         if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            self._check_position_teleport(trip, t, lat, lon,
+                                          coords.get("accuracy"))
             trip.last_fix = (lat, lon)
             # Stall anchor: the oldest fix the rider has not meaningfully left.
             anchor = trip.stall_anchor
@@ -4038,6 +4277,80 @@ class RideWatch:
                 trip.fixes_since_anchor = 1
             else:
                 trip.fixes_since_anchor += 1
+
+    def _check_position_teleport(self, trip, t, lat, lon, accuracy):
+        """Two consecutive fixes that cannot both be true. (18.3a)
+
+        Called BEFORE trip.last_fix is overwritten, so the pair being judged is
+        the pair the app itself saw back to back.
+
+        What this is looking for is not a bad fix — the matcher absorbs those —
+        but a position STREAM that is not one stream. On 2026-09-17 ride 1 the
+        fixes alternated between two tracks 200-310 m apart, each advancing at
+        bike speed and each stopping at the same red light; whichever one
+        arrived is what the deviation check, the replan, the progress bar and
+        the turn card were computed off. The rate is the signal, so the finding
+        matures on the count in a rolling minute, not on a single jump.
+
+        Deliberately NOT gated on the rider being on a particular leg or mode:
+        the defect is in the phone, and it fired on a bike leg on 09-17 and on
+        a bus leg on 09-15.
+        """
+        prev = trip.last_fix_meta
+        trip.last_fix_meta = (t, lat, lon, accuracy)
+        if prev is None:
+            return
+        gap = t - prev[0]
+        if gap < 0 or gap > TELEPORT_MAX_GAP_MS:
+            return
+        # Both ends must claim to be sure of themselves. A missing accuracy is
+        # not a claim, so it is judged as unusable rather than as good: the
+        # rule fails closed, which is right for one whose whole case rests on
+        # "neither fix admits to being uncertain".
+        for acc in (prev[3], accuracy):
+            if not isinstance(acc, (int, float)) or acc >= TELEPORT_MAX_ACCURACY_M:
+                return
+        meters = meters_between((prev[1], prev[2]), (lat, lon))
+        if meters <= TELEPORT_MIN_M:
+            return
+        trip.teleports.append((t, meters, gap, prev[3], accuracy))
+        while trip.teleports and t - trip.teleports[0][0] > TELEPORT_WINDOW_MS:
+            trip.teleports.popleft()
+        n = len(trip.teleports)
+        if n < TELEPORT_WARN_COUNT:
+            return
+        page = n >= TELEPORT_PAGE_COUNT
+        # The cooldown holds a second warn about the same episode, but never
+        # holds the escalation: a stream that has got worse since the warn is
+        # news, and it gets through once.
+        if trip.teleport_fired_ms and \
+                t - trip.teleport_fired_ms <= TELEPORT_COOLDOWN_MS and \
+                not (page and not trip.teleport_paged):
+            return
+        trip.teleport_fired_ms = t
+        biggest = max(trip.teleports, key=lambda j: j[1])
+        summary = ("position jumped %.0fm in %.1fs, %d times in the last"
+                   " minute (accuracy %.0f/%.0fm — both fixes trusted)"
+                   % (biggest[1], biggest[2] / 1000.0, n,
+                      biggest[3], biggest[4]))
+        context = {"jumps": [{"tMs": j[0], "meters": round(j[1], 1),
+                              "gapMs": j[2],
+                              "accuracyM": [round(j[3], 1), round(j[4], 1)]}
+                             for j in trip.teleports],
+                   "countInWindow": n,
+                   "windowMs": TELEPORT_WINDOW_MS,
+                   "minMeters": TELEPORT_MIN_M,
+                   "maxGapMs": TELEPORT_MAX_GAP_MS,
+                   "maxAccuracyM": TELEPORT_MAX_ACCURACY_M}
+        if page:
+            trip.teleport_paged = True
+            self._finding(
+                trip, t, "position-teleport", "page", summary, context,
+                push_body=("Position tracking is jumping %d times a minute."
+                           " Distances and turns on screen may be wrong."
+                           % n))
+        else:
+            self._finding(trip, t, "position-teleport", "warn", summary, context)
 
     def _check_progress_without_motion(self, trip, t, p):
         """Leg progress advancing faster than the rider physically moved.
@@ -4761,6 +5074,45 @@ class RideWatch:
             return False
         return int(old_end) == int(new_end)
 
+    @staticmethod
+    def _swap_lands_on_the_ridden_trip(trip, new_summary):
+        """Does the incoming plan put the rider on the trip they are ON? (17.9a2)
+
+        The stronger half of the boarded-earlier exemption, and the one that
+        needs no arrival-time comparison: if a transit leg of the new plan
+        carries `riding.tripId`, the app has replanned around the vehicle the
+        rider is physically sitting in. Improving the arrival is what that
+        replan is FOR, so an "arrival unchanged" test fails open on it — which
+        is exactly what happened on 2026-09-17 17:59:24.
+
+        Any transit leg, not just leg 0: the daemon should not care whether the
+        splice made the ridden trip the first leg or left an access leg in
+        front of it, only that the plan still contains the rider's vehicle.
+
+        Fails closed on a summarized payload and on a plan with no tripIds:
+        with nothing to compare, the swap is judged as before.
+
+        It trusts `riding.tripId`, which the client is known to carry stale
+        across a leg change (2026-08-31 17:35:57: TRANSITION_LEG 2 and
+        SET_RIDING still saying trip 1:1268645 while the leg's route went
+        1:904 -> 1:539 -> 1:546). That costs nothing here, because the plan
+        coming in carries the same stale id: the app is replanning around the
+        vehicle it believes the rider is on, which is the only thing this rule
+        can be asked about. The stale id itself is a separate defect.
+        """
+        riding = trip.riding or {}
+        trip_id = riding.get("tripId")
+        if not trip_id or not new_summary:
+            return False
+        legs = new_summary.get("legs")
+        if not isinstance(legs, list):
+            return False
+        for leg in legs:
+            if isinstance(leg, dict) and leg.get("transit") \
+                    and leg.get("tripId") == trip_id:
+                return True
+        return False
+
     def _rule_aboard_swap(self, trip, t, prev_summary=None, new_summary=None):
         if trip.riding is None:
             return
@@ -4776,6 +5128,16 @@ class RideWatch:
                    " > ".join(str(r) for r in
                               self._transit_route_signature(new_summary)),
                    fmt_hms(new_summary.get("endTime"))))
+            return
+        # ...and a swap that lands the rider on the trip they are already
+        # riding is the same splice with a better arrival (17.9a2). Checked
+        # second because it is the one that cost 2026-09-17 its only page.
+        if self._swap_lands_on_the_ridden_trip(trip, new_summary):
+            self.log.info(
+                "itinerary swap #%d kept the rider on trip %s (arrival %s):"
+                " not an aboard-swap"
+                % (trip.swap_seq, trip.riding.get("tripId"),
+                   fmt_hms((new_summary or {}).get("endTime"))))
             return
         # Being "aboard" has to mean aboard NOW. The sticky fact alone was the
         # bug: on 8/2 it was still set 53 minutes after the rider got off, so
