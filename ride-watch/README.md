@@ -64,7 +64,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 
 | rule | fires when | severity |
 | --- | --- | --- |
-| `stop-count-collapse` | `stopsRemaining` drops to 1 below 60% of a transit leg | page |
+| `stop-count-collapse` | `stopsRemaining` drops to 1 below 60% of a transit leg **and more than 100 m from the stop the count says was just passed** (the percentage alone when the leg carries no stop coordinates) | page |
 | `stop-count-increase` | `stopsRemaining` rises with no itinerary swap | warn |
 | `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby, and the new plan neither keeps the same routes arriving at the same time **nor lands the rider on the trip they are riding** | page |
 | `riding-flip` | `SET_RIDING` tripId changes on the same transit leg | page |
@@ -73,7 +73,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
 | `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip | warn |
 | `position-teleport` | consecutive fixes >150m apart within 2s with **both** accuracies <30m, twice in a rolling minute | warn (page at 5 in a minute) |
-| `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m | warn |
+| `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m (the anchor's percentage is re-based on an itinerary swap, which changes the denominator and not the rider) | warn |
 | `reroute-storm` | more than 3 **`autoApply: true`** `START_REROUTE` in 5 minutes | warn |
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
 | `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
@@ -84,6 +84,8 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `distance-spike` | `distanceFromRoute` >2000m one tick after <200m | warn |
 | `session-churn` | the app re-mounted mid-ride and minted a new session id | warn |
 | `arrived-never-ended` | `SET_ARRIVED` latched and no `STOP_GO_MODE` 4m30s later — the client's own 3-minute auto-end plus slack | warn, once an arrival |
+| `arrived-far-from-destination` | arrival latched while the same tick's `distanceToDestination` is past the client's own 75 m `ARRIVAL_RADIUS_M` (not on a round trip's outbound pause) | warn, once an arrival |
+| `riding-fact-dropped` | a bare `CLEAR_RIDING` after a `CONFIRM_VEHICLE`, with no `TRANSITION_LEG` or `STOP_GO_MODE` to explain it | warn, once a ride |
 | `resumed-trip` | a ride that began with no `START_GO_MODE` **anywhere in the stream**, so it has no replay fixture | warn (info when it is the daemon that restarted) |
 | `missed-start` | the ride's `START_GO_MODE` was in the stream and the follower never delivered it; the trip is opened from it rather than adopted | warn |
 | `vehicle-match-never` | a transit leg polled >=30 times and the live matcher never named a vehicle | warn |
@@ -94,7 +96,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `onboard-anchor-behind-rider` | the alight candidates are anchored >2 km from the rider's last fix **and a later candidate in the list is nearer** | warn |
 | `same-route-transfer` | two consecutive transit legs, same `routeId`, different `tripId` | warn |
 | `session-restart-while-aboard` | `resumed-session` / `RESUME_GO_MODE` inside a live trip while the riding fact is held | page (warn from the second in a ride) |
-| `note-unverifiable` | a rider note with no rider-gesture record in the previous minute, or one that arrived while a request was hanging on its way to a timeout | warn, once a ride |
+| `note-unverifiable` | a rider note **that claims a control did or did not respond** with no rider-gesture record in the previous minute, or one that arrived while a request was hanging on its way to a timeout | warn, once a ride |
 | `boot-crash` | the app threw before it could run (`boot-error` / `boot-rejection`) | page |
 | `bundle-health` | the 5s health gate withheld its verdict, so the bundle rolls back | page (info when confirmed) |
 
@@ -1060,7 +1062,8 @@ somewhere else. It prints every finding with its local time and the pushes that
 Thresholds are module constants at the top of `ride_watch.py` —
 `STOP_COLLAPSE_MAX_PROGRESS`, `DEVIATED_STREAK_MS`, `GPS_GAP_MS`,
 `REROUTE_STORM_COUNT`, `DISTANCE_SPIKE_FAR_M`, `NOTIFICATION_REPEAT_COUNT`,
-`MOTION_PROGRESS_PCT`, `MOTION_DISPLACEMENT_M`, `TELEPORT_MIN_M`,
+`MOTION_PROGRESS_PCT`, `MOTION_DISPLACEMENT_M`, `STOP_COLLAPSE_NEAR_STOP_M`,
+`ARRIVAL_RADIUS_M`, `TELEPORT_MIN_M`,
 `TELEPORT_WARN_COUNT`, `ARRIVED_NEVER_ENDED_MS`, `MAX_PAGES_PER_TRIP`,
 `PUSH_MIN_INTERVAL_MS`, `PAGE_COALESCE_MS`, `PAGE_RANK`, and so on.
 
@@ -1091,7 +1094,7 @@ states the convention outright.
 python3 ride-watch/test_ride_watch.py
 ```
 
-535 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
+563 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
 (both the firing case and the case that must stay quiet), the state machine, and
 page ranking (supersession inside the window, tie-breaking, flush on a quiet log,
 flush on trip end).
@@ -1119,6 +1122,19 @@ data does not work:
   while `replan-not-converging` correctly stays out of it; and the
   `progress-without-motion` at **09:35:12** carries the span it released —
   45 ticks, 44 s, 74 m.
+- `TestProgressWithoutMotionAcrossASwap`, `TestStopCollapseReadsTheLeg`,
+  `TestNoteUnverifiableIsScopedToControlClaims`,
+  `TestArrivedFarFromDestination` and `TestRidingFactDropped` (9/20, 9/21) —
+  the four false positives of those two days are gone and the catches around
+  them are not: the rider's own onboard pick at **12:55:24** is silent while
+  **13:11:41** and **08:49:07** still fire; the 2 -> 1 count at **09:32:47**
+  (31 m from the stop it named) no longer pages while 7/29's 17:28:53 still
+  does; three notes that claimed nothing about a control are silent while
+  9/15's "Clicking does nothing" fires, now carrying `/feedback`; the
+  arrival at **08:54:10** is a warn at 83 m while the 74.2 m and 73.7 m
+  arrivals either side of it are not; and the dropped riding fact at
+  **09:23:42** — and at 9/15 **15:46:22**, twenty seconds before "Why'd you
+  lose my bus??" — is a finding at last.
 
 `TestThreadPushWaitsForThePane` covers 12.4's pusher against a scripted
 `capture-pane`: a ready pane is typed into at once, a **blocked** one never is

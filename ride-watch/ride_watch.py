@@ -261,6 +261,25 @@ ARRIVED_END_MS = 5 * 60 * 1000
 # and when 13.5 lands the rule should go quiet — which makes it that fix's
 # regression test.
 ARRIVED_NEVER_ENDED_MS = 270 * 1000
+# arrived-far-from-destination (21.2, daemon half). The client's own arrival
+# radius, from otprr lib/util/go-mode/progress-calculator.ts ARRIVAL_RADIUS_M.
+# The app grants arrival either inside that radius OR on overallProgress
+# >= 99.5 with only a 120 m veto (ARRIVAL_MAX_DISTANCE_M), and on a long trip
+# the last half-percent of OVERALL progress is the last 80 m of the final leg:
+# 2026-09-21 08:54:10.060 UPDATE_PROGRESS overallProgress 99.527,
+# currentLegProgress 94.21, distanceToDestination 83.26, status completed ->
+# SET_ARRIVED 08:54:10.075 and a "Trip complete" notification, with the rider
+# still 83 m out and 1m26s of walking left (they reached 27.8 m at 08:55:36).
+# Accuracy was 2.8-8.4 m throughout, so this is not GPS.
+#
+# A warn, never a page: the rider is standing there looking at the screen that
+# just told them they had arrived, and a buzz saying the same thing 83 m early
+# helps nobody. The number is what the report needs.
+#
+# The threshold discriminates on the recorded days: the other two arrivals on
+# 09-20 and 09-21 latched at 74.2 m and 73.7 m — the 75 m branch working
+# correctly — and neither fires.
+ARRIVAL_RADIUS_M = 75.0
 # One ride, two session ids. The app re-mounted at 18:52:55 and minted
 # `mthw8o2w-i8z1i6` 41 s after `mthw7svy-s4msqc` — same phone, same itinerary,
 # same frozen leg, seconds apart. The daemon read them as two rides: two
@@ -272,7 +291,25 @@ ARRIVED_NEVER_ENDED_MS = 270 * 1000
 # continuation can come through is adoption, which is where these gates sit.
 CONTINUATION_GAP_MS = 120 * 1000           # since the older trip's last event
 CONTINUATION_PROGRESS_PCT = 2.0            # same leg, within this much of it
-STOP_COLLAPSE_MAX_PROGRESS = 60.0          # percent
+# stop-count-collapse. The percentage was always a proxy for "the count says
+# the rider is nearly there and the leg says they are not", and it is only a
+# proxy: it assumes the second-to-last stop sits past STOP_COLLAPSE_MAX_PROGRESS
+# of the leg. On the Orange Line it does not. 2026-09-21 09:32:47 the count
+# went 2 -> 1 at 41 % of a 7885 m leg and the daemon spent the ride's only page
+# on it — the rider was 31 m from Knox Ave & American Blvd Station, the leg's
+# penultimate stop, pulling in at 8.4 m/s, with 3775 m still to run to I-35W &
+# 98th St because the longest hop on that leg is the last one (22.3).
+#
+# So the leg's own geometry decides now, and the percentage is only the
+# fallback for a leg that carries no stop coordinates. The stop the count
+# implies is the one it has just consumed; if the rider is within
+# STOP_COLLAPSE_NEAR_STOP_M of it, the count is RIGHT and there is nothing to
+# say. 100 m: the 09-21 drops were 31 m (American Blvd) and 29 m (76th St), and
+# a station platform plus a bus length plus GPS is comfortably inside that,
+# while the 7/29 incident this rule was written for collapsed to 1 at the very
+# START of the leg, kilometres from any stop the count could have meant.
+STOP_COLLAPSE_MAX_PROGRESS = 60.0          # percent; fallback only (see above)
+STOP_COLLAPSE_NEAR_STOP_M = 100.0
 DEVIATED_STREAK_MS = 90 * 1000
 GPS_GAP_MS = 60 * 1000
 REROUTE_STORM_WINDOW_MS = 5 * 60 * 1000
@@ -343,6 +380,15 @@ NOTIFICATION_REPEAT_COUNT = 2              # fires on the 2nd
 MOTION_PROGRESS_PCT = 5.0                  # percentage points gained
 MOTION_DISPLACEMENT_M = 15.0               # ...while the fix stayed this close
 MOTION_COOLDOWN_MS = 5 * 60 * 1000
+# ...and the anchor has to be dropped when the DENOMINATOR changes, not only
+# when the rider moves. An itinerary swap re-bases currentLegProgress onto a
+# new leg 0, so the two ticks straddling it describe different quantities:
+# 2026-09-20 12:55:24.829 the rider's own onboard pick (GO_MODE_CONTROL_TAP
+# `onboard-preview-confirm` -> CLEAR_ONBOARD -> START_GO_MODE) took the bar
+# from 11 % to 66 % in 9 ms at the IDENTICAL fix (44.86033, -93.30134,
+# distanceToDestination unchanged at 4914.3 m) and this rule called it a
+# teleport (21.6). Nothing about the rider changed; the leg they were being
+# measured against did.
 # position-teleport (18.3a). progress-without-motion measures the MATCH, which
 # is downstream of the app's continuity gate and therefore lags the input it
 # ought to be reporting: on 2026-09-17 ride `mu63yfrb-ekv1fl` the position
@@ -604,8 +650,13 @@ SESSION_RESTART_DEDUP_MS = 5 * 1000
 #
 # note-unverifiable (17.11). Ride B, 15:53:50, rider note "Clicking does
 # nothing" with a screenshot — and nothing in the stream records that a tap
-# happened, so the claim could be neither confirmed nor contradicted. Two
-# independent things make a note unanswerable, and either is the finding:
+# happened, so the claim could be neither confirmed nor contradicted.
+#
+# FIRST the note has to be that kind of note (NOTE_NO_RESPONSE_RE, below). A
+# note that does not claim a control responded or failed to respond is not
+# made unanswerable by the absence of tap records, and the rule spent three
+# firings in two days saying otherwise. Then, and only then, two independent
+# things make such a note unanswerable, and either is the finding:
 #
 #   * no rider-gesture record in the minute before it. RIDER_GESTURE_TYPES
 #     below is the allowlist; it deliberately excludes the act of writing the
@@ -655,6 +706,38 @@ RIDER_GESTURE_TYPES = frozenset((
 TAP_RECORD_RE = re.compile(r"(^|_)(TAP|TAPPED|PRESS|PRESSED|CLICK|CLICKED"
                            r"|GESTURE|LONG_PRESS)($|_)")
 TAP_RECORD_KINDS = frozenset(("tap", "gesture", "ui", "interaction"))
+# ...and the note itself has to be ABOUT a control before any of that is
+# evidence of anything. The rule's premise — "nothing records that a tap
+# happened, so this claim cannot be checked" — only holds for a note that
+# CLAIMS a control did or did not respond. It does not hold for a layout
+# complaint, a question, or a feature ask, and on three notes in two days it
+# fired on exactly those: 2026-09-20 12:54:48 ("The “tap to return” is
+# still overlapping on pages"), 2026-09-21 08:26:05 (a note about displayed
+# times, answerable from the realtime stream alone) and 09:12:04 (a feature
+# ask). See 17.11.
+#
+# Two vocabularies again, and the ORDER matters. NOTE_NO_RESPONSE_RE is the
+# claim; NOTE_CONTROL_RE is only the noun. Requiring the noun as well would
+# lose "Reset to planned? ... And it did nothing." (2026-09-17 17:57:39, a
+# real one), and accepting the noun alone would keep every false positive
+# above — "tap to return", "the edit trip buttons", "the 2 gps buttons" are
+# all controls named in notes that claim nothing about a response. Measured
+# against all 37 rider notes on disk (09-07 through 09-21): the claim regex
+# alone selects exactly two, 2026-09-15 15:53:50 "Clicking does nothing" and
+# 2026-09-17 17:57:39.
+NOTE_NO_RESPONSE_RE = re.compile(
+    r"(do|does|did|doing)(es)?\s+nothing"
+    r"|nothing\s+(happen|happens|happened|happening)"
+    r"|(is|are|was|were)?\s*not\s+(working|responding|respond)"
+    r"|(isn|aren|doesn|don|didn|won|wouldn|can|couldn)['\u2019]?t\s+"
+    r"(work|working|respond|responding|do\s+anything|tap|click|press|select)"
+    r"|(does|did)\s+not\s+(work|respond|do\s+anything)"
+    r"|no\s+response|unresponsive|not\s+(clickable|tappable|pressable)",
+    re.I)
+NOTE_CONTROL_RE = re.compile(
+    r"\b(tap|taps|tapped|tapping|click|clicks|clicked|clicking|press|presses"
+    r"|pressed|pressing|button|buttons|toggle|toggles|toggled|slider|sliders"
+    r"|swipe|swipes|swiped|checkbox|long[- ]press)\b", re.I)
 # "Request timed out after 20000 ms" (every FIND_*/REALTIME_* error on 09-15)
 # and the structured form ROUTING_ERROR carries, {timedOut, timeoutMs, url}.
 TIMEOUT_MESSAGE_RE = re.compile(r"timed out after (\d+)\s*ms", re.I)
@@ -1229,6 +1312,28 @@ def short_session(session):
     return session.rsplit("-", 1)[-1]
 
 
+def href_page(href):
+    """The screen a record was emitted on, as a route path.
+
+    The app is a hash router inside a Capacitor shell, so every record carries
+    `href` = "capacitor://localhost#/feedback" (or ".../#/" for the map). The
+    origin is identical on every record ever written and the query string is
+    router bookkeeping; the fragment path is the only part that says where the
+    rider was. Used by note-unverifiable so a report can place the note (17.11)
+    — the rider-note records themselves carry no href, because they come in
+    through the /ride console sidecar rather than the beacon.
+    """
+    if not isinstance(href, str) or not href:
+        return None
+    frag = href.split("#", 1)[1] if "#" in href else href
+    path = frag.split("?", 1)[0].split("&", 1)[0].strip()
+    if not path:
+        return None
+    if not path.startswith("/"):
+        path = "/" + path
+    return path[:120]
+
+
 def short_boot_href(href, limit=BOOT_HREF_MAX):
     """The part of a boot URL that differs between one boot and the next.
 
@@ -1371,6 +1476,42 @@ def leg_is_transit(leg):
     return (leg.get("mode") or "").upper() in TRANSIT_MODES
 
 
+def leg_stop_points(leg):
+    """The leg's remaining stop calls, in order, as [{name, lat, lon}].
+
+    THE FIELD IS `intermediatePlaces`, not `intermediateStops`. Measured in
+    2026-09-21's 09:24:21 START_GO_MODE: on the Orange Line leg that produced
+    22.3, `intermediateStops` is **null** and `stopCalls` and `steps` are null
+    too; `intermediatePlaces` carries the two stops with `lat`/`lon`/`name` and
+    a `stop.gtfsId`. Both names are read here because OTP's GraphQL schema has
+    both and the client's selection set has changed before.
+
+    The alight stop (`to`) is appended, because that is the stop the count is
+    counting down to: `stopsRemaining` is 3 at the top of a leg with two
+    intermediate stops, and the stop it names next is stops[-stopsRemaining].
+    """
+    if not isinstance(leg, dict) or not leg_is_transit(leg):
+        return None
+    out = []
+    seq = leg.get("intermediatePlaces")
+    if not isinstance(seq, list) or not seq:
+        seq = leg.get("intermediateStops")
+    for place in (seq if isinstance(seq, list) else []):
+        if not isinstance(place, dict):
+            continue
+        lat, lon = place.get("lat"), place.get("lon")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            continue
+        out.append({"name": place.get("name"), "lat": float(lat),
+                    "lon": float(lon)})
+    to = leg.get("to")
+    if isinstance(to, dict) and isinstance(to.get("lat"), (int, float)) \
+            and isinstance(to.get("lon"), (int, float)):
+        out.append({"name": to.get("name"), "lat": float(to["lat"]),
+                    "lon": float(to["lon"])})
+    return out or None
+
+
 def summarize_itinerary(payload):
     """Compact leg summary from a START_GO_MODE payload; None if unavailable."""
     if not isinstance(payload, dict):
@@ -1405,6 +1546,11 @@ def summarize_itinerary(payload):
             "to": ((leg.get("to") or {}).get("name")),
             "startTime": leg.get("startTime"),
             "endTime": leg.get("endTime"),
+            # The stops the leg still has to call at, in order, ending at the
+            # alight stop. stop-count-collapse (22.3) needs coordinates, not a
+            # percentage, to say whether a count that dropped to 1 dropped at
+            # the stop it names.
+            "stops": leg_stop_points(leg),
         })
     return {
         "legs": legs,
@@ -1458,6 +1604,12 @@ class Trip:
         self.swap_times = []                      # ms of each swap
         self.last_event_ms = start_ms
         self.riding = None                        # SET_RIDING payload + swap_seq
+        # The last CONFIRM_VEHICLE: (ms, vehicleId, tripId). The riding fact
+        # it established should outlive everything but alighting, so a
+        # CLEAR_RIDING with no TRANSITION_LEG or STOP_GO_MODE behind it is the
+        # app dropping a fact it had confirmed. See _rule_riding_fact_dropped.
+        self.confirm_vehicle = None
+        self.riding_dropped_fired = False
         self.progress = None                      # last UPDATE_PROGRESS snapshot
         self.last_pos_ms = start_ms
         self.last_fix = None                      # (lat, lon) of the last fix
@@ -1467,6 +1619,12 @@ class Trip:
         self.arrived_leg = None                   # leg index when it latched
         self.arrived_source = None                # which evidence latched it
         self.arrived_never_ended_fired = False    # 18.3b, once per arrival
+        self.arrived_far_fired = False            # 21.2, once per arrival
+        # START_GO_MODE's `roundTrip` block (round-trip feature, 09-05): the
+        # outbound arrival of a round trip is a PAUSE at the stay, not the end
+        # of the journey, and the app is right to latch it early-ish. The
+        # stream marks it and arrived-far-from-destination steps aside.
+        self.round_trip = False
         # The last position fix with its metadata: (tMs, lat, lon, accuracy).
         # last_fix above is the coordinate alone and is reset by rules that do
         # not care when it arrived; position-teleport needs the pair.
@@ -1655,6 +1813,11 @@ class RideWatch:
         # error, which is the only record that carries the timeout: the window
         # is [errorMs - timeoutMs, errorMs].
         self.session_timeouts = {}
+        # session -> the route path of the last record that carried an href.
+        # A rider note comes in through the /ride console sidecar and carries
+        # none of its own, so this is the only thing that can say which screen
+        # the rider was looking at when they typed it (17.11).
+        self.session_href = {}
         # Rider notes whose "could anyone check this?" verdict is still
         # pending: the timeout half of note-unverifiable cannot be known until
         # the request that swallowed the tap comes back. See
@@ -1948,6 +2111,7 @@ class RideWatch:
         # minutes before START_GO_MODE opened a trip.
         self._note_rider_gesture(session, t, kind, typ, obj)
         self._note_request_timeout(session, t, typ, obj)
+        self._note_href(session, obj)
 
         if typ == "START_GO_MODE":
             self._on_start_go_mode(session, t, obj)
@@ -2058,10 +2222,16 @@ class RideWatch:
                 self._on_vehicle_match(trip, t, obj.get("payload") or {})
             elif typ == "SET_RIDING":
                 self._on_set_riding(trip, t, obj.get("payload") or {})
+            elif typ == "CONFIRM_VEHICLE":
+                pv = obj.get("payload") or {}
+                trip.confirm_vehicle = (t, pv.get("vehicleId"),
+                                        pv.get("tripId"), pv.get("label"))
             elif typ == "CLEAR_RIDING":
+                self._rule_riding_fact_dropped(trip, t)
                 trip.riding = None
                 self._mark_dirty()
             elif typ == "TRANSITION_LEG":
+                trip.confirm_vehicle = None
                 self._on_transition_leg(trip, t, obj.get("payload") or {})
             elif typ == "ADD_NOTIFICATION":
                 self._on_notification(trip, t, obj.get("payload") or {})
@@ -2104,6 +2274,7 @@ class RideWatch:
             self.ended_arrived.discard(session)
             self._declined_completed.discard(session)
             trip.device = obj.get("device")
+            trip.round_trip = bool(payload.get("roundTrip"))
             self._note_device_session(trip.device, session)
             self._stamp_trip_bundle(trip)
             self.trips[session] = trip
@@ -2133,6 +2304,8 @@ class RideWatch:
                     "CLEAR_ONBOARD %d ms before START_GO_MODE"
                     % (session, t - trip.clear_onboard_ms))
             self._clear_arrival(trip, t, "itinerary swap")
+            if payload.get("roundTrip"):
+                trip.round_trip = True
             trip.swap_seq += 1
             trip.swap_times.append(t)
             if summary is not None:
@@ -2919,7 +3092,54 @@ class RideWatch:
         trip.arrived_never_ended_fired = False
         self.log.info("arrived (%s): session=%s" % (source, trip.session))
         self._thread_event(trip, t, "arrived at destination")
+        self._rule_arrived_far_from_destination(trip, t, source)
         self._mark_dirty()
+
+    def _rule_arrived_far_from_destination(self, trip, t, source):
+        """"You have arrived" while the app's own tick says they have not. (21.2)
+
+        The distance is not inferred from anything here: the client publishes
+        it on every UPDATE_PROGRESS as `distanceToDestination`, and the tick
+        that latches the arrival carries it. On 2026-09-21 that tick is
+        08:54:10.060 (83.26 m, overallProgress 99.527, currentLegProgress
+        94.21) and SET_ARRIVED is 15 ms behind it, so `trip.progress` is the
+        right snapshot by construction — the progress branch of _process runs
+        before the SET_ARRIVED branch for the same millisecond.
+
+        Warn, never a page. The mechanism is in the client (hasArrivedAtDest-
+        ination grants on overallProgress >= 99.5 with only a 120 m veto, so
+        the last half-percent of a 14 km trip is the last 80 m of the final
+        leg) and the fix is an OTA; what the daemon owes the report is the
+        number, because §7 of a ride report otherwise has to reconstruct it by
+        hand from the fixes.
+
+        A round trip's outbound arrival is a pause at the stay and is skipped:
+        START_GO_MODE carries a `roundTrip` block with the return itinerary
+        when that is what this is.
+        """
+        if trip.arrived_far_fired or trip.round_trip:
+            return
+        p = trip.progress or {}
+        dist = p.get("distanceToDestination")
+        if not isinstance(dist, (int, float)) or dist <= ARRIVAL_RADIUS_M:
+            return
+        trip.arrived_far_fired = True
+        self._finding(
+            trip, t, "arrived-far-from-destination", "warn",
+            "arrival latched %.0f m from the destination (the app's own"
+            " radius is %.0f m; overallProgress %s, currentLegProgress %s)"
+            % (dist, ARRIVAL_RADIUS_M,
+               # Not fmt_pct: the whole mechanism lives in the last half a
+               # percent of overall progress, and "100%" hides it.
+               ("%.2f%%" % p["overallProgress"])
+               if isinstance(p.get("overallProgress"), (int, float)) else "?",
+               fmt_pct(p.get("currentLegProgress"))),
+            {"distanceToDestinationM": round(float(dist), 1),
+             "arrivalRadiusM": ARRIVAL_RADIUS_M,
+             "overallProgressPct": p.get("overallProgress"),
+             "legProgressPct": p.get("currentLegProgress"),
+             "legIndex": p.get("currentLegIndex"),
+             "arrivedSource": source})
 
     def _rule_arrived_never_ended(self, trip, t, ending=None):
         """The rider arrived and the app never closed the trip. (18.3b)
@@ -2999,6 +3219,7 @@ class RideWatch:
         trip.arrived_leg = None
         trip.arrived_source = None
         trip.arrived_never_ended_fired = False
+        trip.arrived_far_fired = False
         self._thread_event(trip, t, "ride resumed after arrival (%s)" % why)
         self._mark_dirty()
 
@@ -3177,7 +3398,7 @@ class RideWatch:
                                 if k in keep)
         for cache in (self.route_vehicles, self.nearby_vehicles_ms,
                       self.onboard_anchor, self.session_last_gesture,
-                      self.session_timeouts):
+                      self.session_timeouts, self.session_href):
             for key in [k for k in cache if k not in keep]:
                 del cache[key]
 
@@ -4146,6 +4367,11 @@ class RideWatch:
         trip.progress = {
             "currentLegIndex": p.get("currentLegIndex"),
             "currentLegProgress": p.get("currentLegProgress"),
+            # Progress over the WHOLE itinerary. This is the quantity the
+            # client's arrival branch actually tests (>= 99.5 grants arrival),
+            # so a finding about an early arrival has to be able to quote it
+            # next to the leg percentage that disagrees with it (21.2).
+            "overallProgress": p.get("overallProgress"),
             "status": p.get("status"),
             "stopsRemaining": p.get("stopsRemaining"),
             "stopsTrusted": p.get("stopsTrusted"),
@@ -4219,19 +4445,24 @@ class RideWatch:
             if prev_stops is not None and same_leg:
                 if (stops == 1 and prev_stops > 1
                         and isinstance(progress, (int, float))
-                        and progress < STOP_COLLAPSE_MAX_PROGRESS
                         and trip.current_leg_transit()
                         and trip.swap_seq not in trip.collapse_fired_seq):
-                    trip.collapse_fired_seq.add(trip.swap_seq)
-                    self._finding(
-                        trip, t, "stop-count-collapse", "page",
-                        "stopsRemaining %d -> 1 at %.0f%% of transit leg %s"
-                        % (prev_stops, progress, p.get("currentLegIndex")),
-                        {"prevStops": prev_stops, "stops": stops,
-                         "legProgressPct": progress,
-                         "nextStop": p.get("nextStopName")},
-                        push_body="Stop count wrong — app says 1 left at %.0f%% of the leg. Ignore the banner."
-                                  % progress)
+                    verdict = self._stop_collapse_verdict(
+                        trip, p.get("currentLegIndex"), int(prev_stops),
+                        progress)
+                    if verdict["wrong"]:
+                        trip.collapse_fired_seq.add(trip.swap_seq)
+                        ctx = {"prevStops": prev_stops, "stops": stops,
+                               "legProgressPct": progress,
+                               "nextStop": p.get("nextStopName")}
+                        ctx.update(verdict["context"])
+                        self._finding(
+                            trip, t, "stop-count-collapse", "page",
+                            "stopsRemaining %d -> 1 %s"
+                            % (prev_stops, verdict["summary"]),
+                            ctx,
+                            push_body="Stop count wrong — app says 1 left %s. Ignore the banner."
+                                      % verdict["push"])
                 elif (stops > prev_stops
                         and not trip.stops_swap_pending
                         and t - trip.stop_increase_last_ms > STOP_INCREASE_COOLDOWN_MS):
@@ -4352,14 +4583,96 @@ class RideWatch:
         else:
             self._finding(trip, t, "position-teleport", "warn", summary, context)
 
+    def _stop_collapse_verdict(self, trip, leg_index, prev_stops, progress):
+        """Is a `stopsRemaining` that just fell to 1 actually WRONG? (22.3)
+
+        The old test was a percentage: below STOP_COLLAPSE_MAX_PROGRESS of the
+        leg, "one stop left" cannot be true. That is a proxy for the leg's
+        geometry and it assumes the hops are roughly even. On 2026-09-21 the
+        Orange Line's I-35W & 66th St -> I-35W & 98th St leg is 7885 m with its
+        LONGEST hop last (3775 m of it after Knox Ave & American Blvd), so the
+        penultimate stop sits at 41 % by construction; the count fell to 1 at
+        09:32:47 while the rider was 31 m from that platform at 8.4 m/s, and
+        the daemon spent the ride's one page telling them to ignore a banner
+        that was right.
+
+        So ask the leg instead. `stopsRemaining` counts the calls still ahead,
+        the last of them being the alight stop, so the drop from N to 1 means
+        the vehicle has just consumed stops[-N] — American Blvd here, and
+        76th St for the 3 -> 2 drop 2m13s earlier (29 m away, same shape).
+        Within STOP_COLLAPSE_NEAR_STOP_M of that stop the count is simply
+        true and there is nothing to say.
+
+        A leg with no stop coordinates falls back to the percentage, which is
+        what the 7/29 incident this rule exists for needed: the count there
+        collapsed to 1 at the very start of the leg, nowhere near any stop it
+        could have meant.
+        """
+        legs = (trip.itinerary or {}).get("legs") or []
+        stops = None
+        if isinstance(leg_index, int) and 0 <= leg_index < len(legs):
+            leg = legs[leg_index]
+            if isinstance(leg, dict):
+                stops = leg.get("stops")
+        implied = None
+        if isinstance(stops, list) and 1 <= prev_stops <= len(stops):
+            implied = stops[-prev_stops]
+        if implied is None or trip.last_fix is None:
+            wrong = progress < STOP_COLLAPSE_MAX_PROGRESS
+            return {
+                "wrong": wrong,
+                "summary": ("at %.0f%% of transit leg %s (the leg carries no"
+                            " stop coordinates, so the percentage decided)"
+                            % (progress, leg_index)),
+                "push": "at %.0f%% of the leg" % progress,
+                "context": {"stopGeometry": "unavailable",
+                            "maxProgressPct": STOP_COLLAPSE_MAX_PROGRESS},
+            }
+        gap = meters_between(trip.last_fix,
+                             (implied["lat"], implied["lon"]))
+        name = implied.get("name") or "the stop it counted off"
+        context = {"stopGeometry": "leg",
+                   "impliedStop": name,
+                   "impliedStopMeters": round(gap, 1),
+                   "nearStopM": STOP_COLLAPSE_NEAR_STOP_M,
+                   "maxProgressPct": STOP_COLLAPSE_MAX_PROGRESS,
+                   "legStopCount": len(stops)}
+        return {
+            # Both tests, and the geometry only ever NARROWS the rule. The
+            # percentage on its own pages on a correct count whose last hop is
+            # the long one (22.3); the geometry on its own would page on a
+            # count that is late rather than early — 2026-08-27 13:36:17 and
+            # 2026-08-28 17:07:38 both drop to 1 at 97-98 % of the leg, 177 m
+            # and 102 m past the stop the count named, which is a stale
+            # `stopsRemaining` and not the "one stop left" lie this rule pages
+            # about. Nothing that fired before this change fires only because
+            # of it.
+            "wrong": (progress < STOP_COLLAPSE_MAX_PROGRESS
+                      and gap > STOP_COLLAPSE_NEAR_STOP_M),
+            "summary": ("at %.0f%% of transit leg %s, %.0f m from %s — the"
+                        " stop the count says was just passed"
+                        % (progress, leg_index, gap, name)),
+            "push": "but you are %.0f m from %s" % (gap, name),
+            "context": context,
+        }
+
     def _check_progress_without_motion(self, trip, t, p):
         """Leg progress advancing faster than the rider physically moved.
 
         The anchor is the last place progress was believed. It is reset when
         the rider genuinely travels (past MOTION_DISPLACEMENT_M — a real move,
-        not GPS jitter) or when the leg changes, so the question the rule
-        actually asks is *physical*: did the progress bar gain more than
-        MOTION_PROGRESS_PCT points in the time it took the rider to cover 15m?
+        not GPS jitter), when the leg changes, or when the ITINERARY changes
+        under it, so the question the rule actually asks is *physical*: did the
+        progress bar gain more than MOTION_PROGRESS_PCT points in the time it
+        took the rider to cover 15m?
+
+        That third reset is 21.6 and it was missing. currentLegProgress is a
+        percentage of whatever leg the current itinerary calls `currentLegIndex`,
+        so an itinerary swap changes the denominator without moving the rider:
+        on 2026-09-20 12:55:24 the rider's own onboard pick re-based the bar
+        11 % -> 66 % in 9 ms at the identical fix and this rule reported it as
+        the app teleporting them up the leg. `trip.swap_seq` is bumped in
+        _on_start_go_mode and, until now, was never read here.
 
         That window is adaptive, and both of its ends are real defects:
         - Stationary: the window is minutes wide. This is the 7/31 shape —
@@ -4383,10 +4696,29 @@ class RideWatch:
             return
         span = self._note_progress_freeze(trip, t, leg, prog)
         anchor = trip.motion_anchor
-        fresh = {"fix": trip.last_fix, "progress": prog, "leg": leg, "tMs": t}
+        fresh = {"fix": trip.last_fix, "progress": prog, "leg": leg, "tMs": t,
+                 "swapSeq": trip.swap_seq, "afterSwap": None}
         if anchor is None or anchor["leg"] != leg:
             trip.motion_anchor = fresh
             return
+        if anchor.get("swapSeq") != trip.swap_seq:
+            # The itinerary was replaced under the anchor, so its percentage
+            # is measured against a different leg 0 than this tick's and the
+            # two are not comparable (21.6). REBASE rather than drop: the
+            # anchor's fix and timestamp are still the physical window the
+            # rule is asking about, and only the percentage changed basis, so
+            # the new basis is read off this tick and everything below runs as
+            # usual. Dropping the anchor outright would also work for 21.6 and
+            # is what this was written as first — but it costs a tick, and at
+            # 8 m/s an anchor survives exactly two ticks, so a one-tick phase
+            # shift moves which tick a real jump lands on: it silently lost
+            # 2026-08-31 15:37:52 (11 % -> 50 % in one second on an 8801 m
+            # leg, the 7/29 shape). Rebasing preserves the phase exactly.
+            anchor = dict(anchor)
+            anchor["progress"] = prog
+            anchor["swapSeq"] = trip.swap_seq
+            anchor["afterSwap"] = trip.swap_seq
+            trip.motion_anchor = anchor
         moved = meters_between(anchor["fix"], trip.last_fix)
         if moved > MOTION_DISPLACEMENT_M:
             trip.motion_anchor = fresh          # they really went somewhere
@@ -4401,6 +4733,10 @@ class RideWatch:
         context = {"fromPct": anchor["progress"], "toPct": prog,
                    "movedMeters": round(moved, 1), "legIndex": leg,
                    "sinceMs": anchor["tMs"]}
+        if anchor.get("afterSwap") is not None:
+            summary += " (measured from the anchor re-based at itinerary" \
+                       " swap #%d)" % anchor["afterSwap"]
+            context["anchorAfterSwap"] = anchor["afterSwap"]
         if span:
             summary += " (frozen at %s for %ds, %.0fm travelled, %d ticks)" % (
                 fmt_pct(span["atPct"]), span["seconds"], span["meters"],
@@ -4719,6 +5055,46 @@ class RideWatch:
         trip.riding = new
         self._mark_dirty()
 
+    def _rule_riding_fact_dropped(self, trip, t):
+        """CLEAR_RIDING after a confirmed vehicle, with nothing to explain it.
+
+        The app does not dispatch CLEAR_RIDING on alighting — TRANSITION_LEG's
+        reducer does that (see _on_transition_leg) — and it does not dispatch
+        it on STOP_GO_MODE either. So a bare CLEAR_RIDING after a
+        CONFIRM_VEHICLE is the app throwing away a boarding it had just
+        confirmed, which is exactly what the rider was typing about on
+        2026-09-21: "I used already on the bus flow but it's showing like I'm
+        not!" (09:24:56).
+
+        Measured on that ride (`mubbbiy9-6zjoq9`): CONFIRM_VEHICLE 09:22:10.536
+        (vehicle 8228, trip 1:1268952, confidence confirmed) -> SET_RIDING
+        09:22:10.538 -> CLEAR_RIDING 09:23:42.054, 91 s later, with no
+        TRANSITION_LEG and no STOP_GO_MODE between them (STOP_GO_MODE is
+        09:23:45.789, three seconds AFTER). It happened again at 09:25:52.081,
+        91 s after the 09:24:21.372 confirm. Nothing in the daemon remarked on
+        either.
+
+        Warn and once a ride: the same defect twice in four minutes is one
+        thing to read, and the rider cannot act on it in the next minute —
+        they are already re-doing the onboard flow by hand.
+        """
+        if trip.riding_dropped_fired or trip.confirm_vehicle is None:
+            return
+        confirmed_ms, vehicle, trip_id, label = trip.confirm_vehicle
+        trip.confirm_vehicle = None
+        if trip.riding is None:
+            return
+        trip.riding_dropped_fired = True
+        held = max(0, t - confirmed_ms)
+        self._finding(
+            trip, t, "riding-fact-dropped", "warn",
+            "CLEAR_RIDING %ds after CONFIRM_VEHICLE %s with no leg change"
+            " or stop — the app dropped a boarding it had confirmed"
+            % (held // 1000, label or vehicle or trip_id or "?"),
+            {"confirmedMs": confirmed_ms, "heldMs": held,
+             "vehicleId": vehicle, "tripId": trip_id, "label": label,
+             "legIndex": (trip.riding or {}).get("legIndex")})
+
     def _on_transition_leg(self, trip, t, p):
         """Mirror the app's alight clear.
 
@@ -4914,6 +5290,23 @@ class RideWatch:
             return                        # buffered replay of an older record
         self.session_last_gesture[session] = (int(t), gesture)
 
+    def _note_href(self, session, obj):
+        """Remember which screen this session's records are coming from.
+
+        Every beacon record carries the full href; the note the rider types
+        carries none. The 2026-09-20 12:54:48 note ("the tap to return is
+        still overlapping ... this feedback page for example") was surrounded
+        on both sides by records reading `capacitor://localhost#/feedback`,
+        and the finding could not say so (17.11).
+        """
+        page = href_page(obj.get("href"))
+        if page is None:
+            return
+        if len(self.session_href) > SESSION_CACHE_MAX and \
+                session not in self.session_href:
+            self._prune_session_caches()
+        self.session_href[session] = page
+
     def _note_request_timeout(self, session, t, typ, obj):
         """Reconstruct the window of a request that came back timed out.
 
@@ -4956,6 +5349,12 @@ class RideWatch:
         15:53:59.330 for a note at 15:53:50.965. So the whole decision waits
         NOTE_EVIDENCE_GRACE_MS and is taken on the 5 s tick.
         """
+        if not NOTE_NO_RESPONSE_RE.search(text):
+            # Not a claim about a control, so "nothing records that a tap
+            # happened" says nothing about it (17.11). Dropped here rather
+            # than at resolve time so the pending list stays the notes the
+            # rule might actually file.
+            return
         last = self.session_last_gesture.get(session)
         self.pending_notes.append({
             "session": session,
@@ -4963,6 +5362,8 @@ class RideWatch:
             "dueMs": int(t) + NOTE_EVIDENCE_GRACE_MS,
             "text": text,
             "image": image,
+            "page": self.session_href.get(session),
+            "control": bool(NOTE_CONTROL_RE.search(text)),
             "lastGestureMs": last[0] if last else None,
             "lastGesture": last[1] if last else None,
         })
@@ -5010,9 +5411,18 @@ class RideWatch:
             reasons.append(
                 "a request that timed out after %d ms was in flight across it"
                 " (%s at %s)" % (hung[1], hung[0], fmt_hms(hung[2])))
-        summary = ("rider note \"%s\" cannot be checked against the telemetry:"
-                   " %s" % (entry["text"][:80], "; and ".join(reasons)))
+        page = entry.get("page")
+        summary = ("rider note \"%s\"%s cannot be checked against the"
+                   " telemetry: %s"
+                   % (entry["text"][:80],
+                      (" (on %s)" % page) if page else "",
+                      "; and ".join(reasons)))
         ctx = {"text": entry["text"], "noteMs": t,
+               # Which screen the rider was on when they typed it, from the
+               # nearest record that carried an href (17.11). A report cannot
+               # place a control complaint without it.
+               "page": page,
+               "controlNamed": entry.get("control", False),
                "lastGestureMs": gesture_ms,
                "lastGesture": entry.get("lastGesture"),
                "gestureLookbackMs": NOTE_GESTURE_LOOKBACK_MS,
