@@ -546,6 +546,14 @@ beat between them** (combined, the line is typed but never submitted), and every
 line is collapsed to one line by `one_line()`, because a newline in a rider's
 note would submit half a sentence.
 
+A third one, learned 2026-09-21: every `capture-pane` and `send-keys` targets
+the **pane id** `new-session -P` handed back (`%120`), falling back to the
+session's first window (`ride-1646:^`) — never the bare session name. `-t
+ride-1646` means "that session's *active* window", and a rider who opens a
+second window in the ride's session for some other Claude conversation would
+otherwise have the ride typed into it (four milestones and a rider note landed
+in a session rebuilding the pipeline board that evening).
+
 None of it runs on the tailer: spawning and typing happen on a worker thread, so
 a 12-second TUI startup never stalls telemetry reading, and a dead pane, a
 missing tmux or a rider who typed `/exit` are logged and survived.
