@@ -8342,5 +8342,74 @@ class TestRidingFactDropped(RuleTestCase):
         self.assertEqual(found[0]["context"]["tripId"], "1:1268952")
 
 
+class TestThreadPushTargetsThePaneItSpawned(RuleTestCase):
+    """2026-09-21 16:46 ride: `send-keys -t ride-1646` is "that session's
+    ACTIVE window", and the rider had opened a second window in it for an
+    unrelated Claude session — four milestones and a rider note were typed
+    into a session that was rebuilding the pipeline board. Every read and
+    every keystroke goes to the pane `new-session -P` handed back, or failing
+    that to the session's first window; never to the bare session name."""
+
+    class PaneTmux(ScriptedTmux):
+        def __init__(self, screens, pane_id):
+            ScriptedTmux.__init__(self, screens)
+            self.pane_id = pane_id
+
+        def __call__(self, args, timeout=20):
+            if args[0] == "new-session":
+                self.calls.append(args)
+                return TmuxResult(0, self.pane_id)
+            return ScriptedTmux.__call__(self, args, timeout)
+
+        def targets(self, verb):
+            return [a[a.index("-t") + 1] for a in self.calls if a[0] == verb]
+
+    def setUp(self):
+        RuleTestCase.setUp(self)
+        self.watch = quiet_watch(self.tmp)
+        for attr in ("THREAD_PUSH_POLL_S", "THREAD_SUBMIT_DELAY_S",
+                     "THREAD_READY_POLL_S"):
+            original = getattr(ride_watch, attr)
+            setattr(ride_watch, attr, 0)
+            self.addCleanup(setattr, ride_watch, attr, original)
+
+    def spawn_and_push(self, pane_id):
+        fake = self.PaneTmux([READY_PANE], pane_id)
+        self.watch._tmux = fake
+        self.watch._tmux_spawn_blocking("ride-1646", "ride 09-21 16:46")
+        self.watch._tmux_push_blocking("ride-1646", "[ride-watch] leg 0 -> 1",
+                                       50)
+        return fake
+
+    def test_the_spawn_asks_tmux_for_the_pane_id(self):
+        fake = self.spawn_and_push("%120\n")
+        new = [a for a in fake.calls if a[0] == "new-session"][0]
+        self.assertIn("-P", new)
+        self.assertEqual(new[new.index("-F") + 1], "#{pane_id}")
+        self.assertEqual(self.watch._thread_pane, {"ride-1646": "%120"})
+
+    def test_reads_and_keystrokes_go_to_that_pane_never_the_session(self):
+        fake = self.spawn_and_push("%120\n")
+        self.assertEqual(set(fake.targets("capture-pane")), {"%120"})
+        self.assertEqual(fake.targets("send-keys"), ["%120", "%120"])
+        self.assertEqual(fake.typed(), ["[ride-watch] leg 0 -> 1"])
+        self.assertNotIn("ride-1646", fake.targets("send-keys"))
+
+    def test_without_a_pane_id_the_first_window_is_the_target(self):
+        """An older tmux, or a stub, answers nothing: the session's
+        lowest-numbered window is the one new-session made, so `:^` still
+        cannot land in a window the rider opened later."""
+        fake = self.spawn_and_push("")
+        self.assertEqual(self.watch._thread_pane, {})
+        self.assertEqual(fake.targets("send-keys"), ["ride-1646:^"] * 2)
+        self.assertEqual(set(fake.targets("capture-pane")), {"ride-1646:^"})
+
+    def test_the_session_itself_is_still_killed_by_name(self):
+        fake = self.spawn_and_push("%120\n")
+        self.watch._tmux_kill_blocking("ride-1646")
+        self.assertEqual(fake.targets("kill-session"), ["ride-1646"])
+        self.assertEqual(self.watch._thread_pane, {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

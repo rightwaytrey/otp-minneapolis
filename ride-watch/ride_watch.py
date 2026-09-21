@@ -1906,6 +1906,15 @@ class RideWatch:
         self._thread_wake = threading.Event()
         self._thread_worker = None
         self._thread_status = {}       # tmux name -> True/False once known
+        # tmux name -> the pane id `new-session -P` handed back. Every
+        # capture-pane / send-keys goes to THIS, never to the bare session
+        # name: `-t ride-1646` means "that session's ACTIVE window", and on
+        # 2026-09-21 the rider had opened a second window in the ride's
+        # session for an unrelated Claude session — so four milestones and a
+        # rider note were typed into a session that was rebuilding the
+        # pipeline board ("sick of agents reading ride messages when I ask
+        # them to do something else"). See _pane_target.
+        self._thread_pane = {}
         # Panes the rider has already been paged about for sitting on a
         # permission prompt, and the count of lines that never got typed
         # because of one. Both are for the log and the status file; neither
@@ -7207,22 +7216,44 @@ class RideWatch:
                     self.log.error("ride thread worker job %s failed: %r"
                                    % (job[0], exc))
 
+    def _pane_target(self, name):
+        """The tmux target for typing into and reading the ride thread.
+
+        The pane id recorded at spawn when there is one; otherwise the
+        session's LOWEST-numbered window (`name:^`), which is the one
+        `new-session` created — never the bare session name, which tmux
+        resolves to whatever window the rider happens to have active. A
+        recorded pane that has since died makes send-keys fail, and the
+        thread is then rightly considered gone instead of the line landing
+        in somebody else's window.
+        """
+        pane = self._thread_pane.get(name)
+        return pane if pane else "%s:^" % name
+
     def _tmux_spawn_blocking(self, name, display):
         self._kill_previous_threads(keep=name)
         cmd = "%s %s" % (shlex.quote(THREAD_RUNNER), shlex.quote(display))
         res = self._tmux(["new-session", "-d", "-s", name,
                           "-x", str(THREAD_TMUX_SIZE[0]),
                           "-y", str(THREAD_TMUX_SIZE[1]),
-                          "-c", REPO_DIR, cmd])
+                          "-c", REPO_DIR, "-P", "-F", "#{pane_id}", cmd])
         if res.returncode != 0:
             self.log.error("tmux new-session failed (%d): %s"
                            % (res.returncode, one_line(res.stdout)))
             self._thread_status[name] = False
             return
+        pane_id = (res.stdout or "").strip().split("\n")[-1].strip()
+        if re.match(r"^%\d+$", pane_id):
+            self._thread_pane[name] = pane_id
+        else:
+            self._thread_pane.pop(name, None)
+            self.log.warn("tmux new-session gave no pane id for %s (%r);"
+                          " targeting its first window" % (name, pane_id))
         deadline = time.time() + THREAD_READY_TIMEOUT_S
         while time.time() < deadline:
             time.sleep(THREAD_READY_POLL_S)
-            pane = self._tmux(["capture-pane", "-p", "-t", name])
+            pane = self._tmux(["capture-pane", "-p", "-t",
+                               self._pane_target(name)])
             if pane.returncode != 0:
                 continue
             if THREAD_READY_MARKER in (pane.stdout or ""):
@@ -7249,7 +7280,7 @@ class RideWatch:
         "unknown" capture failed or the screen says nothing we recognise —
                   type, exactly as this did before there was a check at all.
         """
-        res = self._tmux(["capture-pane", "-p", "-t", name])
+        res = self._tmux(["capture-pane", "-p", "-t", self._pane_target(name)])
         if res.returncode != 0:
             return "unknown"
         pane = res.stdout or ""
@@ -7320,14 +7351,15 @@ class RideWatch:
                           % (name, hold_ms // 1000))
         # -l types the line literally: a note containing `;` or `C-c` must
         # never be interpreted as a tmux key name.
-        res = self._tmux(["send-keys", "-t", name, "-l", line])
+        res = self._tmux(["send-keys", "-t", self._pane_target(name),
+                          "-l", line])
         if res.returncode != 0:
             self.log.error("send-keys failed for %s (%s); thread considered gone"
                            % (name, one_line(res.stdout)))
             self._thread_status[name] = False
             return
         time.sleep(THREAD_SUBMIT_DELAY_S)
-        res = self._tmux(["send-keys", "-t", name, "Enter"])
+        res = self._tmux(["send-keys", "-t", self._pane_target(name), "Enter"])
         if res.returncode != 0:
             self.log.error("submit failed for %s (%s)"
                            % (name, one_line(res.stdout)))
@@ -7342,6 +7374,7 @@ class RideWatch:
             self.log.info("ride thread %s was already gone (%s)"
                           % (name, one_line(res.stdout)))
         self._thread_status[name] = False
+        self._thread_pane.pop(name, None)
 
     def _panes_awaiting_wrap_up(self):
         """tmux panes that were asked for a wrap-up and have not delivered.
