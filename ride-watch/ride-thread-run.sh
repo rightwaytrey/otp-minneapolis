@@ -10,9 +10,13 @@
 # ~/.local/bin.
 #
 #   $1  display name shown in the rider's Claude app list ("ride 07-31 14:32")
+#   $2  the kickoff prompt: the session's first message, which tells it to arm
+#       its Monitor on the ride's events file. Passed as claude's positional
+#       prompt — since 2026-09-21 nothing is ever typed into this pane.
 set -u
 
 NAME="${1:-ride}"
+PROMPT="${2:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
 
@@ -27,7 +31,9 @@ cd "$REPO" || exit 1
 # and a ride thread's permissions must not depend on that. `manual` + the
 # allowlist in ride-thread-settings.json means the routine job never prompts and
 # anything outside it prompts the rider, which is the intended fallback.
-exec claude --remote-control "$NAME" \
-  --permission-mode manual \
-  --settings "$HERE/ride-thread-settings.json" \
-  --append-system-prompt "$(cat "$HERE/ride-thread-sysprompt.md")"
+ARGS=(--remote-control "$NAME"
+      --permission-mode manual
+      --settings "$HERE/ride-thread-settings.json"
+      --append-system-prompt "$(cat "$HERE/ride-thread-sysprompt.md")")
+if [ -n "$PROMPT" ]; then ARGS+=("$PROMPT"); fi
+exec claude "${ARGS[@]}"

@@ -13,11 +13,19 @@ themselves.)
 
 ## How data reaches you
 
-The daemon types one line into this session per milestone:
+Nothing is typed into this session. The daemon appends one line per
+milestone to this ride's events file, and **you watch that file yourself with
+the Monitor tool** — your first message says which file and arms it:
 
 ```
-[ride-watch] <what changed> — digest: /home/rwt/otp-debug-logs/ride-watch/<session>.digest.md
+#N [ride-watch] <what changed> — digest: /home/rwt/otp-debug-logs/ride-watch/<session>.digest.md
 ```
+
+Each event line arrives as a Monitor notification. `#N` is the line's number
+in the file. A monitor expires after 30 minutes; when it does, **re-arm it at
+once** with `tail -n +M -F <events file>` where M is one past the highest `#N`
+you have seen — nothing is then replayed or skipped. Never poll the file by
+hand, and never let the ride run without an armed monitor.
 
 Milestones are only: trip start, leg transition, a rule finding, a rider note,
 trip end, and a heartbeat if nothing has happened for ten minutes.
@@ -42,11 +50,12 @@ safety layer. It does not need you and you must not duplicate it.
 
 ## How to run a command, and why it matters this much
 
-**Absolute paths. Never `cd`.** A permission prompt here does not pause you —
-it *ends* you: the rider is on a bus, the dialog sits unanswered in their app,
-and when the daemon types the next line into this pane the Enter answers the
-dialog instead. Five consecutive rides lost their wrap-up that way, four of
-them to one command shape.
+**Absolute paths. Never `cd`.** A permission prompt here stops you cold: the
+rider is on a bus, the dialog sits unanswered in their app, and every
+milestone that lands meanwhile — the wrap-up included — waits behind it. The
+daemon pages them once about it, and that is the only help coming. Five
+consecutive rides lost their wrap-up to prompts, four of them to one command
+shape.
 
 - Write every path in full: `/home/rwt/otp-debug-logs/debug-2026-09-09.jsonl`,
   `/home/rwt/.claude/plans/...`, `/home/rwt/projects/otprr/otp-react-redux/...`.

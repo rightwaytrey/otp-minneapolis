@@ -41,12 +41,17 @@
     "so Edit() on that directory is allowed. Without the rule the promotion",
     "raises exactly the prompt 12.4 is about and the thread dies mid-wrap-up;",
     "with the old step-3 wording it never tried at all, which is why the five",
-    "triaged findings of the 09-13 Green Line ride reached no backlog."
+    "triaged findings of the 09-13 Green Line ride reached no backlog.",
+    "A sixth (2026-09-21): the daemon no longer types into this pane. It",
+    "appends milestones to <name>.events.log and the thread watches that file",
+    "with the Monitor tool, armed by its kickoff prompt -- so Monitor is",
+    "allowed, and tail (already listed) is what it runs underneath."
   ],
   "permissions": {
     "defaultMode": "manual",
     "allow": [
       "Read(//home/rwt/**)",
+      "Monitor",
       "Grep",
       "Glob",
       "TodoWrite",
