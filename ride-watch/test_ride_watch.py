@@ -1540,6 +1540,7 @@ class TestPageRanking(RuleTestCase):
     def test_the_ranking_covers_every_page_rule(self):
         """A page rule with no rank would silently fall back to mid-pack."""
         page_rules = {"stop-count-collapse", "itinerary-backwards",
+                      "missed-bus-still-coming",
                       "missed-bus-while-riding", "replan-not-converging",
                       "unreachable-but-routable", "notification-repeat",
                       "aboard-swap", "session-restart-while-aboard",
@@ -1547,6 +1548,7 @@ class TestPageRanking(RuleTestCase):
         self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
         self.assertEqual(
             ["stop-count-collapse", "itinerary-backwards",
+             "missed-bus-still-coming",
              "missed-bus-while-riding", "replan-not-converging",
              "unreachable-but-routable", "notification-repeat", "aboard-swap",
              "session-restart-while-aboard", "riding-flip",
@@ -9254,6 +9256,505 @@ class TestThreadPaneIsolation(RuleTestCase):
         self.assertEqual(seen[0][:3],
                          ["tmux", "-L", ride_watch.THREAD_TMUX_SOCKET])
         self.assertEqual(ride_watch.THREAD_TMUX_SOCKET, "ride-watch")
+
+
+
+# ---------------------------------------------------------------------------
+# 26.7 / 26.8 — the missed-bus watch, and progress that is not travel
+# ---------------------------------------------------------------------------
+
+REAL_LOG_0922 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-22.jsonl")
+# What the two 26.7 rules read, on top of what opens and moves a trip.
+RIDE_TYPES_0922 = RIDE_TYPES_0921 | {
+    "ADD_NOTIFICATION", "SET_LIVE_LEG_TIMES",
+    "REALTIME_VEHICLE_POSITIONS_RESPONSE", "START_REROUTE"}
+
+# 2026-09-22's geometry: I-35W & 98th St Station, stop 1:56831, and the stop
+# after it. The bus is 6 km south, at the Burnsville end, where it really was.
+STOP_98TH = ("1:56831", 44.825493, -93.290872)
+STOP_NEXT = "1:56832"
+BUS_FAR = (44.7719612, -93.2789764)          # vehicle 8228 at 08:38:38, 6.0 km
+
+
+def missed_bus_itinerary(trip_id="1:1346857", board_ms=None,
+                         access_m=2157.18):
+    """bike -> Orange Line -> bike, with the fields the 26.7 plumbing keeps."""
+    board_ms = board_ms if board_ms is not None else T0 + 600000
+    stop_id, lat, lon = STOP_98TH
+    return {"itinerary": {
+        "startTime": T0, "endTime": T0 + 3600000, "duration": 3600,
+        "legs": [
+            {"mode": "BICYCLE", "transitLeg": False, "distance": access_m,
+             "from": {"name": "(Current Location)", "lat": 44.8167536,
+                      "lon": -93.3104098, "stop": None},
+             "to": {"name": "I-35W & 98th St Station", "lat": lat,
+                    "lon": lon}},
+            {"mode": "BUS", "transitLeg": True, "distance": 16279.2,
+             "route": {"shortName": None, "longName": "METRO Orange Line",
+                       "gtfsId": "1:904"},
+             "routeId": "1:904", "tripId": trip_id,
+             "headsign": "ORANGE Downtown Minneapolis",
+             "startTime": board_ms, "endTime": board_ms + 1100000,
+             "from": {"name": "I-35W & 98th St Station", "lat": lat,
+                      "lon": lon, "stopId": stop_id,
+                      "stop": {"gtfsId": stop_id, "lat": lat, "lon": lon}},
+             "to": {"name": "I-35W & Lake St Station", "lat": 44.948626,
+                    "lon": -93.274662}},
+        ]}}
+
+
+def vehicle_poll(b, vehicles, route="1:904"):
+    """A REALTIME_VEHICLE_POSITIONS_RESPONSE as the trip sheet logs it."""
+    return b.action("REALTIME_VEHICLE_POSITIONS_RESPONSE",
+                    {"routeId": route, "vehicles": vehicles})
+
+
+def orange_vehicle(b, trip_id="1:1346857", next_stop=STOP_98TH[0],
+                   where=BUS_FAR, age_s=30, label="8148"):
+    """One feed entry whose AVL clock (`seconds`) is `age_s` behind now."""
+    return {"vehicleId": "1:" + label, "label": label, "tripId": trip_id,
+            "lat": where[0], "lon": where[1], "nextStopId": next_stop,
+            "nextStopName": "I-35W & 98th St Station",
+            "routeId": "1:904", "stopStatus": "IN_TRANSIT_TO",
+            "seconds": (b.t // 1000) - age_s}
+
+
+def missed_bus(b, board_ms, stop="I-35W & 98th St Station"):
+    return b.notification(
+        title="Missed bus", message="METRO Orange Line missed · next departure",
+        ntype="MISSED_BUS",
+        nid="MISSED_BUS_METRO Orange Line_%s_%d_%d" % (stop, board_ms, b.t))
+
+
+def bus_here(b, trip_id="1:1346857", stop_id=STOP_98TH[0]):
+    return b.notification(
+        title="Bus here", message="METRO Orange Line · I-35W & 98th St Station",
+        ntype="BOARD_BUS_ARRIVING",
+        nid="BOARD_BUS_ARRIVING_%s_%s_arriving_%d" % (stop_id, trip_id, b.t))
+
+
+def live_times(b, leg, board_ms, source):
+    return b.action("SET_LIVE_LEG_TIMES", {str(leg): {
+        "boardEpoch": board_ms, "boardSource": source, "boardRealtime": True,
+        "alightEpoch": board_ms + 1100000, "realtime": True}})
+
+
+class TestMissedBusPlumbing(RuleTestCase):
+    """The three things 26.7 needed the daemon to keep and it did not."""
+
+    def test_the_summary_keeps_the_boarding_stop_and_the_leg_length(self):
+        summary = ride_watch.summarize_itinerary(missed_bus_itinerary())
+        bike, bus = summary["legs"]
+        self.assertEqual(bike["distance"], 2157.18)
+        self.assertIsNone(bike["fromStopId"])     # a street leg has no stop
+        self.assertEqual(bus["fromStopId"], "1:56831")
+        self.assertEqual((bus["fromLat"], bus["fromLon"]),
+                         (44.825493, -93.290872))
+        self.assertEqual(bus["distance"], 16279.2)
+
+    def test_the_stop_id_is_read_from_either_field(self):
+        leg = {"from": {"name": "X", "stop": {"gtfsId": "1:7"}}}
+        self.assertEqual(ride_watch.leg_from_stop_id(leg), "1:7")
+        leg = {"from": {"name": "X", "stopId": "1:8", "stop": None}}
+        self.assertEqual(ride_watch.leg_from_stop_id(leg), "1:8")
+        self.assertIsNone(ride_watch.leg_from_stop_id({"from": {"stop": None}}))
+
+    def test_a_missing_distance_is_none_not_a_crash(self):
+        summary = ride_watch.summarize_itinerary(transit_itinerary())
+        self.assertIsNone(summary["legs"][0]["distance"])
+        self.assertIsNone(summary["legs"][1]["fromStopId"])
+
+    def test_the_vehicle_record_keeps_next_stop_and_its_own_clock(self):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000)
+        vehicle_poll(b, [orange_vehicle(b, age_s=36)])
+        watch = self.run_stream(b, finalize=False)
+        rec, age = watch._trip_vehicle(SESSION, "1:1346857", b.t)
+        self.assertEqual(rec["nextStopId"], "1:56831")
+        self.assertAlmostEqual(age, 36, delta=1)
+
+    def test_an_empty_poll_is_noted_and_does_not_erase_the_last_record(self):
+        """25.4: 7 of 236 polls on 09-22 came back empty. The early return
+        made those invisible; the record from the poll before still stands,
+        because it is still what the app had."""
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000)
+        vehicle_poll(b, [orange_vehicle(b)])
+        b.advance(16000)
+        vehicle_poll(b, [])
+        watch = self.run_stream(b, finalize=False)
+        polls = list(watch.route_polls[SESSION])
+        self.assertEqual([q["count"] for q in polls], [1, 0])
+        self.assertIsNotNone(watch._trip_vehicle(SESSION, "1:1346857", b.t))
+        self.assertEqual(
+            len(watch.route_vehicles[SESSION]["1:904"]["vehicles"]), 1)
+
+    def test_a_poll_the_trip_is_missing_from_keeps_the_trip_s_record(self):
+        """08:38:54 on 09-22 carried ten vehicles and not trip 1:1346857;
+        the 08:38:38 record was still the freshest the app had."""
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000)
+        vehicle_poll(b, [orange_vehicle(b)])
+        b.advance(16000)
+        vehicle_poll(b, [orange_vehicle(b, trip_id="1:999", label="8228")])
+        watch = self.run_stream(b, finalize=False)
+        self.assertIsNotNone(watch._trip_vehicle(SESSION, "1:1346857", b.t))
+
+    def test_an_older_avl_fix_does_not_replace_a_newer_one(self):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000)
+        vehicle_poll(b, [orange_vehicle(b, age_s=10, next_stop=STOP_NEXT)])
+        b.advance(5000)
+        vehicle_poll(b, [orange_vehicle(b, age_s=60)])   # older fix
+        watch = self.run_stream(b, finalize=False)
+        rec, _ = watch._trip_vehicle(SESSION, "1:1346857", b.t)
+        self.assertEqual(rec["nextStopId"], STOP_NEXT)
+
+    def test_a_record_past_the_app_s_stale_limit_is_not_believed(self):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000)
+        vehicle_poll(b, [orange_vehicle(b, age_s=100)])
+        b.advance(21000)                         # 121 s on the record's clock
+        watch = self.run_stream(b, finalize=False)
+        self.assertIsNone(watch._trip_vehicle(SESSION, "1:1346857", b.t))
+
+    def test_live_leg_times_are_kept_by_epoch_with_their_source(self):
+        board = T0 + 600000
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000)
+        live_times(b, 1, board, "stop")
+        b.advance(20000)
+        live_times(b, 1, board - 60000, "trip")
+        watch = self.run_stream(b, finalize=False)
+        times = watch.trips[SESSION].live_board_times
+        self.assertEqual(times[board]["source"], "stop")
+        self.assertEqual(times[board - 60000]["source"], "trip")
+
+
+class TestMissedBusStillComing(RuleTestCase):
+    """26.7: the call that cost the rider a bus, and nothing said so.
+
+    2026-09-22 08:38:55.108 MISSED_BUS for the 08:15 Orange Line at I-35W &
+    98th St, with START_REROUTE {reason: missed-bus, autoApply: true} 8 ms
+    later. At 08:38:38.236 vehicle 8148 on that trip was IN_TRANSIT_TO the
+    stop, 5.2 km south, its record 36 s old; and 08:15:00 was the
+    trip-sourced time the app had shown since 08:22:09 (26.1).
+    """
+
+    def waiting(self, trip_id="1:1346857"):
+        b = StreamBuilder().start(missed_bus_itinerary(trip_id=trip_id))
+        b.advance(1000).action("TRANSITION_LEG", {"legIndex": 1})
+        b.advance(1000).position().progress(leg=1, prog=0.0, stops=12)
+        return b
+
+    def test_the_bus_still_heading_for_the_stop_pages(self):
+        board = T0 + 600000
+        b = self.waiting()
+        b.advance(10000)
+        vehicle_poll(b, [orange_vehicle(b, age_s=36)])
+        b.advance(17000)
+        missed_bus(b, board)
+        watch = self.run_stream(b)
+        found = self.find(watch, "missed-bus-still-coming")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "page")
+        self.assertTrue(found[0]["context"]["vehicleArm"])
+        self.assertFalse(found[0]["context"]["epochArm"])
+        self.assertAlmostEqual(found[0]["context"]["recordAgeSec"], 53,
+                               delta=1)
+        sent = [p["body"] for p in watch.push_log if p.get("sent")]
+        self.assertEqual(sent, ["Missed-bus alert is wrong: METRO Orange Line"
+                                " still headed to I-35W & 98th St Station."])
+
+    def test_a_trip_sourced_board_time_alone_is_a_finding_not_a_page(self):
+        """The epoch arm says the arithmetic stood on a schedule; it does not
+        say where the bus is. No vehicle record at all here."""
+        board = T0 + 600000
+        b = self.waiting()
+        b.advance(5000)
+        live_times(b, 1, board, "trip")
+        b.advance(60000)
+        missed_bus(b, board)
+        watch = self.run_stream(b)
+        found = self.find(watch, "missed-bus-still-coming")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertTrue(found[0]["context"]["epochArm"])
+        self.assertIn("trip-sourced", found[0]["summary"])
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    def test_a_stop_sourced_board_time_is_not_evidence(self):
+        board = T0 + 600000
+        b = self.waiting()
+        b.advance(5000)
+        live_times(b, 1, board, "stop")
+        b.advance(60000)
+        missed_bus(b, board)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "missed-bus-still-coming"), [])
+
+    def test_a_bus_that_has_moved_on_is_a_real_miss(self):
+        """2026-09-04 11:22:41: the 537's record named the NEXT stop
+        (1:44393, not 1:57525) — it had gone by. Quiet."""
+        board = T0 + 600000
+        b = self.waiting()
+        b.advance(10000)
+        vehicle_poll(b, [orange_vehicle(b, next_stop=STOP_NEXT, age_s=20)])
+        b.advance(10000)
+        missed_bus(b, board)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "missed-bus-still-coming"), [])
+
+    def test_a_stale_record_is_not_evidence(self):
+        board = T0 + 600000
+        b = self.waiting()
+        b.advance(10000)
+        vehicle_poll(b, [orange_vehicle(b, age_s=100)])
+        b.advance(25000)                          # 125 s on its own clock
+        missed_bus(b, board)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "missed-bus-still-coming"), [])
+
+    def test_another_trip_s_bus_is_not_this_one(self):
+        board = T0 + 600000
+        b = self.waiting()
+        b.advance(10000)
+        vehicle_poll(b, [orange_vehicle(b, trip_id="1:1346052")])
+        b.advance(10000)
+        missed_bus(b, board)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "missed-bus-still-coming"), [])
+
+    def test_the_second_call_is_filed_and_does_not_page_again(self):
+        """08:39:27, 32 s after the first: both are findings, one page."""
+        board = T0 + 600000
+        b = self.waiting()
+        b.advance(10000)
+        vehicle_poll(b, [orange_vehicle(b)])
+        b.advance(5000)
+        missed_bus(b, board)
+        b.advance(32000)
+        vehicle_poll(b, [orange_vehicle(b)])
+        missed_bus(b, board + 660000)
+        watch = self.run_stream(b)
+        found = self.find(watch, "missed-bus-still-coming")
+        self.assertEqual([f["severity"] for f in found], ["page", "warn"])
+        self.assertEqual(len([p for p in watch.push_log
+                              if p.get("sent")]), 1)
+
+    def test_the_epoch_is_read_from_the_right_of_the_id(self):
+        nid = ("MISSED_BUS_METRO Orange Line_I-35W & 98th St Station_"
+               "1790082900000_1790084335102")
+        self.assertEqual(ride_watch.RideWatch._notification_epoch(nid),
+                         1790082900000)
+        self.assertIsNone(ride_watch.RideWatch._notification_epoch(
+            "MISSED_BUS_x"))
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0922),
+                         "%s not present" % REAL_LOG_0922)
+    def test_the_real_0922_calls_are_both_flagged(self):
+        watch = replay_real_window(self, REAL_LOG_0922,
+                                   (1790082240000, 1790086800000),
+                                   types=RIDE_TYPES_0922)
+        found = hits_of(watch, "missed-bus-still-coming")
+        self.assertEqual([(f["tsMs"], f["severity"]) for f in found],
+                         [(1790084335108, "page"), (1790084367067, "warn")],
+                         [(f["time"], f["summary"]) for f in found])
+        for f in found:
+            self.assertTrue(f["context"]["epochArm"])
+            self.assertTrue(f["context"]["vehicleArm"])
+        self.assertEqual(found[0]["context"]["tripId"], "1:1346857")
+        self.assertEqual(found[1]["context"]["tripId"], "1:1346052")
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0921),
+                         "%s not present" % REAL_LOG_0921)
+    def test_the_real_0921_lake_st_double_is_flagged(self):
+        """25.1: 17:05:45 / 17:06:06, vehicle 8142 still bound for Lake St
+        with a 62 s record — the guard 25.1 said should have fired."""
+        watch = replay_real_window(self, REAL_LOG_0921,
+                                   (1790027160000, 1790028480000),
+                                   types=RIDE_TYPES_0922)
+        found = hits_of(watch, "missed-bus-still-coming")
+        self.assertEqual([f["tsMs"] for f in found],
+                         [1790028345077, 1790028366038],
+                         [(f["time"], f["summary"]) for f in found])
+        self.assertEqual(found[0]["severity"], "page")
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0904),
+                         "%s not present" % REAL_LOG_0904)
+    def test_the_real_0904_miss_stays_quiet(self):
+        watch = replay_real_window(self, REAL_LOG_0904,
+                                   (1788537120000, 1788538980000),
+                                   types=RIDE_TYPES_0922)
+        self.assertEqual(hits_of(watch, "missed-bus-still-coming"), [])
+
+
+class TestBoardArrivalVehicleFar(RuleTestCase):
+    """26.7: "Bus here" with the bus 6 km away (08:16:52, 08:38:56)."""
+
+    def run_bus_here(self, where, age_s, twice=False):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=40.0)
+        b.advance(1000)
+        vehicle_poll(b, [orange_vehicle(b, where=where, age_s=age_s)])
+        bus_here(b)
+        if twice:
+            b.advance(30000)
+            vehicle_poll(b, [orange_vehicle(b, where=where, age_s=age_s)])
+            bus_here(b)
+        return self.run_stream(b)
+
+    def test_six_km_away_is_a_warning(self):
+        watch = self.run_bus_here(BUS_FAR, 13)
+        found = self.find(watch, "board-arrival-vehicle-far")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertAlmostEqual(found[0]["context"]["vehicleToStopM"], 6026,
+                               delta=10)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    def test_a_bus_at_the_stop_is_quiet(self):
+        # ~200 m north of the stop: every honest "Bus here" on disk was
+        # 12-290 m out.
+        watch = self.run_bus_here((44.827293, -93.290872), 30)
+        self.assertEqual(self.find(watch, "board-arrival-vehicle-far"), [])
+
+    def test_the_record_s_age_widens_the_limit(self):
+        # ~900 m out. A 60 s-old record could be a bus that has since covered
+        # it (limit 400 + 15*60 = 1300 m); a 10 s-old one could not (550 m).
+        where = (44.817393, -93.290872)
+        self.assertEqual(self.find(self.run_bus_here(where, 60),
+                                   "board-arrival-vehicle-far"), [])
+        self.assertEqual(len(self.find(self.run_bus_here(where, 10),
+                                       "board-arrival-vehicle-far")), 1)
+
+    def test_once_per_trip_and_stop(self):
+        watch = self.run_bus_here(BUS_FAR, 13, twice=True)
+        self.assertEqual(len(self.find(watch, "board-arrival-vehicle-far")), 1)
+
+    def test_no_record_no_verdict(self):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=40.0)
+        bus_here(b)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "board-arrival-vehicle-far"), [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0922),
+                         "%s not present" % REAL_LOG_0922)
+    def test_the_real_0922_pair_is_flagged(self):
+        watch = replay_real_window(self, REAL_LOG_0922,
+                                   (1790082240000, 1790086800000),
+                                   types=RIDE_TYPES_0922)
+        found = hits_of(watch, "board-arrival-vehicle-far")
+        self.assertEqual([f["tsMs"] for f in found],
+                         [1790083012086, 1790084336608],
+                         [(f["time"], f["summary"]) for f in found])
+        for f in found:
+            self.assertGreater(f["context"]["vehicleToStopM"], 6000)
+
+
+class TestProgressWithoutMotionNeedsTravel(RuleTestCase):
+    """26.8: a percentage that does not measure travel is not evidence.
+
+    2026-09-22 08:16:52 — `deviated`, 394 m off a parallel bike path, the
+    projection flipped ~300 m along it between two ticks. 08:39:26 and
+    08:44:50 — a 6.38 m BICYCLE leg, where a 1 m wobble is 15 points.
+    """
+
+    def ride(self, access_m=2157.18):
+        b = StreamBuilder().start(missed_bus_itinerary(access_m=access_m))
+        b.advance(1000).position().progress(leg=0, prog=60.0)
+        return b
+
+    def test_a_deviated_jump_files_nothing(self):
+        b = self.ride()
+        b.advance(1000).position_metres_north(3).progress(
+            leg=0, prog=62.0, status="deviated")
+        b.advance(1000).position_metres_north(6).progress(
+            leg=0, prog=74.0, status="deviated")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "progress-without-motion"), [])
+
+    def test_the_same_jump_on_track_still_fires(self):
+        b = self.ride()
+        b.advance(1000).position_metres_north(3).progress(leg=0, prog=62.0)
+        b.advance(1000).position_metres_north(6).progress(leg=0, prog=74.0)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1)
+
+    def test_a_six_metre_leg_has_no_percentage_to_trust(self):
+        b = self.ride(access_m=6.38)
+        b.advance(1000).position_metres_north(1).progress(leg=0, prog=72.0)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "progress-without-motion"), [])
+
+    def test_a_sixty_metre_leg_does(self):
+        b = self.ride(access_m=60.0)
+        b.advance(1000).position_metres_north(1).progress(leg=0, prog=72.0)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1)
+
+    def test_a_freeze_released_on_an_on_track_tick_still_fires(self):
+        """09-22 09:27:43, 12.17's freeze: pinned at 5.635 % through 19
+        deviated ticks while the rider moved, released on an on_track tick
+        to 23.15 %. The release is the defect and must survive."""
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=5.6)
+        for i in range(19):
+            b.advance(1000).position_metres_north(6 * (i + 1)).progress(
+                leg=0, prog=5.635, status="deviated")
+        b.advance(1000).position_metres_north(6 * 19 + 5).progress(
+            leg=0, prog=23.15)
+        watch = self.run_stream(b)
+        found = self.find(watch, "progress-without-motion")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertIn("5.6", found[0]["summary"])
+
+    def test_a_suppressed_tick_spends_the_cooldown(self):
+        """Suppressed, not skipped: a replay of 26.8 must only take findings
+        away, so the would-be firing still holds the window it always held.
+        (Letting it lapse un-masked seven firings across the 29 day files.)"""
+        b = self.ride()
+        b.advance(1000).position_metres_north(2).progress(
+            leg=0, prog=74.0, status="deviated")
+        b.advance(60000).position_metres_north(4).progress(leg=0, prog=90.0)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "progress-without-motion"), [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0922),
+                         "%s not present" % REAL_LOG_0922)
+    def test_the_real_0922_rides(self):
+        """Five firings -> two. Gone: 08:16:52 (deviated), 08:39:26 and
+        08:44:50 (6.38 m leg). Kept: 09:27:43 (the freeze above) and
+        09:10:38 — status `behind`, isOnRoute true at 29.6 m, a 1449.77 m leg:
+        neither of 26.8's tests describes it, see the row."""
+        watch = replay_real_window(self, REAL_LOG_0922,
+                                   (1790082240000, 1790088300000))
+        found = hits_of(watch, "progress-without-motion")
+        self.assertEqual([f["time"] for f in found],
+                         [ride_watch.fmt_hms(1790086238057),
+                          ride_watch.fmt_hms(1790087263061)],
+                         [(f["time"], f["summary"]) for f in found])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0909),
+                         "%s not present" % REAL_LOG_0909)
+    def test_the_real_0909_freeze_is_kept(self):
+        watch = replay_real_window(self, REAL_LOG_0909,
+                                   (1788963300000, 1788964620000))
+        times = [f["time"] for f in hits_of(watch, "progress-without-motion")]
+        self.assertIn("09:35:12", times)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0901),
+                         "%s not present" % REAL_LOG_0901)
+    def test_the_real_0901_one_tick_snap_is_kept(self):
+        """11:10:06, 0 % -> 100 % in one tick, status `completed` and
+        isOnRoute false at 132 m: the early "You have arrived". This is why
+        the isOnRoute arm the row proposed is not built."""
+        watch = replay_real_window(self, REAL_LOG_0901,
+                                   (1788277800000, 1788279120000))
+        times = [f["time"] for f in hits_of(watch, "progress-without-motion")]
+        self.assertIn("11:10:06", times)
 
 
 if __name__ == "__main__":

@@ -69,11 +69,13 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby, and the new plan neither keeps the same routes arriving at the same time **nor lands the rider on the trip they are riding** | page |
 | `riding-flip` | `SET_RIDING` tripId changes on the same transit leg | page |
 | `missed-bus-while-riding` | `MISSED_BUS` notification while riding is held | page |
+| `missed-bus-still-coming` | `MISSED_BUS` while the bus is still on its way: the trip's own vehicle record (fresh by the app's `VEHICLE_RECORD_STALE_SEC`, 120 s on the record's clock) still has the boarding stop as `nextStopId`, **or** the id's board epoch is a time the same ride showed with `boardSource 'trip'` | page on the vehicle arm, once a ride (warn otherwise) |
+| `board-arrival-vehicle-far` | `BOARD_BUS_ARRIVING` ("Bus here") while that trip's vehicle is more than 400 m + 15 m/s × the record's age from the boarding stop | warn, once per trip and stop |
 | `notification-repeat` | the same alert (id stem + title) twice in 5 minutes — and the same message too, where the stem's titles differ only in their numbers | page |
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
 | `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip, measured from the newest fix TIMESTAMP the stream holds — never from when the daemon last looked (19.2) | warn |
 | `position-teleport` | consecutive fixes >150m apart within 2s with **both** accuracies <30m, twice in a rolling minute | warn (page at 5 in a minute) |
-| `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m (the anchor's percentage is re-based on an itinerary swap, which changes the denominator and not the rider) | warn |
+| `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m (the anchor's percentage is re-based on an itinerary swap, which changes the denominator and not the rider). Never on a tick the app labels `deviated` or on a leg shorter than 50 m — those are suppressed, not skipped: they still re-anchor and spend the cooldown (26.8) | warn |
 | `reroute-storm` | more than 3 automatic re-plans in 5 minutes: **`autoApply: true`** `START_REROUTE`, plus every `AUTO_REPLAN` that has no `START_REROUTE` behind it (the quiet re-plan dispatches none) | warn |
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
 | `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
@@ -253,6 +255,33 @@ typed the complaint out by hand on a bike.
   pinned at `31.24200447554046` for fourteen ticks — while ordinary motion
   never does), and the GPS path length the rider covered inside it. A span of
   one tick is not a span and is not reported.
+  Since 2026-09-22 (26.8) a percentage that does not measure travel is never
+  the one that fires: a tick the app labels **`deviated`** (the projection of
+  a rider who is not on the route onto whichever segment is nearest — 09-22
+  08:16:52, 394 m off a parallel bike path, `nearestPoint` flipped ~300 m
+  along it between two ticks) or a leg **shorter than 50 m** (08:39:26 and
+  08:44:50, a 6.38 m bike leg). Such ticks are *suppressed*, not skipped:
+  they still move the anchor and spend the cooldown, because a deviated
+  stretch is exactly where 12.17's freeze lives (09-22 09:27:43, pinned at
+  5.635 % through 19 deviated ticks and released on an on_track one), and
+  because a replay of this change must only take findings away. Over the 29
+  day files: 31 firings → 15, none added.
+
+- **`missed-bus-still-coming`** and **`board-arrival-vehicle-far`** (26.7)
+  read the one record the daemon used to throw away: each vehicle's
+  `nextStopId` and its AVL clock (`seconds`), kept per trip across polls
+  (`trip_vehicles`) because the poll just before a call often does not carry
+  the trip at all (09-22 08:38:54). Every poll is also noted, empty ones
+  included (`route_polls`), so 25.4's blackouts are visible now.
+  `missed-bus-still-coming` fires when the trip's fresh record still has the
+  boarding stop next, or when the id's board epoch is a time the same ride
+  showed with `boardSource 'trip'` (`SET_LIVE_LEG_TIMES`, 26.1); it pages
+  only on the vehicle arm, once a ride. Over the 29 day files it fires on
+  exactly 09-21 17:05:45 / 17:06:06 (25.1) and 09-22 08:38:55 / 08:39:27, and
+  stays quiet on 09-04 11:22:41, where the 537's record had moved on to the
+  next stop — a real miss. `board-arrival-vehicle-far` separates cleanly:
+  every honest "Bus here" on disk had the bus 12–290 m out, every one it
+  fires on 2.5–6.0 km (ten, across seven days — 26.3's app defect).
 
 - **`early-leg-transition`** (2026-09-09, backlog 13.4) watches the one thing
   no rule here watched: the app advancing to the next leg. On 09-09 at
@@ -406,6 +435,7 @@ post-ride report covers that):
 | --- | --- | --- |
 | 50 | `stop-count-collapse` | the banner is lying about when to get off; acted on immediately |
 | 45 | `itinerary-backwards` | every time on the trip sheet is suspect, and they are reading it now |
+| 42 | `missed-bus-still-coming` | the app just dropped the bus they are waiting for and re-planned onto a later one; "keep waiting" expires when the bus arrives |
 | 40 | `missed-bus-while-riding` | a wrong alert telling a seated rider to move |
 | 38 | `replan-not-converging` | the app cannot get them there and has not said so; every minute spent waiting for the next plan is spent |
 | 37 | `unreachable-but-routable` | the app just told them to give up and is wrong; "ask again" expires |
