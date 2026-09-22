@@ -1070,10 +1070,19 @@ ROUTE_FEED_KEEP = 8
 #     trip end — plus a heartbeat if ten minutes pass silently while the rider
 #     is still moving. ~1 Hz telemetry never reaches the thread; the digest file
 #     does the detail and the ping is one line.
-#   * NEVER BLOCK THE TAILER. Bringing a Claude TUI up takes ~10s and every
-#     send-keys needs a beat before Enter, so the real tmux work happens on a
-#     worker thread. A dead pane, a missing tmux, a rider who typed /exit: all
+#   * NEVER BLOCK THE TAILER. Bringing a Claude TUI up takes ~10s, so the tmux
+#     work (spawn, a blocked-pane check, retirement) happens on a worker
+#     thread. A dead pane, a missing tmux, a rider who typed /exit: all
 #     logged, none fatal. Telemetry keeps being read and pages keep going out.
+#   * NOTHING IS TYPED INTO THE PANE. Since 2026-09-21 a milestone is one line
+#     appended to `<watch_dir>/<name>.events.log` (`#N [ride-watch] …`), and
+#     the thread itself watches that file with its Monitor tool — armed by the
+#     kickoff prompt it is launched with, re-armed from `#N` when the monitor
+#     expires. The keystroke era (send-keys, the Enter beat, pane-state holds,
+#     a permission dialog eating the wrap-up — 12.4 —, a line landing in
+#     whatever window the rider had active) is over. `_pane_state` survives
+#     only to page the rider once when the thread is stuck on a permission
+#     prompt, because only they can tap it.
 THREAD_ENABLED = os.environ.get("RIDE_THREAD_ENABLED", "1") not in (
     "0", "false", "no", "off")
 THREAD_RUNNER = os.path.join(REPO_DIR, "ride-watch", "ride-thread-run.sh")
@@ -1081,42 +1090,24 @@ THREAD_RUNNER = os.path.join(REPO_DIR, "ride-watch", "ride-thread-run.sh")
 # ("ride 07-31 14:32"). Overridable so an end-to-end test can spawn a real
 # thread without ever colliding with — or cleaning up — the rider's own.
 THREAD_NAME_PREFIX = os.environ.get("RIDE_THREAD_NAME_PREFIX", "ride")
+# The ride threads live on their OWN tmux server (`tmux -L ride-watch`), not
+# the rider's default one. Two reasons, both from 2026-09-21: the rider's own
+# sessions and the daemon's must never share a namespace a bare `tmux ls`
+# shows side by side, and a window the rider opens for something else must
+# not be able to land inside a ride session at all. To look at a thread from
+# a terminal: `tmux -L ride-watch attach -t ride-HHMM`.
+THREAD_TMUX_SOCKET = os.environ.get("RIDE_THREAD_TMUX_SOCKET", "ride-watch")
 THREAD_TMUX_SIZE = (200, 50)               # wide enough that the TUI wraps sanely
 THREAD_READY_TIMEOUT_S = 30                # TUI is usually up in 10-12s
 THREAD_READY_POLL_S = 1.0
 THREAD_READY_MARKER = "❯"             # the ❯ prompt = accepting input
-# ...but the ❯ box is drawn while the TUI is thinking too, and it is drawn
-# under a permission dialog as well, so the marker alone is not "listening".
-# Five consecutive rides lost their wrap-up to this (backlog 12.4): the line
-# was typed into a pane that was not at the prompt and the keystrokes went
-# somewhere else. On 2026-09-08 12:09 a `capture-pane` caught it in the act —
-# the pane was sitting on "Compound command contains `cd` with a relative file
-# read while a `Read()` deny rule exists — Do you want to proceed?" and the
-# Enter that followed answered THAT, taking the wrap-up with it.
-#
-# BUSY is survivable: the tty buffers keystrokes and the TUI reads them when
-# the turn ends, which is exactly what the spawn path already relies on. So a
-# busy pane is waited for and then typed into anyway. BLOCKED is not: typing
-# into a permission dialog answers the dialog. A blocked pane is waited for
-# and never typed into.
+# ...but the ❯ box is drawn while the TUI is thinking too, and under a
+# permission dialog as well. Nothing is typed any more, so the one reading
+# that still matters is BLOCKED: a thread stuck on a permission prompt cannot
+# act on its events until the rider taps, and they get one page about it.
 THREAD_BUSY_MARKERS = ("esc to interrupt",)
 THREAD_BLOCKED_MARKERS = ("Do you want to proceed?", "Do you want to allow",
                           "Do you want to make this edit")
-# How long a push waits for a pane that is not listening. The ordinary
-# milestone gives up quickly — a leg transition is worthless ten minutes late.
-THREAD_PUSH_HOLD_MS = 60 * 1000
-# ...and a busy pane is held for much less than that, because typing into one
-# is SAFE. Waiting the full hold on every push while the rider is chatting to
-# the thread would delay every milestone for a minute to avoid a problem that
-# does not exist. Blocked gets the whole hold; busy gets this.
-THREAD_PUSH_BUSY_HOLD_MS = 10 * 1000
-THREAD_PUSH_POLL_S = 2.0
-# The wrap-up is the one line that must land, so it keeps trying right up to
-# a minute before the missing-report page would fire anyway.
-THREAD_PUSH_WRAP_UP_HOLD_MS = 9 * 60 * 1000
-# send-keys of the text and send-keys of Enter must be two calls with a beat
-# between them; combined into one call the line is typed but never submitted.
-THREAD_SUBMIT_DELAY_S = 1.0
 THREAD_HEARTBEAT_MS = 10 * 60 * 1000
 THREAD_MOVING_MS = 2 * 60 * 1000           # a fix this recent = still riding
 THREAD_LINE_MAX = 400                      # one line, no exceptions
@@ -1358,11 +1349,34 @@ def short_boot_href(href, limit=BOOT_HREF_MAX):
 def one_line(text, limit=THREAD_LINE_MAX):
     """Collapse anything to a single bounded line.
 
-    Everything typed into the ride thread goes through here: a newline in a
-    rider's note would submit half a sentence and leave the rest in the box.
+    Everything appended to a ride thread's events file goes through here:
+    one event is one line, and a newline in a rider's note would be two.
     """
     s = " ".join(str(text).split())
     return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def thread_kickoff_prompt(name, display, events_path, digest_path, session):
+    """The ride thread's first message, handed to it on the command line.
+
+    It has to make the thread arm its own Monitor on the events file before
+    anything else, and say how to re-arm from the `#N` numbering, because
+    from here on nothing is ever typed into the pane.
+    """
+    return (
+        "You are the ride thread for Go Mode session %s (\"%s\"). The "
+        "ride-watch daemon appends one line per milestone to %s; each line is "
+        "numbered `#N [ride-watch] <what changed> - digest: %s`. FIRST, before "
+        "replying, arm the Monitor tool on that file: command "
+        "`tail -n +1 -F %s`, timeout_ms 1800000, description \"%s events\". "
+        "Every event line is a milestone: handle it as your brief says (read "
+        "the digest; one short line for a routine milestone; the trip-ended "
+        "line is the wrap-up). When the monitor expires, re-arm it at once "
+        "with `tail -n +M -F %s` where M is one past the highest #N you have "
+        "seen, so nothing is replayed or skipped. Do not poll the file by "
+        "hand. Reply to this message with one line saying the monitor is armed."
+        % (session, display, events_path, digest_path, events_path, name,
+           events_path))
 
 
 def ride_thread_sessions(names, prefix=THREAD_NAME_PREFIX):
@@ -1915,6 +1929,7 @@ class RideWatch:
         # pipeline board ("sick of agents reading ride messages when I ask
         # them to do something else"). See _pane_target.
         self._thread_pane = {}
+        self._thread_kickoff = {}      # tmux name -> the prompt it is born with
         # Panes the rider has already been paged about for sitting on a
         # permission prompt, and the count of lines that never got typed
         # because of one. Both are for the log and the status file; neither
@@ -3878,12 +3893,10 @@ class RideWatch:
                      " investigate anything else after; request: %s"
                      % (PROMOTION_DEADLINE_MS // 60000, req_path))
         self._thread_event(trip, t, line)
-        # The one line that must land. Everything else is a milestone the
-        # digest repeats anyway; this one is the whole wrap-up, so it waits
-        # for the pane rather than being typed over whatever is on it.
-        self._thread_push(trip, line,
-                          hold_ms=(THREAD_PUSH_WRAP_UP_HOLD_MS if req_path
-                                   else None))
+        # The one line that must land. It is appended like every other one;
+        # the thread's monitor wakes on it, and a pane stuck on a permission
+        # dialog gets the rider paged by the check that follows every push.
+        self._thread_push(trip, line)
         # Fallback: findings with nobody to write them up. Same push the report
         # agent's failure used to send — it is still exactly the right sentence.
         if n > 0 and self._thread_missing(trip):
@@ -6841,7 +6854,10 @@ class RideWatch:
                 self.log.info("replay: not spawning a ride thread")
                 return
             spawn = self._tmux_spawn
-        trip.thread = {"tmux": name, "display": display,
+        events = self._events_path(name)
+        self._thread_kickoff[name] = thread_kickoff_prompt(
+            name, display, events, self._digest_path(trip), trip.session)
+        trip.thread = {"tmux": name, "display": display, "events": events,
                        "spawnedMs": self.now_ms(), "ok": None}
         try:
             # None = pending: the real spawner hands the ~10s of TUI startup to
@@ -6886,14 +6902,8 @@ class RideWatch:
             del trip.thread_events[:drop]
             trip.thread_cursor = max(0, trip.thread_cursor - drop)
 
-    def _thread_push(self, trip, line, hold_ms=None):
-        """Rewrite the digest, then type one line into the thread.
-
-        `hold_ms` is how long the pusher may wait for a pane that is mid-turn
-        or sitting on a permission prompt. It reaches only the real tmux
-        pusher — the test stubs take (name, line) and a ride must not depend
-        on a stub growing a third parameter.
-        """
+    def _thread_push(self, trip, line):
+        """Rewrite the digest, then append one line to the thread's events file."""
         if not self._thread_ok(trip):
             return False
         try:
@@ -6923,14 +6933,12 @@ class RideWatch:
         if push is None:
             if self.replay:
                 return False
-            push = self._tmux_push
+            push = self._events_push
         try:
-            if hold_ms is not None and push is self._tmux_push:
-                push(trip.thread["tmux"], text, hold_ms=hold_ms)
-            else:
-                push(trip.thread["tmux"], text)
+            push(trip.thread["tmux"], text)
         except Exception as exc:
             self.log.error("ride thread push failed: %r" % exc)
+            self._thread_pushes_undelivered += 1
             return False
         self.log.info("ride thread push: %s" % text)
         self._mark_dirty()
@@ -7157,7 +7165,8 @@ class RideWatch:
 
     def _tmux(self, args, timeout=20):
         return subprocess.run(
-            ["tmux"] + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            ["tmux", "-L", THREAD_TMUX_SOCKET] + args,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, timeout=timeout,
             universal_newlines=True)
 
@@ -7170,16 +7179,36 @@ class RideWatch:
         self._thread_enqueue(("spawn", name, display))
         return None
 
-    def _tmux_push(self, name, line, hold_ms=None):
-        self._thread_enqueue(("push", name, line,
-                              THREAD_PUSH_HOLD_MS if hold_ms is None
-                              else hold_ms))
+    def _events_path(self, name):
+        return os.path.join(self.watch_dir, "%s.events.log" % name)
+
+    def _events_push(self, name, line):
+        """Append `#N <line>` to the thread's events file.
+
+        N is one past the lines already there, so a daemon restarted mid-ride
+        keeps counting and the thread's `tail -n +M` re-arm neither replays
+        nor skips a line. Synchronous and on the tailer: a file append is
+        instant, which is the whole point of not typing.
+        """
+        path = self._events_path(name)
+        n = 0
+        try:
+            with open(path, "r") as f:
+                for n, _ in enumerate(f, 1):
+                    pass
+        except FileNotFoundError:
+            pass
+        with open(path, "a") as f:
+            f.write("#%d %s\n" % (n + 1, line))
+        # The one thing the pane is still asked: is it stuck on a permission
+        # dialog? Then the rider gets one page, because only they can tap it.
+        self._thread_enqueue(("check", name, None))
         return True
 
     def _tmux_kill(self, name):
         """Queue the retirement. Same reason as the spawn: the tailer must not
-        wait on tmux, and a kill must not overtake the last push into the pane
-        it is killing."""
+        wait on tmux, and a kill must not overtake the blocked-pane check of
+        the last event."""
         self._thread_enqueue(("kill", name, None))
         return True
 
@@ -7193,8 +7222,8 @@ class RideWatch:
             self._thread_wake.set()
 
     def _thread_worker_loop(self):
-        """Serialize tmux work. Order matters: pushes must not overtake the
-        spawn they belong to, and two send-keys must not interleave."""
+        """Serialize tmux work. Order matters: a blocked-pane check must not
+        run before the spawn it belongs to, and a kill must not overtake it."""
         while True:
             self._thread_wake.wait(1.0)
             while True:
@@ -7208,10 +7237,8 @@ class RideWatch:
                         self._tmux_spawn_blocking(job[1], job[2])
                     elif job[0] == "kill":
                         self._tmux_kill_blocking(job[1])
-                    else:
-                        self._tmux_push_blocking(
-                            job[1], job[2],
-                            job[3] if len(job) > 3 else THREAD_PUSH_HOLD_MS)
+                    elif job[0] == "check":
+                        self._tmux_check_blocking(job[1])
                 except Exception as exc:
                     self.log.error("ride thread worker job %s failed: %r"
                                    % (job[0], exc))
@@ -7232,7 +7259,15 @@ class RideWatch:
 
     def _tmux_spawn_blocking(self, name, display):
         self._kill_previous_threads(keep=name)
-        cmd = "%s %s" % (shlex.quote(THREAD_RUNNER), shlex.quote(display))
+        # A fresh events file per thread, and the kickoff prompt as the TUI's
+        # first message via argv: the last thing that ever reached a thread
+        # through the keyboard was the kickoff line, and now nothing does.
+        try:
+            open(self._events_path(name), "w").close()
+        except OSError as exc:
+            self.log.error("events file for %s: %r" % (name, exc))
+        cmd = "%s %s %s" % (shlex.quote(THREAD_RUNNER), shlex.quote(display),
+                            shlex.quote(self._thread_kickoff.get(name, "")))
         res = self._tmux(["new-session", "-d", "-s", name,
                           "-x", str(THREAD_TMUX_SIZE[0]),
                           "-y", str(THREAD_TMUX_SIZE[1]),
@@ -7270,15 +7305,13 @@ class RideWatch:
                       % (name, THREAD_READY_TIMEOUT_S, alive))
 
     def _pane_state(self, name):
-        """What the pane is doing, from its own screen: the check 12.4 wanted.
+        """What the pane is doing, from its own screen. Read-only now.
 
-        "ready"   at the ❯ prompt, nothing pending — safe to type.
-        "busy"    running a turn. The tty buffers; safe to type, better to wait.
-        "blocked" a permission dialog is up. Typing answers the DIALOG and the
-                  line is lost, which is how ride-1040's wrap-up became the
-                  answer to a 418-second-old prompt.
-        "unknown" capture failed or the screen says nothing we recognise —
-                  type, exactly as this did before there was a check at all.
+        "ready"   at the ❯ prompt, nothing pending.
+        "busy"    running a turn.
+        "blocked" a permission dialog is up: the thread cannot act on its
+                  events until the rider taps it, so they are paged once.
+        "unknown" capture failed or the screen says nothing we recognise.
         """
         res = self._tmux(["capture-pane", "-p", "-t", self._pane_target(name)])
         if res.returncode != 0:
@@ -7291,29 +7324,6 @@ class RideWatch:
         if THREAD_READY_MARKER in pane:
             return "ready"
         return "unknown"
-
-    def _wait_for_pane(self, name, hold_ms):
-        """Hold the push until the pane is listening, or the hold runs out.
-
-        Returns the state it gave up in. Serialising this on the worker thread
-        is deliberate: a pane that cannot take this line cannot take the next
-        one either, and letting a heartbeat overtake a wrap-up is the ordering
-        bug _thread_worker_loop exists to prevent.
-        """
-        now = time.time()
-        hold = max(0, hold_ms) / 1000.0
-        deadlines = {"blocked": now + hold,
-                     "busy": now + min(hold, THREAD_PUSH_BUSY_HOLD_MS / 1000.0)}
-        state = self._pane_state(name)
-        logged = False
-        while state in deadlines and time.time() < deadlines[state]:
-            if not logged:
-                self.log.info("ride thread %s is %s; holding the push"
-                              % (name, state))
-                logged = True
-            time.sleep(THREAD_PUSH_POLL_S)
-            state = self._pane_state(name)
-        return state
 
     def _page_blocked_thread(self, name):
         """The rider can clear this one themselves, and only they can.
@@ -7332,38 +7342,13 @@ class RideWatch:
             " answer it.",
             kind="thread-blocked")
 
-    def _tmux_push_blocking(self, name, line, hold_ms=THREAD_PUSH_HOLD_MS):
-        # Is the pane actually listening? Before this it was never asked, and
-        # five consecutive rides lost their wrap-up to the answer (12.4).
-        state = self._wait_for_pane(name, hold_ms)
-        if state == "blocked":
-            # Never type. Enter here answers the dialog and the line is gone.
-            self.log.error("ride thread %s still blocked on a permission"
-                           " prompt after %ds; push NOT delivered: %s"
-                           % (name, hold_ms // 1000, one_line(line, 120)))
-            self._thread_pushes_undelivered += 1
+    def _tmux_check_blocking(self, name):
+        """After each event: is the thread stuck on a permission dialog? It
+        cannot act on the line until the rider taps, so tell them, once."""
+        if self._pane_state(name) == "blocked":
+            self.log.warn("ride thread %s is blocked on a permission prompt"
+                          % name)
             self._page_blocked_thread(name)
-            return
-        if state == "busy":
-            # The tty buffers it. Say so, so the log shows a late line rather
-            # than a lost one.
-            self.log.warn("ride thread %s still busy after %ds; typing anyway"
-                          % (name, hold_ms // 1000))
-        # -l types the line literally: a note containing `;` or `C-c` must
-        # never be interpreted as a tmux key name.
-        res = self._tmux(["send-keys", "-t", self._pane_target(name),
-                          "-l", line])
-        if res.returncode != 0:
-            self.log.error("send-keys failed for %s (%s); thread considered gone"
-                           % (name, one_line(res.stdout)))
-            self._thread_status[name] = False
-            return
-        time.sleep(THREAD_SUBMIT_DELAY_S)
-        res = self._tmux(["send-keys", "-t", self._pane_target(name), "Enter"])
-        if res.returncode != 0:
-            self.log.error("submit failed for %s (%s)"
-                           % (name, one_line(res.stdout)))
-            self._thread_status[name] = False
 
     def _tmux_kill_blocking(self, name):
         res = self._tmux(["kill-session", "-t", name])
@@ -7551,8 +7536,8 @@ class RideWatch:
         lines.append("- Last fix: %ds ago" % max(0, (now - trip.last_pos_ms) // 1000))
         lines.append("- Pages sent: %d/%d" % (trip.pages_sent, MAX_PAGES_PER_TRIP))
         if trip.thread:
-            lines.append("- Ride thread: tmux %s (%s), %d push(es)" % (
-                trip.thread["tmux"],
+            lines.append("- Ride thread: `tmux -L %s attach -t %s` (%s), %d event(s)" % (
+                THREAD_TMUX_SOCKET, trip.thread["tmux"],
                 {True: "up", False: "gone", None: "starting"}.get(
                     trip.thread.get("ok"), "?"),
                 trip.thread_pushes))

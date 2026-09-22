@@ -488,7 +488,7 @@ PUSH_KINDS = (
 
 
 class StubThread:
-    """Records what would have been typed, and the digest as it was then.
+    """Records what would have been pushed, and the digest as it was then.
 
     Reading the digest at push time is the point: asserting on the file after
     the ride would only prove the last write, and the promise is that the
@@ -3517,139 +3517,96 @@ BLOCKED_PANE = (
     "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n")
 
 
-class TestThreadPushWaitsForThePane(RuleTestCase):
-    """12.4(a). Five consecutive rides lost their wrap-up to a line typed into
-    a pane nobody had asked whether it was listening.
-
-    ride-1040 is the clearest: its `last-prompt` is the 10:42:42 finding push,
-    not the 10:49:44 wrap-up, and the tool_use of 10:42:48 got its result at
-    10:49:46 — two seconds after the daemon typed. The keystrokes answered a
-    418-second-old permission dialog and the wrap-up went with them.
+class TestThreadEventsFile(RuleTestCase):
+    """2026-09-21: nothing is typed into the pane. A milestone is one numbered
+    line appended to `<name>.events.log`; the thread watches the file with its
+    Monitor tool, armed by the kickoff prompt it is launched with. 12.4's
+    whole family (a wrap-up typed into a permission dialog) and the window
+    mix-up of the same evening cannot happen to a file append.
     """
 
-    def setUp(self):
-        RuleTestCase.setUp(self)
-        self.watch = quiet_watch(self.tmp)
-        # The poll is 2 s in the daemon; a test must not sleep through it.
-        original = ride_watch.THREAD_PUSH_POLL_S
-        ride_watch.THREAD_PUSH_POLL_S = 0
-        self.addCleanup(setattr, ride_watch, "THREAD_PUSH_POLL_S", original)
-        # ...nor through the beat between the text and the Enter.
-        submit = ride_watch.THREAD_SUBMIT_DELAY_S
-        ride_watch.THREAD_SUBMIT_DELAY_S = 0
-        self.addCleanup(setattr, ride_watch, "THREAD_SUBMIT_DELAY_S", submit)
-
-    def push(self, screens, hold_ms=50):
-        fake = ScriptedTmux(screens)
-        self.watch._tmux = fake
-        self.watch._tmux_push_blocking("ride-1040", "[ride-watch] wrap-up now",
-                                       hold_ms)
-        return fake
-
-    def test_a_ready_pane_is_typed_into_at_once(self):
-        fake = self.push([READY_PANE])
-        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
-        self.assertEqual(len(fake.submits()), 1)
-
-    def test_a_blocked_pane_is_never_typed_into(self):
-        """Enter here answers the dialog, not the thread. This is the whole
-        bug: the line is lost AND a permission decision is made by accident.
-        """
-        fake = self.push([BLOCKED_PANE])
-        self.assertEqual(fake.typed(), [])
-        self.assertEqual(fake.submits(), [])
-        self.assertEqual(self.watch._thread_pushes_undelivered, 1)
-
-    def test_a_pane_that_clears_its_prompt_gets_the_line(self):
-        fake = self.push([BLOCKED_PANE, BLOCKED_PANE, READY_PANE],
-                         hold_ms=5000)
-        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
-        self.assertEqual(self.watch._thread_pushes_undelivered, 0)
-
-    def test_a_busy_pane_is_waited_for_then_typed_into_anyway(self):
-        """A tty buffers keystrokes and the TUI reads them when the turn ends
-        — which is what the spawn path has always relied on. Busy is late,
-        not lost."""
-        fake = self.push([BUSY_PANE])
-        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
-
-    def test_a_busy_pane_that_settles_is_not_waited_out(self):
-        fake = self.push([BUSY_PANE, READY_PANE], hold_ms=5000)
-        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
-
-    def test_a_pane_we_cannot_read_is_typed_into_as_before(self):
-        """capture-pane failing is not evidence of anything, and a daemon that
-        went quiet on it would be worse than the bug."""
-        fake = self.push(["  nothing recognisable here\n"])
-        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
-
-    def test_the_rider_is_paged_once_per_blocked_pane(self):
-        """The dialog is sitting in their Claude app waiting for a tap, and
-        only they can clear it. A second buzz about the same pane says
-        nothing new."""
-        self.push([BLOCKED_PANE])
-        self.push([BLOCKED_PANE])
-        pages = [p for p in self.watch.push_log
-                 if p["kind"] == "thread-blocked"]
-        self.assertEqual(len(pages), 1, self.watch.push_log)
-        self.assertIn("permission prompt", pages[0]["body"])
-
-    def test_a_busy_pane_is_not_held_for_the_whole_wrap_up_window(self):
-        """Typing into a busy pane is safe, so waiting nine minutes for one
-        would delay every milestone to avoid a problem that does not exist.
-        Blocked gets the whole hold; busy gets ten seconds of it."""
-        self.assertLess(ride_watch.THREAD_PUSH_BUSY_HOLD_MS,
-                        ride_watch.THREAD_PUSH_HOLD_MS)
-        original = ride_watch.THREAD_PUSH_BUSY_HOLD_MS
-        ride_watch.THREAD_PUSH_BUSY_HOLD_MS = 50
-        self.addCleanup(setattr, ride_watch, "THREAD_PUSH_BUSY_HOLD_MS",
-                        original)
-        started = time.time()
-        fake = self.push([BUSY_PANE],
-                         hold_ms=ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS)
-        # The line still lands, and the loop gave up on the BUSY deadline
-        # rather than on the nine-minute one it was handed.
-        self.assertLess(time.time() - started, 5.0)
-        self.assertEqual(fake.typed(), ["[ride-watch] wrap-up now"])
-
-    def test_the_wrap_up_is_the_line_that_keeps_trying(self):
-        """A leg transition is worthless ten minutes late; the wrap-up is the
-        one line that must land, so it holds right up to a minute before the
-        missing-report page would fire anyway."""
-        self.assertGreater(ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS,
-                           ride_watch.THREAD_PUSH_HOLD_MS)
-        self.assertLess(ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS,
-                        ride_watch.REPORT_DEADLINE_MS)
-
-    def test_the_pane_state_reader_names_the_three_cases(self):
-        for screen, expected in ((READY_PANE, "ready"), (BUSY_PANE, "busy"),
-                                 (BLOCKED_PANE, "blocked"),
-                                 ("", "unknown")):
-            self.watch._tmux = ScriptedTmux([screen])
-            self.assertEqual(self.watch._pane_state("ride-1040"), expected)
-
-    def test_a_wrap_up_push_asks_for_the_long_hold(self):
-        """The hold reaches the real pusher only: the stubs take (name, line)
-        and a ride must not depend on a stub growing a parameter."""
-        holds = []
-
-        def fake_tmux_push(name, line, hold_ms=None):
-            holds.append(hold_ms)
-            return True
-
+    def ended_ride_watch(self):
         thread = StubThread()
         b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
         b.advance(1000).progress(stops=1, prog=21.0)
         b.advance(1000).stop()
         watch = self.run_stream(b, finalize=False, thread=thread)
         trip = watch.ended_trips[0]
-        watch.push_line = None
+        watch.push_line = None          # the real path, not the stub
         watch.replay = False
-        watch._tmux_push = fake_tmux_push
-        watch._thread_push(trip, "trip ended — wrap-up now",
-                           hold_ms=ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS)
+        watch._tmux = FakeTmux([])
+        return watch, trip
+
+    def events(self, watch, trip):
+        with open(watch._events_path(trip.thread["tmux"])) as f:
+            return f.read().splitlines()
+
+    def test_a_push_is_one_numbered_line_in_the_events_file(self):
+        watch, trip = self.ended_ride_watch()
+        watch._thread_push(trip, "leg 0 -> 1")
+        watch._thread_push(trip, "trip ended — wrap-up now")
+        lines = self.events(watch, trip)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[0].startswith(
+            "#1 [ride-watch] leg 0 -> 1 — digest: "), lines[0])
+        self.assertTrue(lines[1].startswith(
+            "#2 [ride-watch] trip ended — wrap-up now — digest: "), lines[1])
+        self.assertEqual(trip.thread["events"],
+                         watch._events_path(trip.thread["tmux"]))
+
+    def test_numbering_continues_after_a_restart(self):
+        """The re-arm is `tail -n +M`: a restarted daemon that started again
+        at #1 would replay three lines into the thread."""
+        watch, trip = self.ended_ride_watch()
+        with open(watch._events_path(trip.thread["tmux"]), "w") as f:
+            f.write("#1 a\n#2 b\n#3 c\n")
         watch._thread_push(trip, "leg 1 -> 2")
-        self.assertEqual(holds, [ride_watch.THREAD_PUSH_WRAP_UP_HOLD_MS, None])
+        self.assertTrue(self.events(watch, trip)[-1].startswith("#4 "))
+
+    def test_nothing_is_ever_typed(self):
+        watch, trip = self.ended_ride_watch()
+        watch._thread_push(trip, "leg 0 -> 1")
+        self.assertEqual([a for a in watch._tmux.calls
+                          if a[0] == "send-keys"], [])
+        self.assertEqual(watch._thread_pushes_undelivered, 0)
+
+    def test_a_blocked_pane_pages_the_rider_once(self):
+        """The dialog is sitting in their Claude app waiting for a tap, and
+        only they can clear it. A second buzz about the same pane says
+        nothing new."""
+        watch, trip = self.ended_ride_watch()
+        watch._tmux = ScriptedTmux([BLOCKED_PANE])
+        watch._tmux_check_blocking("ride-1040")
+        watch._tmux_check_blocking("ride-1040")
+        pages = [p for p in watch.push_log if p["kind"] == "thread-blocked"]
+        self.assertEqual(len(pages), 1, watch.push_log)
+        self.assertIn("permission prompt", pages[0]["body"])
+
+    def test_a_ready_or_busy_pane_pages_nobody(self):
+        watch, trip = self.ended_ride_watch()
+        for screen in (READY_PANE, BUSY_PANE, ""):
+            watch._tmux = ScriptedTmux([screen])
+            watch._tmux_check_blocking("ride-1040")
+        self.assertEqual([p for p in watch.push_log
+                          if p["kind"] == "thread-blocked"], [])
+
+    def test_the_pane_state_reader_names_the_three_cases(self):
+        watch = quiet_watch(self.tmp)
+        for screen, expected in ((READY_PANE, "ready"), (BUSY_PANE, "busy"),
+                                 (BLOCKED_PANE, "blocked"),
+                                 ("", "unknown")):
+            watch._tmux = ScriptedTmux([screen])
+            self.assertEqual(watch._pane_state("ride-1040"), expected)
+
+    def test_the_kickoff_prompt_arms_and_re_arms_the_monitor(self):
+        p = ride_watch.thread_kickoff_prompt(
+            "ride-1646", "ride 09-21 16:46", "/x/ride-1646.events.log",
+            "/x/sess.digest.md", "sess")
+        self.assertIn("Monitor", p)
+        self.assertIn("tail -n +1 -F /x/ride-1646.events.log", p)
+        self.assertIn("tail -n +M -F /x/ride-1646.events.log", p)
+        self.assertIn("/x/sess.digest.md", p)
+        self.assertIn("1800000", p)
 
 
 class TestDaemonProvenance(RuleTestCase):
@@ -8342,73 +8299,108 @@ class TestRidingFactDropped(RuleTestCase):
         self.assertEqual(found[0]["context"]["tripId"], "1:1268952")
 
 
-class TestThreadPushTargetsThePaneItSpawned(RuleTestCase):
-    """2026-09-21 16:46 ride: `send-keys -t ride-1646` is "that session's
-    ACTIVE window", and the rider had opened a second window in it for an
-    unrelated Claude session — four milestones and a rider note were typed
-    into a session that was rebuilding the pipeline board. Every read and
-    every keystroke goes to the pane `new-session -P` handed back, or failing
-    that to the session's first window; never to the bare session name."""
+class PaneTmux(ScriptedTmux):
+    """A ScriptedTmux whose `new-session -P` answers with a pane id."""
 
-    class PaneTmux(ScriptedTmux):
-        def __init__(self, screens, pane_id):
-            ScriptedTmux.__init__(self, screens)
-            self.pane_id = pane_id
+    def __init__(self, screens, pane_id):
+        ScriptedTmux.__init__(self, screens)
+        self.pane_id = pane_id
 
-        def __call__(self, args, timeout=20):
-            if args[0] == "new-session":
-                self.calls.append(args)
-                return TmuxResult(0, self.pane_id)
-            return ScriptedTmux.__call__(self, args, timeout)
+    def __call__(self, args, timeout=20):
+        if args[0] == "new-session":
+            self.calls.append(args)
+            return TmuxResult(0, self.pane_id)
+        return ScriptedTmux.__call__(self, args, timeout)
 
-        def targets(self, verb):
-            return [a[a.index("-t") + 1] for a in self.calls if a[0] == verb]
+    def targets(self, verb):
+        return [a[a.index("-t") + 1] for a in self.calls if a[0] == verb]
+
+
+class TestThreadPaneIsolation(RuleTestCase):
+    """2026-09-21 16:46 ride: `-t ride-1646` is "that session's ACTIVE
+    window", and the rider had opened a second window in it for an unrelated
+    Claude session — four milestones and a rider note were typed into a
+    session that was rebuilding the pipeline board. Typing is gone; what
+    tmux still does (spawn, readiness poll, blocked check, kill) is pinned to
+    the pane it spawned, on the daemon's own server."""
 
     def setUp(self):
         RuleTestCase.setUp(self)
         self.watch = quiet_watch(self.tmp)
-        for attr in ("THREAD_PUSH_POLL_S", "THREAD_SUBMIT_DELAY_S",
-                     "THREAD_READY_POLL_S"):
-            original = getattr(ride_watch, attr)
-            setattr(ride_watch, attr, 0)
-            self.addCleanup(setattr, ride_watch, attr, original)
+        original = ride_watch.THREAD_READY_POLL_S
+        ride_watch.THREAD_READY_POLL_S = 0
+        self.addCleanup(setattr, ride_watch, "THREAD_READY_POLL_S", original)
+        self.watch._thread_kickoff["ride-1646"] = "arm the monitor on X"
 
-    def spawn_and_push(self, pane_id):
-        fake = self.PaneTmux([READY_PANE], pane_id)
+    def spawn(self, pane_id):
+        fake = PaneTmux([READY_PANE], pane_id)
         self.watch._tmux = fake
         self.watch._tmux_spawn_blocking("ride-1646", "ride 09-21 16:46")
-        self.watch._tmux_push_blocking("ride-1646", "[ride-watch] leg 0 -> 1",
-                                       50)
         return fake
 
     def test_the_spawn_asks_tmux_for_the_pane_id(self):
-        fake = self.spawn_and_push("%120\n")
+        fake = self.spawn("%120\n")
         new = [a for a in fake.calls if a[0] == "new-session"][0]
         self.assertIn("-P", new)
         self.assertEqual(new[new.index("-F") + 1], "#{pane_id}")
         self.assertEqual(self.watch._thread_pane, {"ride-1646": "%120"})
 
-    def test_reads_and_keystrokes_go_to_that_pane_never_the_session(self):
-        fake = self.spawn_and_push("%120\n")
+    def test_the_spawn_hands_the_kickoff_prompt_to_the_runner(self):
+        fake = self.spawn("%120\n")
+        cmd = [a for a in fake.calls if a[0] == "new-session"][0][-1]
+        self.assertIn("ride-thread-run.sh", cmd)
+        self.assertIn("arm the monitor on X", cmd)
+
+    def test_the_spawn_starts_an_empty_events_file(self):
+        path = self.watch._events_path("ride-1646")
+        with open(path, "w") as f:
+            f.write("#1 stale line from an earlier life\n")
+        self.spawn("%120\n")
+        self.assertEqual(open(path).read(), "")
+
+    def test_reads_go_to_that_pane_never_the_session(self):
+        fake = self.spawn("%120\n")
+        self.watch._tmux_check_blocking("ride-1646")
         self.assertEqual(set(fake.targets("capture-pane")), {"%120"})
-        self.assertEqual(fake.targets("send-keys"), ["%120", "%120"])
-        self.assertEqual(fake.typed(), ["[ride-watch] leg 0 -> 1"])
-        self.assertNotIn("ride-1646", fake.targets("send-keys"))
+        self.assertNotIn("ride-1646", fake.targets("capture-pane"))
 
     def test_without_a_pane_id_the_first_window_is_the_target(self):
         """An older tmux, or a stub, answers nothing: the session's
         lowest-numbered window is the one new-session made, so `:^` still
-        cannot land in a window the rider opened later."""
-        fake = self.spawn_and_push("")
+        cannot be a window the rider opened later."""
+        fake = self.spawn("")
         self.assertEqual(self.watch._thread_pane, {})
-        self.assertEqual(fake.targets("send-keys"), ["ride-1646:^"] * 2)
+        self.watch._tmux_check_blocking("ride-1646")
         self.assertEqual(set(fake.targets("capture-pane")), {"ride-1646:^"})
 
+    def test_nothing_is_typed_by_spawn_or_check(self):
+        fake = self.spawn("%120\n")
+        self.watch._tmux_check_blocking("ride-1646")
+        self.assertEqual(fake.typed(), [])
+        self.assertEqual(fake.submits(), [])
+
     def test_the_session_itself_is_still_killed_by_name(self):
-        fake = self.spawn_and_push("%120\n")
+        fake = self.spawn("%120\n")
         self.watch._tmux_kill_blocking("ride-1646")
         self.assertEqual(fake.targets("kill-session"), ["ride-1646"])
         self.assertEqual(self.watch._thread_pane, {})
+
+    def test_every_tmux_call_goes_to_the_ride_watch_server(self):
+        """Own socket: the rider's `tmux ls` never lists a ride session and a
+        window they open can never be inside one."""
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append(argv)
+            return TmuxResult(0, "")
+
+        original = ride_watch.subprocess.run
+        ride_watch.subprocess.run = fake_run
+        self.addCleanup(setattr, ride_watch.subprocess, "run", original)
+        self.watch._tmux(["has-session", "-t", "ride-1646"])
+        self.assertEqual(seen[0][:3],
+                         ["tmux", "-L", ride_watch.THREAD_TMUX_SOCKET])
+        self.assertEqual(ride_watch.THREAD_TMUX_SOCKET, "ride-watch")
 
 
 if __name__ == "__main__":

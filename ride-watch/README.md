@@ -526,11 +526,19 @@ free suffix (`ride-1852b`) when the minute is already spoken for.
 
 ### How data reaches it
 
-The daemon **types one line per milestone** and nothing else:
+The daemon **appends one line per milestone** to the thread's events file
+(`~/otp-debug-logs/ride-watch/<name>.events.log`) and nothing else:
 
 ```
-[ride-watch] <what changed> — digest: ~/otp-debug-logs/ride-watch/<session>.digest.md
+#N [ride-watch] <what changed> — digest: ~/otp-debug-logs/ride-watch/<session>.digest.md
 ```
+
+**Nothing is typed into the pane** (since 2026-09-21). The thread is launched
+with a kickoff prompt on its command line that makes it arm its own `Monitor`
+on that file (`tail -n +1 -F`), and every appended line reaches it as a
+notification; when the monitor expires (30 min) the thread re-arms from `#N`,
+so a line is never replayed or skipped. `#N` restarts from the file, so a
+daemon restarted mid-ride keeps counting.
 
 Milestones are exactly: **trip start · leg transition · any rule finding ·
 rider note · trip end · a heartbeat only if 10 minutes pass silently while the
@@ -540,21 +548,30 @@ carries the trip summary, current state, everything new since the last push, all
 findings and all rider notes — so a thread that reads it is never behind, even
 if a push was lost.
 
-Two mechanical details, both learned the hard way and both load-bearing:
-`send-keys` of the text and `send-keys Enter` must be **separate calls with a
-beat between them** (combined, the line is typed but never submitted), and every
-line is collapsed to one line by `one_line()`, because a newline in a rider's
-note would submit half a sentence.
+Why a file and not keystrokes: the keystroke era needed `send-keys` + a beat +
+`Enter`, a screen-scrape to guess whether the pane was at its prompt, mid-turn
+or on a permission dialog, holds of a minute to nine minutes, and it still
+answered a 418-second-old dialog with a wrap-up once (12.4) and typed a whole
+ride into the wrong window once (2026-09-21). A file append is instant, cannot
+answer a dialog, and cannot land anywhere else.
 
-A third one, learned 2026-09-21: every `capture-pane` and `send-keys` targets
-the **pane id** `new-session -P` handed back (`%120`), falling back to the
-session's first window (`ride-1646:^`) — never the bare session name. `-t
-ride-1646` means "that session's *active* window", and a rider who opens a
-second window in the ride's session for some other Claude conversation would
-otherwise have the ride typed into it (four milestones and a rider note landed
-in a session rebuilding the pipeline board that evening).
+What is left of tmux, all learned the hard way and all still load-bearing:
 
-None of it runs on the tailer: spawning and typing happen on a worker thread, so
+* **Own tmux server.** Every tmux call runs as `tmux -L ride-watch …`
+  (`RIDE_THREAD_TMUX_SOCKET`), so the rider's `tmux ls` never lists a ride
+  session and nothing they open in their own tmux can be inside one. To look
+  at a thread from a terminal: `tmux -L ride-watch attach -t ride-HHMM` (the
+  status file prints the exact command).
+* **Pane id, not session name.** The readiness poll at spawn and the
+  blocked-pane check read the pane id `new-session -P` handed back (`%120`),
+  falling back to the session's first window (`ride-1646:^`). `-t ride-1646`
+  means "that session's *active* window", which is whatever the rider is
+  looking at.
+* **The blocked-pane check.** After every event the worker reads the pane
+  once (`_pane_state`); a permission dialog means the thread cannot act on
+  its events until the rider taps, so they are paged once per pane.
+
+None of it runs on the tailer: spawning and the check happen on a worker thread, so
 a 12-second TUI startup never stalls telemetry reading, and a dead pane, a
 missing tmux or a rider who typed `/exit` are logged and survived.
 
@@ -702,39 +719,20 @@ minutes in the past, so a deadline armed from it was already expired. On
 paged about the missing report in the same second, before the thread had even
 been handed the request.
 
-**And the push now asks the pane whether it is listening** (backlog 12.4).
-`_tmux_push_blocking` used to `send-keys -l <text>`, sleep, `send-keys Enter`,
-with no check of any kind; `THREAD_READY_MARKER` was polled exactly once, at
-spawn. On `ride-1040` the consequence is legible in the transcript: its
-`last-prompt` is the **10:42:42 finding push**, not the 10:49:44 wrap-up, and
-the `tool_use` of 10:42:48 got its `tool_result` at **10:49:46** — two seconds
-after the daemon typed. The keystrokes answered a 418-second-old permission
-dialog and the wrap-up went with them. (Whole-session `totalToolDuration`:
-286 ms. Those 418 seconds were waiting, not working.)
+**The pane is read, never typed into** (backlog 12.4, and the 2026-09-21
+rewrite). The keystroke pusher used to `send-keys -l <text>`, sleep,
+`send-keys Enter`; on `ride-1040` its `last-prompt` was the **10:42:42 finding
+push**, not the 10:49:44 wrap-up, and the `tool_use` of 10:42:48 got its
+`tool_result` at **10:49:46** — two seconds after the daemon typed. The
+keystrokes answered a 418-second-old permission dialog and the wrap-up went
+with them. Holds and screen-scraping made that rarer; moving delivery to the
+events file made it impossible. What `_pane_state()` still answers, after each
+event, on the worker thread:
 
-`_pane_state()` now reads the screen with `capture-pane` before every push and
-returns one of four answers:
-
-| state | screen says | what the pusher does |
+| state | screen says | what happens |
 | --- | --- | --- |
-| `ready` | the `❯` prompt, nothing pending | type it |
-| `busy` | `esc to interrupt` | wait, then type anyway — a tty buffers, so busy is *late*, not lost |
-| `blocked` | `Do you want to proceed?` | **never type**; wait, and page the rider once per pane |
-| `unknown` | capture failed, or nothing recognisable | type, exactly as before there was a check |
-
-The hold is `THREAD_PUSH_HOLD_MS` (60s) for an ordinary milestone — a leg
-transition is worthless ten minutes late — and
-`THREAD_PUSH_WRAP_UP_HOLD_MS` (9 min) for the trip-end line, which is the one
-line that must land and so keeps trying until a minute before the
-missing-report page would fire anyway. A **busy** pane is capped much lower
-(`THREAD_PUSH_BUSY_HOLD_MS`, 10s) whatever the hold says: typing into one is
-safe, so waiting nine minutes for a thread that is simply mid-answer would
-delay every milestone to avoid a problem that does not exist. A blocked pane costs the rider one
-push, *"Ride thread is waiting on a permission prompt — open Claude and answer
-it"*: the dialog is sitting in their app waiting for a tap and nobody else can
-clear it. Holding on the worker thread is deliberate — a pane that cannot take
-this line cannot take the next one, and letting a heartbeat overtake a wrap-up
-is the ordering bug `_thread_worker_loop` exists to prevent.
+| `blocked` | `Do you want to proceed?` | the rider is paged once per pane: *"Ride thread is waiting on a permission prompt — open Claude and answer it"* — the dialog is in their app and nobody else can clear it; the events keep queueing behind it |
+| anything else | the `❯` prompt, `esc to interrupt`, or nothing recognisable | nothing — the monitor delivers the line whenever the thread is next free |
 
 The deadline also records **which tmux pane** was asked, and
 `_kill_previous_threads` spares that pane. The next ride's thread used to kill
