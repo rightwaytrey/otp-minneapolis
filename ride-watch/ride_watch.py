@@ -312,8 +312,24 @@ STOP_COLLAPSE_MAX_PROGRESS = 60.0          # percent; fallback only (see above)
 STOP_COLLAPSE_NEAR_STOP_M = 100.0
 DEVIATED_STREAK_MS = 90 * 1000
 GPS_GAP_MS = 60 * 1000
+# How far back an UPDATE_POSITION's own `payload.timestamp` may sit behind the
+# action's `t` and still be believed as the moment of the fix (19.2). The pair
+# is normally tens of milliseconds apart (2026-09-21 08:13:21: timestamp
+# ...401803, t ...401835, 32 ms), so this is a sanity bound and not a tuning
+# knob: outside it the record is not a fix clock and `t` is used instead. A
+# timestamp AHEAD of `t` is never believed at all — a fix is taken before the
+# action that carries it is dispatched, and a clock running fast would close
+# gaps that are real.
+FIX_TIMESTAMP_MAX_LAG_MS = 5 * 60 * 1000
 REROUTE_STORM_WINDOW_MS = 5 * 60 * 1000
 REROUTE_STORM_COUNT = 3                    # "> 3 in 5 min" pages on the 4th
+# One re-plan reaches the stream as TWO records on the paths that have a
+# START_REROUTE: the action is dispatched when the fetch is issued and
+# AUTO_REPLAN when the answer is judged. Measured across every day file on
+# disk, START_REROUTE -> its settle is 0.07 s min / 2.4 s median, so 30 s pairs
+# them with room to spare and still cannot reach the next re-plan on a
+# ~90 s cadence. See _on_auto_replan (17.9d).
+REPLAN_PAIR_WINDOW_MS = 30 * 1000
 DISTANCE_SPIKE_FAR_M = 2000.0
 DISTANCE_SPIKE_NEAR_M = 200.0
 RIDER_ACTION_WINDOW_MS = 30 * 1000         # explicit action shields aboard-swap
@@ -1435,6 +1451,35 @@ def read_pushover_creds(path):
     raise ValueError("could not parse pushover credentials at %s" % path)
 
 
+def fix_time_ms(obj):
+    """When an UPDATE_POSITION record's fix was TAKEN, in epoch ms.
+
+    19.2. Every gap this daemon reports is `now - the newest fix time`, and
+    "newest fix time" has three candidate readings: when the daemon processed
+    the record, when the action was dispatched (`t`), and when the receiver
+    actually produced the fix (`payload.timestamp`, the native
+    GeolocationPosition clock). The first is the one that was wrong on
+    2026-09-19 and 2026-09-21 — it measures the daemon's own blindness — and
+    it is gone. Between the other two this prefers the receiver's, which is
+    the only one that is about the rider at all.
+
+    In practice they differ by tens of milliseconds, so this changes no
+    number the rider ever sees; it changes what the number MEANS, which is
+    what the row asked for. Returns None when the record carries no usable
+    clock at all.
+    """
+    t = obj.get("t")
+    if not isinstance(t, (int, float)) or isinstance(t, bool):
+        return None
+    t = int(t)
+    payload = obj.get("payload")
+    ts = payload.get("timestamp") if isinstance(payload, dict) else None
+    if (isinstance(ts, (int, float)) and not isinstance(ts, bool)
+            and t - FIX_TIMESTAMP_MAX_LAG_MS <= ts <= t):
+        return int(ts)
+    return t
+
+
 def meters_between(a, b):
     """Great-circle distance between two (lat, lon) fixes, in metres."""
     lat1, lon1 = a
@@ -1655,6 +1700,17 @@ class Trip:
         self.riding_dropped_fired = False
         self.progress = None                      # last UPDATE_PROGRESS snapshot
         self.last_pos_ms = start_ms
+        # ...but that seed is the trip START, not a fix, and until a real one
+        # lands every "no GPS fix for Ns" computed from it is a measurement of
+        # the DAEMON (19.2). 2026-09-19 14:38:35: 99 s, which is exactly
+        # 14:38:35 - 14:36:56, the trip start, on a phone that sent 120 fixes
+        # in that window with no inter-fix gap over 30 s. This flag is what
+        # lets the gap rule and the digest tell the two apart.
+        self.last_pos_is_fix = False
+        # Set when a ride opens out of the backlog (missed-start): for one
+        # GPS_GAP_MS the daemon is allowed to be wrong about what it has not
+        # read yet, because by construction it cannot know. See _rule gps-gap.
+        self.gps_gap_suppressed_until_ms = 0
         self.last_fix = None                      # (lat, lon) of the last fix
         self.gps_gap_open = False
         self.gps_gap_started_ms = None            # last_pos_ms when the gap opened
@@ -1717,6 +1773,11 @@ class Trip:
         self.deviated_since_ms = None
         self.deviated_fired = False
         self.reroute_times = collections.deque()
+        # START_REROUTE records still waiting for their AUTO_REPLAN verdict,
+        # as (tMs, reason). One re-plan is one entry however many records it
+        # writes; see _on_auto_replan (17.9d).
+        self.pending_reroutes = collections.deque()
+        self.snapshot_reason_logged = False       # once a ride
         self.reroute_storm_last_ms = 0
         self.prev_dist = None
         self.last_route_match = None               # last UPDATE_ROUTE_MATCH
@@ -2265,7 +2326,14 @@ class RideWatch:
                 self._rule_console(trip, t, obj)
                 self._rule_wake_lock_denied(trip, t, obj)
             elif typ == "UPDATE_POSITION":
-                trip.last_pos_ms = max(trip.last_pos_ms, t)
+                # The fix's own clock, not the action's and emphatically not
+                # the daemon's (19.2 — fix_time_ms says which and why).
+                fix_ms = fix_time_ms(obj)
+                if fix_ms is None:
+                    fix_ms = t
+                trip.last_pos_ms = (max(trip.last_pos_ms, fix_ms)
+                                    if trip.last_pos_is_fix else fix_ms)
+                trip.last_pos_is_fix = True
                 self._note_session_fix(session, t, obj.get("payload") or {})
                 # Only a fix that actually closes the gap closes the gap. A
                 # phone coming back onto the network replays its buffered
@@ -2275,7 +2343,7 @@ class RideWatch:
                 # that produced sixteen gps-gap findings inside one second,
                 # with the reported gap shrinking 108s -> 60s as the backlog
                 # drained. One unbroken gap should be one finding.
-                if self.now_ms() - t < GPS_GAP_MS:
+                if self.now_ms() - fix_ms < GPS_GAP_MS:
                     trip.gps_gap_open = False
                     trip.gps_gap_started_ms = None
                 self._on_position(trip, t, obj.get("payload") or {})
@@ -2312,6 +2380,8 @@ class RideWatch:
                 self._on_notification(trip, t, obj.get("payload") or {})
             elif typ == "START_REROUTE":
                 self._on_start_reroute(trip, t, obj.get("payload") or {})
+            elif typ == "AUTO_REPLAN":
+                self._on_auto_replan(trip, t, obj.get("payload") or {})
             elif typ == "REROUTE_SNAPSHOT":
                 self._on_reroute_snapshot(trip, t, obj.get("payload") or {})
             elif typ in ("REMEMBER_SEARCH", "ROUTING_REQUEST"):
@@ -2533,6 +2603,21 @@ class RideWatch:
             self.log.error("recovered start for %s opened no trip" % session)
             return
         trip.last_event_ms = max(trip.last_event_ms, t)
+        # The gap this ride is about is the FOLLOWER's, not the phone's (19.2).
+        # The stream holds the fixes that were never processed; read the newest
+        # of them back and start the trip from there rather than from the
+        # moment the rider pressed Go. On 2026-09-19 the difference was the
+        # whole finding: 120 fixes ran 14:36:56 -> 14:38:54 with no inter-fix
+        # gap over 30 s, and the daemon reported "no GPS fix for 99s".
+        self._seed_last_fix_from_stream(trip, t)
+        # Belt and braces for the case the seed cannot cover: on 2026-09-21
+        # 16:07:29 the ride's fixes existed on the Linode and had not reached
+        # this host's mirror yet, so there was nothing on disk to seed from and
+        # the rule fired "no GPS fix for 136 s" — again exactly the time since
+        # the start, against a real gap of 80 s. A daemon that has just
+        # admitted it was reading the stream late has no standing to call the
+        # next minute of it a GPS outage.
+        trip.gps_gap_suppressed_until_ms = int(t) + GPS_GAP_MS
         # Not `resumed-trip`: this ride HAS a start and IS replayable, and the
         # whole cost of 09-15 was a thread spending its wrap-up disproving the
         # opposite. What is worth a finding is the thing that actually went
@@ -2700,6 +2785,38 @@ class RideWatch:
                 starts.append((int(ot), obj))
         starts.sort(key=lambda e: e[0])
         return starts
+
+    def _seed_last_fix_from_stream(self, trip, t):
+        """Point a late-opened trip's fix clock at the newest fix on disk.
+
+        Same source as _recover_go_mode_starts and for the same reason: the
+        one claim that cannot be made from the follower's output is "this is
+        not in the stream". Bounded to the trip's own window — a fix from
+        before the rider pressed Go says nothing about this ride — and it
+        never moves the clock backwards past the start.
+
+        Returns the seeded ms, or None when the stream holds no fix for this
+        ride (which is a real answer: see the caller's second guard).
+        """
+        newest = None
+        for obj in self._tail_records():
+            if (obj.get("session") != trip.session
+                    or obj.get("type") != "UPDATE_POSITION"):
+                continue
+            fix_ms = fix_time_ms(obj)
+            if fix_ms is None or fix_ms > t or fix_ms < trip.start_ms:
+                continue
+            if newest is None or fix_ms > newest:
+                newest = fix_ms
+        if newest is None:
+            return None
+        trip.last_pos_ms = newest
+        trip.last_pos_is_fix = True
+        self.log.info(
+            "seeded %s's fix clock from the stream: newest unprocessed"
+            " UPDATE_POSITION at %s, %s before the daemon noticed the ride"
+            % (trip.session, fmt_hms(newest), fmt_ms_span(t - newest)))
+        return newest
 
     def _log_stream_window(self, why):
         """Dump the follower's recent drains. Called when a trip opens.
@@ -4671,8 +4788,16 @@ class RideWatch:
             # destination is not a diagnostic event. On 2026-08-27 the "mid-trip"
             # wording was also simply untrue — the rider had been at 4Front for
             # two minutes when the first one fired.
+            #
+            # Two guards below are 19.2, and both are about the same thing:
+            # the daemon must not report its own blindness as the rider's.
+            # `last_pos_is_fix` says last_pos_ms is a fix and not the trip
+            # start; the suppression window is the grace a ride opened late
+            # out of the backlog gets while the stream catches up.
             if (trip.arrived_ms is None
                     and not trip.gps_gap_open
+                    and trip.last_pos_is_fix
+                    and now >= trip.gps_gap_suppressed_until_ms
                     and now - trip.last_pos_ms > GPS_GAP_MS
                     and trip.gps_gap_started_ms != trip.last_pos_ms):
                 trip.gps_gap_open = True
@@ -5180,6 +5305,10 @@ class RideWatch:
             return
         # A GPS gap is a different fault with its own rule; do not double-report
         # a rider who simply stopped sending fixes as one who stopped moving.
+        # Since 19.2 this reads the same clock gps-gap does — the newest FIX
+        # timestamp in the stream — so the two rules can no longer disagree
+        # about how stale the position is. (It is unreachable before the first
+        # fix: `trip.last_fix` is set in the same branch as last_pos_is_fix.)
         if now - trip.last_pos_ms > GPS_GAP_MS:
             return
         held_ms = now - anchor[1]
@@ -6090,21 +6219,103 @@ class RideWatch:
         # (The ride report attributed three of the four to the onboard-picker
         # commits at 15:43:28 and 15:47:53 instead; those are START_GO_MODE
         # records and never reached this counter at all.)
+        # Whatever this re-plan turns out to be, its AUTO_REPLAN verdict is
+        # still to come and is the SAME re-plan; park it so the counter does
+        # not see one event twice (17.9d).
+        self._park_pending_reroute(trip, t, p.get("reason"))
         if p.get("autoApply") is not True:
             self._note_replan(trip, t, p.get("reason") or "reroute")
             return
-        trip.reroute_times.append(t)
-        while trip.reroute_times and t - trip.reroute_times[0] > REROUTE_STORM_WINDOW_MS:
+        self._count_toward_storm(trip, t, p.get("reason"), auto_replan=False)
+        self._note_replan(trip, t, p.get("reason") or "reroute")
+
+    def _park_pending_reroute(self, trip, t, reason):
+        """Remember a START_REROUTE that has not been judged yet."""
+        while (trip.pending_reroutes
+               and t - trip.pending_reroutes[0][0] > REPLAN_PAIR_WINDOW_MS):
+            trip.pending_reroutes.popleft()
+        trip.pending_reroutes.append((int(t), reason))
+
+    def _on_auto_replan(self, trip, t, p):
+        """The app judged an automatic re-plan. 17.9d, and 24.3's other half.
+
+        `AUTO_REPLAN` (otprr `actions/go-mode.ts:565`, recording-only, scalar
+        payload so it survives on every ride) exists because this counter
+        could not see the app's busiest automatic re-plan at all: the quiet
+        access-leg re-plan fetches in an isolated thunk and goes straight to
+        `beginGoMode` without dispatching a `START_REROUTE`. On 2026-09-21 the
+        16:36-16:40 window held THREE such re-plans in 61 s and not one
+        `START_REROUTE` of any reason.
+
+        Two traps, both of which would put 17.9d's original false positive
+        straight back:
+
+        1. **The paths that DO dispatch a START_REROUTE also reach here**
+           (`applyAutoReroute` at go-mode.ts:2643, `replanFromAboard` at
+           :5133), so one re-plan writes two records. They are paired on the
+           reason, which both records carry from the same option, inside
+           REPLAN_PAIR_WINDOW_MS; only an AUTO_REPLAN with no START_REROUTE
+           behind it is counted.
+        2. **The record's own `autoApply` is a hard-coded `true`** in the
+           client (go-mode.ts:1254) even when the re-plan was the rider's:
+           `replanFromAboard({autoApply: false, reason: "rider-reroute"})`
+           (:2196, the reroute button) and `{reason: "rider-picked-bus"}`
+           (:8402, the onboard picker) both funnel through it. So the flag is
+           not evidence here and is not read; the pairing is what excuses
+           those, because both dispatch their `START_REROUTE` first.
+
+        A REFUSED verdict counts too. The rule is "the app is re-planning in
+        circles", and asking the graph four times in five minutes and throwing
+        every answer away is the purest form of it — it is simply the form the
+        rider cannot see.
+        """
+        if not isinstance(p, dict):
+            return
+        reason = p.get("reason")
+        paired = self._pair_pending_reroute(trip, t, reason)
+        if paired is not None:
+            self.log.info(
+                "AUTO_REPLAN %r at %s is the verdict on the START_REROUTE at"
+                " %s, not a second re-plan"
+                % (reason, fmt_hms(t), fmt_hms(paired)))
+            return
+        self._count_toward_storm(trip, t, reason, auto_replan=True,
+                                 accepted=p.get("accepted"),
+                                 refused=p.get("refusedBecause"))
+
+    def _pair_pending_reroute(self, trip, t, reason):
+        """The START_REROUTE this verdict belongs to, consumed. None if free."""
+        while (trip.pending_reroutes
+               and t - trip.pending_reroutes[0][0] > REPLAN_PAIR_WINDOW_MS):
+            trip.pending_reroutes.popleft()
+        for i, (ms, why) in enumerate(trip.pending_reroutes):
+            if why == reason:
+                del trip.pending_reroutes[i]
+                return ms
+        return None
+
+    def _count_toward_storm(self, trip, t, reason, auto_replan,
+                            accepted=None, refused=None):
+        """One automatic re-plan. Count it, then ask whether they add up."""
+        trip.reroute_times.append((int(t), bool(auto_replan)))
+        while (trip.reroute_times
+               and t - trip.reroute_times[0][0] > REROUTE_STORM_WINDOW_MS):
             trip.reroute_times.popleft()
         if (len(trip.reroute_times) > REROUTE_STORM_COUNT
                 and t - trip.reroute_storm_last_ms > REROUTE_STORM_WINDOW_MS):
             trip.reroute_storm_last_ms = t
+            quiet = sum(1 for _, was_auto in trip.reroute_times if was_auto)
             self._finding(
                 trip, t, "reroute-storm", "warn",
                 "%d reroutes within 5 min" % len(trip.reroute_times),
                 {"count": len(trip.reroute_times),
-                 "reason": p.get("reason")})
-        self._note_replan(trip, t, p.get("reason") or "reroute")
+                 "reason": reason,
+                 # Which records the count is made of, because "4 reroutes"
+                 # said nothing about whether the rider could have seen any
+                 # of them (17.9d).
+                 "quietReplans": quiet,
+                 "accepted": accepted,
+                 "refusedBecause": refused})
 
     # -- destination convergence -------------------------------------------
     #
@@ -6167,9 +6378,25 @@ class RideWatch:
         destination. Reduced here to one number — how far the best itinerary
         ENDS from the `toPlace` that was asked for — which is what
         unreachable-but-routable reads.
+
+        Since otprr `3b25f511a` the record says so itself: `reason: "periodic"`
+        (go-mode.ts:3205, added because a row asked for the field and read one
+        of these as the request behind a swap). That reason is NOT a re-plan
+        reason and is deliberately read by nothing: this method touches
+        neither the storm counter nor `_note_replan`, and a REROUTE_SNAPSHOT
+        carrying any other reason is logged once rather than counted, because
+        the answer to "is this a re-plan?" is no whatever it says. 17.9d.
         """
         if not isinstance(p, dict) or p.get("__summary"):
             return
+        reason = p.get("reason")
+        if reason not in (None, "periodic") and not trip.snapshot_reason_logged:
+            trip.snapshot_reason_logged = True
+            self.log.warn(
+                "REROUTE_SNAPSHOT at %s carries reason %r, not 'periodic'."
+                " Still not counted as a re-plan (17.9d) — but the capture's"
+                " contract has changed and the daemon should be re-read."
+                % (fmt_hms(t), reason))
         req = p.get("request") if isinstance(p.get("request"), dict) else {}
         to = req.get("to") if isinstance(req.get("to"), dict) else {}
         lat, lon = to.get("lat"), to.get("lon")
@@ -7951,7 +8178,16 @@ class RideWatch:
                 trip.riding.get("headsign"), fmt_hms(trip.riding.get("boardedAt"))))
         else:
             lines.append("- Riding: not aboard")
-        lines.append("- Last fix: %ds ago" % max(0, (now - trip.last_pos_ms) // 1000))
+        # "Last fix: 99s ago" on a phone that had never missed one is what
+        # 19.2 was opened about. When no fix has been processed there is no
+        # last fix, and the honest line says so and names what the number
+        # would have been measured from instead.
+        if trip.last_pos_is_fix:
+            lines.append("- Last fix: %ds ago"
+                         % max(0, (now - trip.last_pos_ms) // 1000))
+        else:
+            lines.append("- Last fix: none yet (trip opened %ds ago)"
+                         % max(0, (now - trip.start_ms) // 1000))
         lines.append("- Pages sent: %d/%d" % (trip.pages_sent, MAX_PAGES_PER_TRIP))
         if trip.thread:
             lines.append("- Ride thread: `tmux -L %s attach -t %s` (%s), %d event(s)" % (

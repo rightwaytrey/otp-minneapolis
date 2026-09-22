@@ -4745,6 +4745,193 @@ class TestStartRecoveredFromTheStream(RuleTestCase):
         self.assertEqual(restarted.trips, {})
 
 
+class TestGapIsMeasuredFromTheNewestFix(RuleTestCase):
+    """19.2. The daemon reported its own blindness as the rider's GPS.
+
+    2026-09-19 14:38:35, session mu8sfyq8-smhisx: `gps-gap` "no GPS fix for
+    99s mid-trip". 99 s is exactly 14:38:35 - 14:36:56, the trip START — the
+    daemon had skipped 92 s of backlog (16.7's second sighting), so
+    `last_pos_ms` still held its seed. The phone was fine: 120
+    UPDATE_POSITION records 14:36:56 -> 14:38:54, no inter-fix gap over 30 s,
+    accuracy 2.2-2.7 m.
+
+    2026-09-21 16:07:29, session mubq7tfx-8dz3ar: "no GPS fix for 136 s",
+    which is 16:07:29 - 16:05:13, the trip start again. The real gap was 80 s
+    (16:06:05 -> 16:07:25), and the fixes that prove it were still on the
+    Linode: the phone had been offline 15:58:32-16:07:22 and its 175-line
+    batch had not reached this host's rsync mirror when the rule ran.
+
+    Two mechanisms, one basis: measure from the newest FIX timestamp the
+    stream holds, never from when the daemon happened to look.
+    """
+
+    def stream(self, watch, builder):
+        with open(watch.stream_path, "w") as f:
+            for ev in builder.events:
+                f.write(json.dumps(ev) + "\n")
+
+    def late_open(self, fixes=True, silence_ms=0):
+        """The 09-19 shape: everything is on disk, the daemon reads the tail.
+
+        `fixes` writes the ride's 1 Hz position stream into the file the
+        daemon can read back; `silence_ms` is how long after the last of them
+        the daemon finally notices the ride.
+        """
+        watch = quiet_watch(self.tmp)
+        b = StreamBuilder(device="phone-1")
+        b.start()
+        if fixes:
+            for _ in range(118):
+                b.advance(1000).position()
+        b.advance(silence_ms or 1000).progress(leg=0, prog=1.0, stops=6)
+        self.stream(watch, b)
+        watch.process(b.events[-1])          # the tail, and nothing else
+        return watch, b
+
+    def test_the_trip_opens_from_the_recovered_start(self):
+        """The precondition: this is 16.7's path, not an adopt."""
+        watch, _ = self.late_open()
+        self.assertEqual(len(self.find(watch, "missed-start")), 1)
+
+    def test_the_fix_clock_is_seeded_from_the_stream(self):
+        watch, b = self.late_open()
+        fixes = [ev["t"] for ev in b.events
+                 if ev.get("type") == "UPDATE_POSITION"]
+        trip = watch.trips[SESSION]
+        self.assertEqual(trip.last_pos_ms, fixes[-1])
+        self.assertTrue(trip.last_pos_is_fix)
+        self.assertNotEqual(trip.last_pos_ms, trip.start_ms)
+
+    def test_the_99_second_ghost_gap_is_gone(self):
+        """The 09-19 finding itself. 118 s of unbroken 1 Hz fixes on disk,
+        the daemon 99 s late to the ride, and nothing to report."""
+        watch, b = self.late_open(silence_ms=1000)
+        watch.clock_ms = b.events[-1]["t"] + 5000
+        watch.check_timers()
+        self.assertEqual(self.find(watch, "gps-gap"), [], self.rules(watch))
+
+    def test_the_seed_does_not_hide_a_gap_that_is_really_there(self):
+        """Seeded, then 90 s of silence: the gap fires, and it is measured
+        from the newest fix on disk rather than from the trip start."""
+        watch, b = self.late_open(silence_ms=1000)
+        fixes = [ev["t"] for ev in b.events
+                 if ev.get("type") == "UPDATE_POSITION"]
+        # Past the missed-start grace, then past GPS_GAP_MS beyond it.
+        now = b.events[-1]["t"] + 2 * ride_watch.GPS_GAP_MS + 30000
+        watch.clock_ms = now
+        watch.check_timers()
+        found = self.find(watch, "gps-gap")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["context"]["lastFixMs"], fixes[-1])
+        self.assertIn("no GPS fix for %ds" % ((now - fixes[-1]) // 1000),
+                      found[0]["summary"])
+
+    def test_a_late_open_with_no_fixes_on_disk_gets_a_grace_window(self):
+        """The 09-21 136 s: the fixes existed and were not on this host yet.
+        A daemon that has just filed "I was reading the stream late" does not
+        then call the next minute of it a GPS outage."""
+        watch, b = self.late_open(fixes=False, silence_ms=136000)
+        trip = watch.trips[SESSION]
+        self.assertFalse(trip.last_pos_is_fix)
+        watch.clock_ms = b.events[-1]["t"] + 1000
+        watch.check_timers()
+        self.assertEqual(self.find(watch, "gps-gap"), [], self.rules(watch))
+
+    def test_the_grace_is_exactly_one_gps_gap_ms(self):
+        """It is a grace, not an amnesty: a phone that is still silent a
+        minute after the daemon caught up is a phone with no fix."""
+        watch, b = self.late_open(fixes=False, silence_ms=136000)
+        noticed = b.events[-1]["t"]
+        watch.process({"session": SESSION, "type": "UPDATE_POSITION",
+                       "t": noticed + 1000, "device": "phone-1",
+                       "payload": {"coords": {"latitude": StreamBuilder.LAT,
+                                              "longitude": StreamBuilder.LON,
+                                              "accuracy": 5.0},
+                                   "timestamp": noticed + 1000}})
+        watch.clock_ms = noticed + ride_watch.GPS_GAP_MS + 30000
+        watch.check_timers()
+        found = self.find(watch, "gps-gap")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["context"]["lastFixMs"], noticed + 1000)
+
+    def test_a_trip_that_has_never_had_a_fix_reports_no_gap(self):
+        """`now - the trip start` is not a gap, whatever it measures. This is
+        the 99 s and the 136 s reduced to their common shape."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(ride_watch.GPS_GAP_MS + 60000).progress(stops=5)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "gps-gap"), [], self.rules(watch))
+
+    def test_the_digest_does_not_invent_a_last_fix(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips[SESSION]
+        lines = watch._trip_state_lines(trip, watch.clock_ms)
+        self.assertIn("- Last fix: none yet (trip opened",
+                      "\n".join(lines))
+
+    def test_the_digest_counts_from_the_fix_once_there_is_one(self):
+        b = StreamBuilder().start().advance(1000).position()
+        b.advance(30000).progress(stops=5)
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips[SESSION]
+        lines = watch._trip_state_lines(trip, watch.clock_ms)
+        self.assertIn("- Last fix: 30s ago", "\n".join(lines))
+
+
+class TestTheFixClockIsTheReceivers(RuleTestCase):
+    """19.2, the other half of "newest fix TIMESTAMP".
+
+    An UPDATE_POSITION carries two clocks: `t`, when the action was
+    dispatched, and `payload.timestamp`, when the receiver produced the fix.
+    2026-09-21 08:13:21 they are 32 ms apart (timestamp ...401803, t
+    ...401835), so this changes no number the rider sees — it changes what
+    the number is ABOUT, which is the whole of the row.
+    """
+
+    def test_the_receivers_clock_wins(self):
+        t = 1789996401835
+        self.assertEqual(
+            ride_watch.fix_time_ms({"t": t, "payload": {"timestamp": t - 4000}}),
+            t - 4000)
+
+    def test_a_fix_stamped_in_the_future_is_not_believed(self):
+        """A clock running fast would close gaps that are real."""
+        t = 1789996401835
+        self.assertEqual(
+            ride_watch.fix_time_ms({"t": t, "payload": {"timestamp": t + 5000}}),
+            t)
+
+    def test_a_fix_stamped_absurdly_early_is_not_believed(self):
+        t = 1789996401835
+        stale = t - ride_watch.FIX_TIMESTAMP_MAX_LAG_MS - 1
+        self.assertEqual(
+            ride_watch.fix_time_ms({"t": t, "payload": {"timestamp": stale}}),
+            t)
+
+    def test_a_record_with_no_timestamp_falls_back_to_t(self):
+        t = 1789996401835
+        self.assertEqual(ride_watch.fix_time_ms({"t": t, "payload": {}}), t)
+        self.assertEqual(ride_watch.fix_time_ms({"t": t}), t)
+
+    def test_a_record_with_no_clock_at_all_yields_none(self):
+        self.assertIsNone(ride_watch.fix_time_ms({"payload": {}}))
+        self.assertIsNone(ride_watch.fix_time_ms({"t": True}))
+
+    def test_the_gap_is_reported_against_the_receivers_clock(self):
+        """A fix taken 20 s before it was dispatched is 20 s of the gap."""
+        b = StreamBuilder().start().advance(1000)
+        b.action("UPDATE_POSITION", {
+            "coords": {"latitude": b.LAT, "longitude": b.LON, "accuracy": 5.0},
+            "timestamp": b.t - 20000})
+        taken = b.t - 20000
+        b.advance(ride_watch.GPS_GAP_MS).progress(stops=5)
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "gps-gap")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["context"]["lastFixMs"], taken)
+
+
 class TestFollowerDiagnostics(unittest.TestCase):
     """16.7(b). Nothing in daemon.log or the journal said what the follower
     had done with records 69-329 on 09-15 — not a byte count, not an offset.
@@ -6984,6 +7171,172 @@ class TestRerouteStormCountsOnlyAutoReroutes(RuleTestCase):
                                {"autoApply": False, "reason": "rider-reroute"})
         watch = self.run_stream(b, finalize=False)
         self.assertEqual(watch.trips[SESSION].dest_replans_since_gain, 1)
+
+
+class TestStormCountsTheQuietReplans(RuleTestCase):
+    """17.9d, second half. The busiest automatic re-plan was invisible.
+
+    The storm counter reads `START_REROUTE {autoApply: true}`. The quiet
+    access-leg re-plan dispatches none — it fetches in an isolated thunk and
+    goes straight to `beginGoMode` — so on 2026-09-21 the 16:36-16:40 window
+    held THREE automatic re-plans in 61 s and not one `START_REROUTE` of any
+    reason. otprr `3b25f511a` added `AUTO_REPLAN`, a recording-only scalar
+    record, one per automatic re-plan verdict (`actions/go-mode.ts:565`).
+
+    Two traps in reading it, both of which put 17.9d's original false
+    positive back if missed:
+
+    * the paths that DO dispatch a START_REROUTE also emit an AUTO_REPLAN
+      (`applyAutoReroute` at go-mode.ts:2643, `replanFromAboard` at :5133),
+      so one re-plan writes two records; and
+    * the record's `autoApply` is a hard-coded `true` (go-mode.ts:1254) even
+      when the re-plan was the rider's — `replanFromAboard({autoApply: false,
+      reason: 'rider-reroute'})` (:2196) and `{reason: 'rider-picked-bus'}`
+      (:8402) both funnel through it.
+    """
+
+    def auto_replan(self, b, reason="quiet-replan-full", accepted=True,
+                    refused=None):
+        return b.action("AUTO_REPLAN",
+                        {"accepted": accepted, "autoApply": True,
+                         "originGapM": 12.0, "projectedAtMs": None,
+                         "projectedM": 0, "reason": reason,
+                         "refusedBecause": refused, "tMs": b.t})
+
+    def test_four_quiet_replans_are_a_storm(self):
+        """Fails on master: nothing in the stream reached the counter."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for _ in range(4):
+            b.advance(45000)
+            self.auto_replan(b)
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "reroute-storm")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["context"]["count"], 4)
+        self.assertEqual(found[0]["context"]["quietReplans"], 4)
+
+    def test_the_0921_window_of_three_in_61s_is_counted_but_is_no_storm(self):
+        """The real window. Three is not four; what matters is that the
+        daemon can now see them at all."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for gap in (0, 30000, 31000):
+            b.advance(gap or 1000)
+            self.auto_replan(b, reason="quiet-replan-scoped")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "reroute-storm"), [])
+        self.assertEqual(len(watch.trips[SESSION].reroute_times), 3)
+
+    def test_one_replan_that_writes_two_records_is_counted_once(self):
+        """START_REROUTE then its own AUTO_REPLAN verdict, four times over:
+        four re-plans, not eight, and no storm from the doubling alone."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for _ in range(4):
+            b.advance(45000).action("START_REROUTE",
+                                    {"autoApply": True,
+                                     "reason": "boarded-earlier"})
+            b.advance(2400)          # the measured median settle
+            self.auto_replan(b, reason="boarded-earlier")
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "reroute-storm")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["context"]["count"], 4)
+        self.assertEqual(found[0]["context"]["quietReplans"], 0)
+
+    def test_the_riders_own_reroute_button_is_still_not_a_storm(self):
+        """17.9d's original finding, through the new record. The rider's
+        reroute dispatches START_REROUTE {autoApply: false} and then an
+        AUTO_REPLAN that claims autoApply: true. Counting the second would
+        re-file 2026-09-15 15:47:30 exactly as it was."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for _ in range(4):
+            b.advance(45000).action("START_REROUTE",
+                                    {"autoApply": False,
+                                     "reason": "rider-reroute"})
+            b.advance(2400)
+            self.auto_replan(b, reason="rider-reroute")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "reroute-storm"), [],
+                         self.rules(watch))
+
+    def test_the_onboard_picker_is_not_a_storm_either(self):
+        """`replanFromAboard({reason: 'rider-picked-bus'})` — autoApply
+        undefined, so false — reaches the same AUTO_REPLAN."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for _ in range(4):
+            b.advance(45000).action("START_REROUTE",
+                                    {"reason": "rider-picked-bus"})
+            b.advance(1200)
+            self.auto_replan(b, reason="rider-picked-bus")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "reroute-storm"), [],
+                         self.rules(watch))
+
+    def test_a_verdict_long_after_its_reroute_is_its_own_replan(self):
+        """The pairing is bounded. A record REPLAN_PAIR_WINDOW_MS after the
+        last START_REROUTE is not that reroute's verdict."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).action("START_REROUTE",
+                               {"autoApply": True, "reason": "x"})
+        b.advance(ride_watch.REPLAN_PAIR_WINDOW_MS + 1000)
+        self.auto_replan(b, reason="x")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(watch.trips[SESSION].reroute_times), 2)
+
+    def test_a_verdict_on_a_different_reason_is_a_different_replan(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).action("START_REROUTE",
+                               {"autoApply": True, "reason": "boarded-earlier"})
+        b.advance(2000)
+        self.auto_replan(b, reason="quiet-replan-full")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(watch.trips[SESSION].reroute_times), 2)
+
+    def test_a_refused_quiet_replan_counts_too(self):
+        """Asking the graph four times in five minutes and throwing every
+        answer away IS re-planning in circles — it is the form the rider
+        cannot see."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for _ in range(4):
+            b.advance(45000)
+            self.auto_replan(b, accepted=False, refused="origin-behind-rider")
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "reroute-storm")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["context"]["refusedBecause"],
+                         "origin-behind-rider")
+        self.assertIs(found[0]["context"]["accepted"], False)
+
+    def test_periodic_snapshots_are_never_a_replan(self):
+        """A rider waiting fifteen minutes for a bus produces ten of these
+        and has re-planned nothing. Ten captures, no count, no storm."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5, dest=1700.0)
+        for _ in range(10):
+            b.advance(90000).action("REROUTE_SNAPSHOT", {"reason": "periodic"})
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips[SESSION]
+        self.assertEqual(list(trip.reroute_times), [])
+        self.assertEqual(trip.dest_replans_since_gain, 0)
+        self.assertEqual(self.find(watch, "reroute-storm"), [])
+
+    def test_a_snapshot_with_an_unexpected_reason_is_logged_not_counted(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5, dest=1700.0)
+        for _ in range(4):
+            b.advance(90000).action("REROUTE_SNAPSHOT", {"reason": "swap"})
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(list(watch.trips[SESSION].reroute_times), [])
+        self.assertTrue(watch.trips[SESSION].snapshot_reason_logged)
+
+    def test_a_quiet_replan_does_not_touch_replan_not_converging(self):
+        """Scope. 17.9d is the storm counter; replan-not-converging is a
+        PAGE built on START_REROUTE and is left exactly as it was until
+        there is ride evidence to change it on."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5, dest=1700.0)
+        for _ in range(4):
+            b.advance(45000)
+            self.auto_replan(b)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(watch.trips[SESSION].dest_replans_since_gain, 0)
+        self.assertEqual(self.find(watch, "replan-not-converging"), [])
 
 
 class TestOnboardAnchorNeedsADirection(RuleTestCase):
