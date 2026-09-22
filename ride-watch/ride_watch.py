@@ -373,6 +373,11 @@ NOTIFICATION_REPEAT_WINDOW_MS = 5 * 60 * 1000
 # one — intake now drops re-POSTed duplicate records, so two-in-window can no
 # longer be one alert counted twice. See _is_duplicate_record.
 NOTIFICATION_REPEAT_COUNT = 2              # fires on the 2nd
+# How many distinct titles one id stem may be remembered as having used in a
+# ride. Only ever read as "has this stem shown two titles of the same shape",
+# so a handful is plenty; the bound is here so a stem that rewrites its title
+# on every push cannot grow a set for the length of a four-hour ride.
+NOTIFICATION_STEM_TITLE_MAX = 64
 # progress-without-motion. Map-matching noise reported to the rider as travel.
 # On 7/31 the swing was a tenth of a point (0.31 -> 0.21 -> 0.31) inside a 7m
 # circle, which is below this threshold and should stay quiet; the same
@@ -823,6 +828,19 @@ PLAN_PATHS = (
 # (`### <time> — <rule> (<severity>) -> **real-bug**`), so headings are read
 # first and the whole file only if no heading carries a verdict at all.
 REAL_BUG_RE = re.compile(r"real[-\s]?bug", re.I)
+# ...and how the daemon knows the promotion was about THIS ride rather than
+# about whatever else was being written into the same file at the time (24.2).
+# One memoised count per (plan file version, ride): the plan files are half a
+# megabyte each and the check runs on every tick of an open window.
+PLAN_MENTION_CACHE_MAX = 8
+# How long the "which rides of this session are already written up" answer is
+# reused before the request files are re-globbed (24.1). The adopt path runs
+# on every event of a session with no trip open, and the set only changes when
+# a ride ends — which this daemon invalidates on directly.
+REPORTED_WINDOW_TTL_MS = 60 * 1000
+REPORTED_WINDOW_CACHE_MAX = 16
+# "no digest supplied", distinct from a real digest of None (file absent).
+_UNSET = object()
 # The same verdict, but anchored at the start of a triage-table cell so a
 # "what decided it" cell that merely mentions the phrase does not vote
 # (18.5). Leading "(" and Markdown bold/italic markers are skipped.
@@ -1468,6 +1486,17 @@ def notification_key(payload):
     return (ntype, title)
 
 
+# Every run of digits in a notification title, so two titles can be compared
+# for shape rather than for bytes. "465 · 5 min" and "465 · 6 min" are the
+# same shape; "Tight connection" and "Connection at risk" are not.
+_TITLE_DIGITS_RE = re.compile(r"\d+")
+
+
+def title_shape(title):
+    """A notification title with its numbers taken out. See 24.5."""
+    return _TITLE_DIGITS_RE.sub("#", title or "")
+
+
 def is_panel_route(pathname):
     """Is this path a rider-facing screen of its own, rather than the map?
 
@@ -1648,6 +1677,17 @@ class Trip:
         self.teleport_paged = False
         self.notification_times = collections.defaultdict(collections.deque)
         self.notification_repeat_last = {}        # key -> ms of last finding
+        # Every push of each id stem inside the repeat window, as
+        # (tMs, title, message). notification_times is bucketed by the key
+        # (stem + title), so it cannot see that the TITLE itself moved between
+        # two pushes it counted; this can. See _rule_notification_repeat.
+        self.notification_stem_log = collections.defaultdict(collections.deque)
+        # stem -> every title it has carried this ride. Ride-scoped, not
+        # window-scoped: whether a title is a name or a reading is a property
+        # of the alert, and the push that proves it moved is usually the one
+        # that has just aged out of the window.
+        self.notification_stem_titles = collections.defaultdict(set)
+        self.notification_repeat_held = {}        # key -> logged once
         self.motion_anchor = None                 # where progress was last real
         self.motion_fired_ms = 0
         # The span currently being held: {"tMs", "pct", "leg", "fix",
@@ -1791,6 +1831,14 @@ class RideWatch:
         self.ended_trips = []         # Trip objects, for replay/test inspection
         self.recently_ended = {}      # session -> end_ms (blocks re-adoption)
         self._declined_completed = set()   # sessions refused adoption, logged once
+        # (session, request file, startMs) already refused because the ride is
+        # over and written up (24.1). Logged once each; the guard itself is
+        # re-evaluated every time, so a LATER ride on the same session id is
+        # still adoptable.
+        self._declined_reported = set()
+        # session -> (asOfMs, [(startMs, endMs, what)]). See
+        # _reported_ride_windows.
+        self._reported_windows_cache = collections.OrderedDict()
         # Sessions whose ride this daemon closed at arrival. Re-adopting one
         # is how a single 8/27 ride became nine (see _maybe_adopt).
         self.ended_arrived = set()
@@ -1840,6 +1888,9 @@ class RideWatch:
         # The one backlog and its record file. Instance-level so a test never
         # reads or writes the rider's real plan. See PLAN_PATHS.
         self.plan_paths = list(PLAN_PATHS)
+        # (plan path, digest, ride tokens) -> per-token occurrence counts.
+        # See _plan_mentions; bounded by PLAN_MENTION_CACHE_MAX.
+        self._plan_mention_cache = collections.OrderedDict()
         # Wrap-ups that have been asked for and not yet appeared. Deliberately
         # NOT keyed off self.trips: _end_trip deletes the Trip, which is how
         # the missing-report case escaped every timer in this file. Restored
@@ -2410,6 +2461,22 @@ class RideWatch:
         # not a continuation of anything; it is a trip this daemon should have
         # opened already.
         recovered = self._recover_go_mode_starts(session, t)
+        # ...and a ride that is already over and already written up does not
+        # get opened a second time (24.1). 2026-09-21 16:43:53 the path unit
+        # restarted this daemon one minute into the 16:05 ride's wrap-up; the
+        # fresh process found three START_GO_MODE records from 16:31:17 still
+        # in the stream, opened the finished 16:31 sub-ride off them, filed
+        # "7m36s late", "no GPS fix for 756s" (19.2) and two deviated-streaks
+        # about a rider who had been home for a minute, spawned a second
+        # console, and paged the rider "Ride ended — 5 findings" 25 s before
+        # the real wrap-up landed. The 16:31 start lies INSIDE the window of
+        # report-request-mubq7tfx-8dz3ar-1605.json (16:05:13 -> 16:42:53),
+        # which is on disk precisely so that a restarted daemon can know this.
+        candidate_start = recovered[0][0] if recovered else int(t)
+        blocked = self._ride_already_written_up(session, candidate_start)
+        if blocked is not None:
+            self._log_reported_ride_declined(session, blocked, candidate_start)
+            return
         if recovered:
             self._open_from_recovered_start(session, t, obj, p, recovered)
             return
@@ -2529,6 +2596,79 @@ class RideWatch:
             if isinstance(obj, dict):
                 out.append(obj)
         return out
+
+    def _reported_ride_windows(self, session):
+        """(startMs, endMs, what) for each ride of this session already closed.
+
+        Read off the `report-request-<session>-<HHMM>.json` files, which are
+        written one per ride at trip end and are "the only per-ride artifact
+        that survives a daemon restart" (see _ride_ordinal) — which is exactly
+        the property 24.1 needs, since the daemon that has to know is a fresh
+        one. `lastTrip` out of state.json is added on top so a CLEAN ride,
+        which writes no request, is covered too.
+
+        Cached for a minute and dropped whenever this daemon writes a new
+        request, because the adopt path runs on events, not on ticks.
+        """
+        now = self.now_ms()
+        hit = self._reported_windows_cache.get(session)
+        if hit and 0 <= now - hit[0] < REPORTED_WINDOW_TTL_MS:
+            return hit[1]
+        windows = []
+        pattern = os.path.join(
+            self.watch_dir, "report-request-%s-*.json" % session)
+        for path in sorted(glob.glob(pattern)):
+            try:
+                with open(path) as f:
+                    req = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(req, dict):
+                continue
+            start, end = req.get("startMs"), req.get("endMs")
+            if not isinstance(start, (int, float)):
+                continue
+            if not isinstance(end, (int, float)) or end < start:
+                end = start
+            windows.append((int(start), int(end), os.path.basename(path)))
+        last = self.last_trip_summary or {}
+        if last.get("session") == session:
+            start, end = last.get("startMs"), last.get("endMs")
+            if (isinstance(start, (int, float))
+                    and isinstance(end, (int, float)) and end >= start):
+                windows.append((int(start), int(end),
+                                "the last ride recorded in state.json"))
+        self._reported_windows_cache[session] = (now, windows)
+        while len(self._reported_windows_cache) > REPORTED_WINDOW_CACHE_MAX:
+            self._reported_windows_cache.popitem(last=False)
+        return windows
+
+    def _ride_already_written_up(self, session, start_ms):
+        """The ride whose window contains `start_ms`, if one is on record.
+
+        Inclusive of both ends and with no grace either side, deliberately.
+        A grace after the end would block the legitimate case this must not
+        touch: on 2026-09-21 ride 2 of the same session started 3m47s after
+        ride 1 ended, and a daemon restarted during ride 2 has to be able to
+        recover its start.
+        """
+        for start, end, what in self._reported_ride_windows(session):
+            if start <= start_ms <= end:
+                return (start, end, what)
+        return None
+
+    def _log_reported_ride_declined(self, session, blocked, start_ms):
+        """Once per (session, ride, start) — the adopt path runs per event."""
+        start, end, what = blocked
+        key = (session, what, int(start_ms))
+        if key in self._declined_reported:
+            return
+        self._declined_reported.add(key)
+        self.log.warn(
+            "not opening %s from %s: that start falls inside a ride already"
+            " ended and written up (%s -> %s, %s). A restart of this daemon is"
+            " not a reason to live a finished ride over again (24.1)."
+            % (session, fmt_hms(start_ms), fmt_hms(start), fmt_hms(end), what))
 
     def _recover_go_mode_starts(self, session, t):
         """The START_GO_MODE records of the Go Mode run that is live at `t`.
@@ -3860,7 +4000,17 @@ class RideWatch:
             "reason": reason,
             "findings": n,
             "itinerary": itinerary_one_liner(trip.itinerary),
+            # The ride's window in milliseconds, which `endedAt` cannot give
+            # back. Written so a daemon restarted after this ride can tell
+            # that a START_GO_MODE still in the stream belongs to it (24.1),
+            # including for a CLEAN ride, which writes no report request.
+            "startMs": int(trip.start_ms),
+            "endMs": int(t),
         }
+        # This session now has one more ride on record, clean or not.
+        self._reported_windows_cache.pop(trip.session, None)
+        for alias in (trip.sessions or []):
+            self._reported_windows_cache.pop(alias, None)
         self._save_state()
         req_path = self._write_report_request(trip) if n > 0 else None
         # The wrap-up is the thread's job now (no headless report agent): tell
@@ -3897,30 +4047,63 @@ class RideWatch:
         # the thread's monitor wakes on it, and a pane stuck on a permission
         # dialog gets the rider paged by the check that follows every push.
         self._thread_push(trip, line)
-        # Fallback: findings with nobody to write them up. Same push the report
-        # agent's failure used to send — it is still exactly the right sentence.
-        if n > 0 and self._thread_missing(trip):
-            self.log.warn("no ride thread for %s; falling back to a page"
-                          % trip.session)
-            self._report_fallback_push(n)
-        elif req_path:
+        # Decide whether a wrap-up is owed BEFORE anything is sent about one.
+        # (25.2) Until 2026-09-22 the missing-thread branch paged in the same
+        # tick as the trip ended — "Ride ended — N findings. Report pending;
+        # open Claude and say 'ride report'" — and the next line of the log
+        # was this method retiring the pane with "no wrap-up owed". Both on
+        # 2026-09-21: 16:43:54 for the re-adopted 16:31 sub-ride (24.1) and
+        # 17:54:19 for mubtf1hr-m1boyv, whose console had died at 17:29:23.
+        # The page contradicted the verdict, it went out ten minutes before
+        # any deadline it could have been about, and it asked the rider to go
+        # and fetch a report nobody had been asked to write. A page costs one
+        # of two per-ride interrupts; one spent on nothing is a bug.
+        #
+        # So: owed means a report was REQUESTED (findings > 0) and somebody
+        # was ASKED for it. Only the second kind can be missed, and only a
+        # missed one is ever paged — by _check_report_deadlines, at its
+        # deadline, which is what the 17:37:03 page correctly did.
+        owed = bool(req_path)
+        asked = owed and not self._thread_missing(trip)
+        if owed:
             # A thread that spawned fine and took the wrap-up line is not the
-            # same thing as a wrap-up. Arm a deadline. (8/28)
-            self._arm_report_deadline(trip, t, n)
+            # same thing as a wrap-up. Arm a deadline. (8/28) Armed even when
+            # nobody was asked, so _maybe_reassign_wrap_up can still hand the
+            # request to a console that IS alive — but marked `asked: False`,
+            # so if no one picks it up it lapses in silence instead of paging.
+            self._arm_report_deadline(trip, t, n, asked=asked)
+            if not asked:
+                self.log.warn(
+                    "no ride thread for %s: its %d finding(s) have nobody to"
+                    " write them up (request %s). Not paging — nobody was"
+                    " asked, so nothing can be late." % (trip.session, n,
+                                                         req_path))
         # The other half of the lifecycle. A pane that owes a wrap-up is now
         # held by its deadline and reaped when that settles; a pane that owes
         # nothing — no findings, so no request, or a spawn that failed — has
         # no reason to outlive the ride at all. Before this, neither branch
         # reaped anything and the pane waited for the NEXT ride's spawn.
-        if not self._deadline_for_pane((trip.thread or {}).get("tmux")):
-            self._schedule_thread_reap((trip.thread or {}).get("tmux"),
-                                       max(int(t), self.now_ms()),
-                                       "trip ended (%s), no wrap-up owed" % reason)
+        if not asked:
+            self._schedule_thread_reap(
+                (trip.thread or {}).get("tmux"),
+                max(int(t), self.now_ms()),
+                "trip ended (%s), %s" % (
+                    reason,
+                    "no thread to write it up" if owed
+                    else "no wrap-up owed"))
         self._mark_dirty()
         self.write_status(force=True)
 
-    def _arm_report_deadline(self, trip, t, findings_n):
+    def _arm_report_deadline(self, trip, t, findings_n, asked=True):
         """Watch for the wrap-up that was asked for, and page if it never lands.
+
+        `asked` is False when the ride's own console was already gone at trip
+        end. The entry is still armed, because _maybe_reassign_wrap_up can
+        hand the request to a console that is alive — but an unasked entry
+        never pages and never spares a pane: nobody was asked, so nothing is
+        late, and a page about it spends a rider interrupt on a report that
+        was never going to exist (25.2). If a reassignment lands, the entry
+        becomes asked and is a promise like any other.
 
         The 8/28 hole: _report_fallback_push had exactly one call site, guarded
         by _thread_missing, which is true only when the tmux spawn failed or
@@ -3956,10 +4139,15 @@ class RideWatch:
         # handed the request. Ten minutes has to be ten minutes of the
         # thread's time.
         due = max(int(t), self.now_ms()) + REPORT_DEADLINE_MS
+        tokens = self._ride_tokens(trip)
+        digests = self._plan_digests()
         self.report_deadlines.append({
             "session": trip.session,
             "reportPath": path,
             "dueMs": due,
+            # Was anybody actually asked for this wrap-up? See the docstring
+            # and 25.2. Only an asked promise can be broken.
+            "asked": bool(asked),
             # When the promise was made. _check_report_deadlines compares it
             # against _panes_killed so it can tell "the thread had ten minutes
             # and wrote nothing" from "this daemon killed the pane".
@@ -3970,7 +4158,15 @@ class RideWatch:
             # _check_report_deadlines. Digested rather than stat'ed because an
             # mtime can be bumped by anything, and because the digest is the
             # one comparison that survives a daemon restart inside the window.
-            "planDigests": self._plan_digests(),
+            "planDigests": digests,
+            # ...and how often each plan file already NAMED this ride. A
+            # promotion is not "the file changed" (24.2) but "the file gained
+            # a mention of this ride", so the baseline has to be the count,
+            # not merely the presence: a tier opened by an earlier session
+            # already names the session id, and the wrap-up's own row must
+            # still be able to register.
+            "rideTokens": tokens,
+            "planMentions": self._plan_mentions(tokens, digests=digests),
             "requestPath": self._report_request_path(trip),
             # Which pane was asked. _kill_previous_threads reads this: the
             # next ride's thread must not kill the one still writing.
@@ -3994,13 +4190,89 @@ class RideWatch:
                 out[path] = None
         return out
 
-    def _plans_moved(self, entry):
-        """Has the backlog changed since this wrap-up was asked for?
+    def _ride_tokens(self, trip):
+        """The strings a promotion would have to use to name THIS ride.
 
-        The whole of 15.8's second mechanism. Either file counts: a wrap-up
-        whose findings all dedupe onto existing rows edits the backlog, and one
-        that also closes a row moves it into the record. Both are the promotion
-        step doing its job.
+        Its session id (every alias the ride was seen under), the short form
+        the reports and tier headers use, and the report's own filename with
+        and without the extension. All lower-cased, because the plan files are
+        written by hand and `8dz3ar` has been seen capitalised in a heading.
+
+        This is the whole of 24.2. Anything a wrap-up writes that is about
+        this ride carries at least one of these — the backlog's own convention
+        is a tier header naming the session ("opened … from ride A
+        `mu346i5y-ng2uqc`") and rows citing the report file
+        ("report `2026-09-21-8dz3ar.md` §3").
+        """
+        tokens = set()
+        for session in ([trip.session] + list(trip.sessions or [])):
+            if not session:
+                continue
+            tokens.add(session.lower())
+            short = session.rsplit("-", 1)[-1]
+            if len(short) >= 4:
+                tokens.add(short.lower())
+        path = trip.report_path or ""
+        if path:
+            base = os.path.basename(path)
+            tokens.add(base.lower())
+            tokens.add(os.path.splitext(base)[0].lower())
+        return sorted(t for t in tokens if t)
+
+    def _plan_mentions(self, tokens, only=None, digests=None):
+        """How many times each plan file contains each of `tokens`.
+
+        `only` limits the work to the paths worth looking at (the ones whose
+        digest has moved). Memoised on (path, digest, tokens) because
+        _settle_promotion runs on every tick for as long as a promotion window
+        is open, and the plan files are half a megabyte each: without the
+        cache a ride streaming 30 events a second would re-read and re-scan
+        both of them 30 times a second for eight minutes.
+        """
+        out = {}
+        for path in self.plan_paths:
+            if only is not None and path not in only:
+                continue
+            digest = (digests or {}).get(path, _UNSET)
+            key = (path, digest, tuple(tokens))
+            if digest is not _UNSET and key in self._plan_mention_cache:
+                out[path] = self._plan_mention_cache[key]
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read().lower()
+            except OSError:
+                out[path] = None
+                continue
+            counts = dict((tok, text.count(tok)) for tok in tokens)
+            out[path] = counts
+            if digest is not _UNSET:
+                self._plan_mention_cache[key] = counts
+                while len(self._plan_mention_cache) > PLAN_MENTION_CACHE_MAX:
+                    self._plan_mention_cache.popitem(last=False)
+        return out
+
+    def _plans_moved(self, entry):
+        """Has the backlog gained a row that NAMES this ride?
+
+        15.8's second mechanism was "the report file existing is the whole
+        test". Its replacement was "either plan file changed", and that is
+        24.2: on 2026-09-21 the pipeline session wrote "ON DEV as 2026.0921.1"
+        onto eight unrelated rows at 16:44:30, and fourteen seconds later the
+        daemon logged the 16:05 ride's wrap-up as *promoted* —
+        "please-make-a-centralized-sharded-petal.md changed since 16:42:53" —
+        retired its console, and the ride's two real bugs were promoted by
+        hand three hours later. `grep -c 8dz3ar` on the backlog was **0** at
+        17:15.
+
+        So a change is necessary and no longer sufficient: one of this ride's
+        own names has to appear in a plan file more often than it did when the
+        wrap-up was asked for. Either file still counts — a wrap-up that
+        dedupes onto existing rows edits the backlog, one that closes a row
+        moves it into the record, and both name the ride when they do it.
+
+        Returns the path that gained the mention, False for "not yet", or None
+        when there is no baseline to compare against.
         """
         before = entry.get("planDigests")
         if not isinstance(before, dict) or not before:
@@ -4010,9 +4282,32 @@ class RideWatch:
             # behaviour — the report file is the whole test — stands.
             return None
         after = self._plan_digests()
-        for path, digest in before.items():
-            if after.get(path) != digest:
-                return path
+        touched = [path for path, digest in before.items()
+                   if after.get(path) != digest]
+        if not touched:
+            return False
+        tokens = entry.get("rideTokens")
+        mentions = entry.get("planMentions")
+        if not tokens or not isinstance(mentions, dict):
+            # An entry armed by a daemon that predates 24.2. It has no token
+            # baseline, so the old test is the only one available; applying
+            # the new one would call every such wrap-up unpromoted forever.
+            return touched[0]
+        now = self._plan_mentions(tokens, only=set(touched), digests=after)
+        for path in touched:
+            was = mentions.get(path) or {}
+            has = now.get(path) or {}
+            for tok in tokens:
+                if has.get(tok, 0) > was.get(tok, 0):
+                    return path
+        if not entry.get("unnamedChangeLogged"):
+            entry["unnamedChangeLogged"] = True
+            self.log.info(
+                "plan file(s) changed since %s but name neither %s nor this"
+                " ride's report (%s): not counting it as %s's promotion (24.2)"
+                % (fmt_hms(entry.get("armedMs")), entry.get("session"),
+                   os.path.basename(entry.get("reportPath") or "?"),
+                   entry.get("session")))
         return False
 
     def _check_report_deadlines(self, now):
@@ -4071,6 +4366,19 @@ class RideWatch:
                 keep.append(entry)
                 continue
             changed = True
+            # Nobody was ever asked for this one (25.2): the ride's console
+            # was already gone when the trip ended and no live thread could be
+            # handed it. There is no broken promise to report, so the entry
+            # lapses with a log line and no page. The request file stays on
+            # disk and current-ride.md names it, which is where a session that
+            # wants to write the report by hand will find it.
+            if not entry.get("asked", True):
+                self.log.warn(
+                    "no wrap-up for %s (%s) and nobody was ever asked for one"
+                    " — its console was gone at trip end and no live thread"
+                    " could take it. Request: %s. Not paging."
+                    % (entry.get("session"), path, entry.get("requestPath")))
+                continue
             # Never page about a report this daemon prevented. The pane is
             # dead by our own hand and the thread never had the ten minutes
             # the deadline claims to have given it, so "report pending, open
@@ -4094,6 +4402,11 @@ class RideWatch:
         if changed:
             self.report_deadlines = keep
             self._save_state()
+            # current-ride.md carries the "Wrap-up pending until …" marker the
+            # restart condition reads (24.1), so it has to be rewritten the
+            # moment a window opens or closes rather than on the next event
+            # that happens to dirty it.
+            self._mark_dirty()
 
     def _report_real_bugs(self, path):
         """How many findings this report calls real bugs. 0 = nothing to promote.
@@ -4213,7 +4526,18 @@ class RideWatch:
                        fmt_hms(due)))
             return False
         killed = self._panes_killed.get(entry.get("tmux"))
-        if killed is not None and killed >= entry.get("armedMs", 0):
+        if not entry.get("asked", True):
+            # Nobody was asked to write this report, let alone promote it
+            # (25.2). It exists because a person wrote it by hand, and a page
+            # telling them their own report is not in the backlog is an
+            # interrupt about nothing.
+            self.log.warn(
+                "nothing promoted for %s and nobody was asked to: %s appeared"
+                " with %d real bug(s) against a wrap-up this daemon never"
+                " handed to anyone. Not paging."
+                % (entry.get("session"), entry.get("reportPath"),
+                   entry.get("realBugs") or 0))
+        elif killed is not None and killed >= entry.get("armedMs", 0):
             self.log.error(
                 "nothing promoted for %s and none was possible: this daemon"
                 " killed its pane %s at %s. Not paging the rider about a"
@@ -4304,6 +4628,9 @@ class RideWatch:
         entry["reassigned"] = True
         entry["tmux"] = (target.thread or {}).get("tmux")
         entry["dueMs"] = now + REPORT_DEADLINE_MS
+        # Somebody has now been asked, so from here it is a promise like any
+        # other and missing it is worth the page it was not worth before.
+        entry["asked"] = True
         line = ("you also owe the previous ride's wrap-up: write %s from %s"
                 % (entry.get("reportPath"), entry.get("requestPath")))
         self.log.warn("wrap-up for %s reassigned from %s to %s (%s)"
@@ -5635,6 +5962,35 @@ class RideWatch:
         On the 7/31 log the storm fires at 11:53:07 — the 2nd of 14 buzzes,
         seven minutes before the rider gave up and typed the complaint out on
         a bike.
+
+        2026-09-21 16:19:18 is the other side of that key, and it cost the
+        ride its one page (24.5). Four `DEPARTURE_CHANGED` pushes for the 465
+        share one id stem and carry a live countdown IN THE TITLE — "465 ·
+        5 min", "465 · 6 min", "465 · 5 min", "465 · 5 min" — with four
+        different messages ("3 min later · 4 min slack" … "10 min later ·
+        5 min slack"). The 1st and 3rd collided on 5 by coincidence, so the
+        rule announced "same notification 2x in 5 min" about two pushes that
+        said different things, with a third push of the same alert sitting
+        between them in a different bucket.
+
+        A title that counts down is a reading, not a name, and two readings
+        that happen to match are not one alert. So: when a stem has shown
+        MORE THAN ONE title inside the window, the title has proved itself a
+        moving value and stops being usable as identity — the messages of the
+        counted pushes must match instead.
+
+        Measured over the 28 day files on disk before it was built, because
+        24.5 as written ("compare the id stem + message, not the title")
+        halves the rule: keying on the message takes the firings from 16 to 8
+        and loses six real storms outright — 8/27's "Time to go" (8 min away /
+        7 min away), 8/27 13:11 "Off Route" (121m/127m), 8/27's "Tight
+        connection" (118s/23s), 8/31's "Connection at risk" (4 min late /
+        6 min late), 8/31's "Trip updated" (arriving 5:43/5:44/5:45 PM) and
+        9/09's "Time to go" (10/6 min away). That is the 2026-08-31 regression
+        this docstring's previous version was written to end, re-entered from
+        the other side. The narrow gate below costs one firing — 09-21's —
+        and keeps the other fifteen, 09-21 17:06:06's two identical
+        "Missed bus" pushes included.
         """
         key = notification_key(p)
         if key is None:
@@ -5645,6 +6001,14 @@ class RideWatch:
         window.append(t)
         while window and t - window[0] > NOTIFICATION_REPEAT_WINDOW_MS:
             window.popleft()
+        # Every push of this stem, whatever its title, over the same window.
+        stem_log = trip.notification_stem_log[key[0]]
+        stem_log.append((t, title, message))
+        while stem_log and t - stem_log[0][0] > NOTIFICATION_REPEAT_WINDOW_MS:
+            stem_log.popleft()
+        seen_titles = trip.notification_stem_titles[key[0]]
+        if len(seen_titles) < NOTIFICATION_STEM_TITLE_MAX:
+            seen_titles.add(title)
         if len(window) < NOTIFICATION_REPEAT_COUNT:
             return
         # Once per alert per ride. The finding says "ignore the buzzing"; a
@@ -5652,6 +6016,9 @@ class RideWatch:
         # rider's other interrupt on a thing they have already been told to
         # ignore. A different turn is a different key and can still fire.
         if key in trip.notification_repeat_last:
+            return
+        if not self._notification_title_is_identity(trip, key, title, stem_log,
+                                                    len(window)):
             return
         trip.notification_repeat_last[key] = t
         mins = max(1, int(round((t - window[0]) / 60000.0)))
@@ -5665,6 +6032,47 @@ class RideWatch:
              "key": key[0], "type": p.get("type")},
             push_body="Same alert %d times in %d min: %s. Ignore the buzzing."
                       % (len(window), mins, title[:50]))
+
+    def _notification_title_is_identity(self, trip, key, title, stem_log,
+                                        counted):
+        """May this stem's title stand for "the same alert"? (24.5)
+
+        Yes, unless the stem has used two or more titles of the SAME SHAPE
+        this ride — "465 · 5 min" and "465 · 6 min", identical once the digits
+        are taken out. A title like that is a reading the app rewrites, and
+        two pushes that happen to be taken at the same reading are not one
+        alert. Where the titles differ in their words rather than their
+        numbers the stem has changed what it is saying, not re-displayed a
+        counter: 8/27's `CONNECTION_WARNING_…` stem escalates "Tight
+        connection" to "Connection at risk", and 8/31 17:19:17 / 17:21:17's
+        two "Connection at risk" pushes are a real repeat that must survive.
+
+        When the title is a reading, the messages of the pushes actually
+        counted have to match before the rider is told their phone is
+        repeating itself.
+
+        Returns True to fire. Does NOT latch when it returns False: the same
+        alert really repeating later in the ride is still worth the page.
+        """
+        shape = title_shape(title)
+        same_shape = set(other for other in trip.notification_stem_titles[key[0]]
+                         if title_shape(other) == shape)
+        if len(same_shape) < 2:
+            return True
+        messages = [entry[2] for entry in stem_log if entry[1] == title]
+        if len(set(messages[-counted:])) < 2:
+            return True
+        if key not in trip.notification_repeat_held:
+            trip.notification_repeat_held[key] = True
+            self.log.info(
+                "notification-repeat held for %s: %r is a reading, not a name"
+                " (this stem has also shown %s), and the %d push(es) it"
+                " collided on said different things (%s)"
+                % (key[0], title,
+                   ", ".join(sorted(repr(o) for o in same_shape if o != title)),
+                   counted,
+                   " | ".join(one_line(m, 60) for m in messages[-counted:])))
+        return False
 
     def _on_start_reroute(self, trip, t, p):
         if p.get("autoApply") is False:
@@ -6752,6 +7160,11 @@ class RideWatch:
         path = self._report_request_path(trip)
         with open(path, "w") as f:
             json.dump(req, f, indent=2)
+        # A new ride is on record, so the adopt guard's answer for this
+        # session has changed (24.1).
+        self._reported_windows_cache.pop(trip.session, None)
+        for alias in (trip.sessions or []):
+            self._reported_windows_cache.pop(alias, None)
         self.log.info("report request written: %s" % path)
         return path
 
@@ -7370,9 +7783,14 @@ class RideWatch:
         the namespace forever. The promotion half of that bound is deliberate:
         the backlog write needs a live console, and the pane it needs is the
         one this set spares (15.8).
+
+        Only entries somebody was actually asked for. An unasked one (25.2)
+        is armed for the chance of a reassignment, not because a pane is
+        writing anything — sparing a dead pane on the strength of it would
+        hold a name nobody is using for eighteen minutes.
         """
         return set(e.get("tmux") for e in self.report_deadlines
-                   if e.get("tmux"))
+                   if e.get("tmux") and e.get("asked", True))
 
     def _live_thread_names(self):
         """Panes belonging to a trip that is still running."""
@@ -7543,6 +7961,36 @@ class RideWatch:
                 trip.thread_pushes))
         return lines
 
+    def _wrap_up_pending_lines(self):
+        """One `Wrap-up pending until …` line per outstanding write-up. (24.1)
+
+        Horizon per entry: the report deadline while no report has appeared,
+        and the promotion deadline once one has — the same two windows
+        _check_report_deadlines runs on, so the marker clears exactly when the
+        wrap-up settles and never a tick later.
+
+        The epoch is in the line because the reader is `/bin/sh`, and because
+        a marker with no expiry is a marker that blocks every restart forever
+        the first time this process dies mid-window. A stale file ages out on
+        its own.
+        """
+        lines = []
+        for entry in self.report_deadlines:
+            if entry.get("reportLandedMs") is not None:
+                until = (entry["reportLandedMs"] + PROMOTION_DEADLINE_MS)
+                what = "promotion"
+            else:
+                until = entry.get("dueMs") or 0
+                what = "report"
+            if not until:
+                continue
+            lines.append(
+                "Wrap-up pending until %s (epoch %d) — %s for session %s, %s"
+                % (fmt_hms(until), int(until // 1000), what,
+                   entry.get("session"),
+                   os.path.basename(entry.get("reportPath") or "?")))
+        return sorted(lines)
+
     def maybe_write_status(self):
         if not self._status_dirty:
             return
@@ -7560,6 +8008,17 @@ class RideWatch:
         # whether the process that produced it is running the source they are
         # about to read. (8/28)
         lines.extend(self._daemon_lines())
+        # The restart interlock (24.1). ride-watch-restart.path fires on any
+        # change to ride_watch.py and its ExecCondition used to ask one
+        # question — "^No active trip" — which was true at 16:43:53 on
+        # 2026-09-21 because the 16:05 ride had ended sixty seconds earlier
+        # with its wrap-up outstanding. The restart took the console away
+        # mid-write, re-opened the finished 16:31 sub-ride and paged the
+        # rider about it. A ride is not over when the trip ends; it is over
+        # when its write-up is settled, and this is where a shell script can
+        # see that. Each line is machine-read: keep the `(epoch N)`.
+        for line in self._wrap_up_pending_lines():
+            lines.append(line)
         lines.append("")
         # Above the rides, because a phone that will not start is the one
         # thing here that no ride can be running through. These findings have

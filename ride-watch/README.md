@@ -69,7 +69,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby, and the new plan neither keeps the same routes arriving at the same time **nor lands the rider on the trip they are riding** | page |
 | `riding-flip` | `SET_RIDING` tripId changes on the same transit leg | page |
 | `missed-bus-while-riding` | `MISSED_BUS` notification while riding is held | page |
-| `notification-repeat` | the same alert (id stem + title) twice in 5 minutes | page |
+| `notification-repeat` | the same alert (id stem + title) twice in 5 minutes — and the same message too, where the stem's titles differ only in their numbers | page |
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
 | `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip | warn |
 | `position-teleport` | consecutive fixes >150m apart within 2s with **both** accuracies <30m, twice in a rolling minute | warn (page at 5 in a minute) |
@@ -167,6 +167,26 @@ typed the complaint out by hand on a bike.
   "ignore the buzzing", and saying it twice would spend the rider's other
   interrupt on something they have already been told to ignore. On the 7/31
   log it fires at **11:53:07**, the 2nd of 14 buzzes.
+  Since 2026-09-22 (backlog 24.5) there is one gate on top: **a title that
+  counts down is a reading, not a name.** Four `DEPARTURE_CHANGED` pushes for
+  the 465 on 2026-09-21 shared one id stem and carried the live wait *in the
+  title* — "465 · 5 min", "465 · 6 min", "465 · 5 min", "465 · 5 min" — with
+  four different messages ("3 min later · 4 min slack" … "10 min later"). The
+  1st and 3rd collided on 5 by coincidence and the rule paged *"same
+  notification 2x in 5 min: 465 · 5 min"*, spending that ride's one page. So
+  when a stem has used two or more titles of the same **shape** this ride
+  (identical once the digits are removed), the messages of the pushes actually
+  counted must match too. Titles that differ in their *words* are the app
+  saying a new thing, not re-displaying a counter — 8/27's
+  `CONNECTION_WARNING_…` stem escalates "Tight connection" to "Connection at
+  risk", and 8/31 17:19:17 / 17:21:17's two "Connection at risk" pushes are a
+  real repeat that still fires. 24.5 as filed asked for the id stem **plus the
+  message** instead of the title; measured over the 28 day files on disk that
+  takes the rule from 16 firings to 8 and loses six real storms — it is the
+  2026-08-31 regression above, re-entered from the other side. The gate as
+  built costs one firing, 09-21's, and keeps the other fifteen including that
+  evening's true positive (two identical "Missed bus" pushes 21 s apart,
+  17:06:06).
 - **`replan-not-converging`** is the half `reroute-storm` cannot do.
   `reroute-storm` counts reroute *events* and never looks at whether they are
   working, so it cannot tell "re-planning and converging" from "re-planning in
@@ -776,6 +796,27 @@ it comes to that, an orphaned wrap-up — one whose pane is known to be gone —
 handed **once** to whichever ride thread is alive, with its deadline restarted:
 same session, same rider, and that thread is running anyway.
 
+**Nor about one nobody was ever asked for (backlog 25.2).** A ride whose
+console was already gone at trip end used to page in that same tick — *"Ride
+ended — N findings. Report pending; open Claude and say 'ride report'"* — while
+the next line of the log retired the pane with *"no wrap-up owed"*. Both on
+2026-09-21: at 17:54:19 for `mubtf1hr-m1boyv`, whose thread had died at
+17:29:23, and at 16:43:54 for the re-adopted sub-ride above. The page went out
+ten minutes before any deadline it could have been about, contradicted the
+verdict printed one line later, and asked the rider to fetch a report nobody
+had been asked to write.
+
+So the decision comes first and only one kind of promise can be broken. A
+wrap-up is **owed** when a report was requested (the ride had findings) and
+**asked** when somebody was actually given it. An owed-but-unasked wrap-up
+still arms its deadline — so `_maybe_reassign_wrap_up` can hand it to a console
+that is alive — but the entry carries `asked: False`, which means it never
+pages and never spares a pane. If a reassignment lands it becomes asked, and
+from then on missing it pages like any other. The request file stays on disk
+and `current-ride.md` names it, which is where a session writing the report by
+hand will find it. The page that survives is the one the 17:37:03 page already
+was: a promise, made to a live console, missed at its deadline.
+
 ### A wrap-up is not done when the report file appears
 
 That state machine had one word wrong in it, and the word cost two rides
@@ -800,9 +841,22 @@ each plan file** (`PLAN_PATHS`: the backlog and the record file beside it) in th
 deadline entry, and a report that lands opens a promotion window rather than
 closing the wrap-up:
 
-* **a plan file changed** — that is the promotion. Reap, no page. Either file
-  counts: a wrap-up whose findings all dedupe onto existing rows edits the
-  backlog, and one that also closes a row moves it into the record;
+* **a plan file gained a mention of this ride** — that is the promotion. Reap,
+  no page. Either file counts: a wrap-up whose findings all dedupe onto
+  existing rows edits the backlog, and one that also closes a row moves it
+  into the record. *A mention of this ride*, not merely a change, since
+  2026-09-22 (backlog 24.2): on 2026-09-21 the 16:05 ride's report landed at
+  16:44:19 naming two real bugs and promoted nothing, the pipeline session
+  wrote "ON DEV as 2026.0921.1" onto eight unrelated rows at 16:44:30, and at
+  16:44:34 the daemon logged the wrap-up as *promoted — "changed since
+  16:42:53"* and retired its console. `grep -c 8dz3ar` on the backlog was **0**
+  at 17:15; both bugs were promoted by hand hours later. So the entry now also
+  records how often each plan file already **named** the ride — its session
+  ids, the short form the reports use, and the report's own filename — and a
+  promotion is one of those counts going up. The baseline is the count, not
+  the presence, because a tier opened earlier in the evening already names the
+  session. A change that names nothing is logged and ignored, and the window
+  runs on;
 * **the report named no real bugs** — nothing to promote, so the wrap-up is
   complete the moment the file exists, exactly as before. This is the
   terminating condition that matters most: a clean ride must never hold a
@@ -1012,15 +1066,22 @@ It never touches the stamp, and since 2026-09-09 it no longer decides anything
 either: it supplies the "Tree now" number, and `_daemon_source_drift()` decides
 whether that is a warning.
 
-**Restart on change (optional, not installed).** `ride-watch-restart.path` and
+**Restart on change.** `ride-watch-restart.path` and
 `ride-watch-restart.service` sit next to `ride-watch.service` in this
-directory, uninstalled:
+directory. (The path unit's own "NOT INSTALLED BY DEFAULT" comment is
+history — it has been enabled since 2026-08-31, and on 2026-09-21 it fired.)
+The service's condition now lives in `restart-ok.sh` beside them:
 
 ```
 cp ride-watch/ride-watch-restart.{path,service} ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now ride-watch-restart.path
 ```
+
+`restart-ok.sh` is read from the repo rather than copied, so editing it takes
+effect at once; editing the `.service` file needs the `cp` and the
+`daemon-reload` above, and until both have run the OLD inline condition is
+still what systemd evaluates.
 
 Why a **path unit** and not a git hook: the daemon went stale because the file
 moved under a running process, which a `post-commit` hook only sometimes
@@ -1032,14 +1093,48 @@ all of them and nothing else. A Makefile target has the opposite problem — it
 is honest and discoverable, and it only helps someone who remembers to run it,
 which is exactly the step that was missed.
 
-The restart is gated on the daemon being idle (`ExecCondition` greps
-`current-ride.md` for "No active trip"). A restart mid-ride is *safe* —
-`KillMode=process` leaves the rider's live tmux thread alone, the trip is
-re-adopted on the next `UPDATE_PROGRESS`, and the report deadline survives in
-`state.json` — but it is not free: per-trip rule state resets and the adopted
-trip spawns a **second** ride thread the rider then sees in their app. A file
-changing mid-ride is not a reason to interrupt one. The STALE line covers that
-case by telling the ride thread, live, what it is actually running.
+The restart is gated on the daemon being idle **and owing no wrap-up**
+(`ExecCondition=.../restart-ok.sh`, which reads `current-ride.md` for both
+answers). A restart mid-ride is *safe* — `KillMode=process` leaves the rider's
+live tmux thread alone, the trip is re-adopted on the next `UPDATE_PROGRESS`,
+and the report deadline survives in `state.json` — but it is not free: per-trip
+rule state resets and the adopted trip spawns a **second** ride thread the
+rider then sees in their app. A file changing mid-ride is not a reason to
+interrupt one. The STALE line covers that case by telling the ride thread,
+live, what it is actually running.
+
+**Why the second question (24.1).** Until 2026-09-22 the condition asked only
+about an active trip, and on 2026-09-21 16:43:53 the honest answer was "none":
+the 16:05 ride had ended at 16:42:53 and its console was one minute into the
+wrap-up. The restart went ahead. The fresh process found the 16:31
+`START_GO_MODE` records still in the stream, opened the **finished** sub-ride
+off them, filed `missed-start` "7m36s late", `gps-gap` "756 s" and two
+`deviated-streak`s about a rider who was already home, spawned a second
+console, and paged *"Ride ended — 5 findings. Report pending"* twenty-five
+seconds before the real report landed. Three things changed:
+
+* the daemon writes `Wrap-up pending until HH:MM:SS (epoch N) — …` into
+  `current-ride.md` for as long as a report or promotion window is open, and
+  `restart-ok.sh` refuses while any such line is in the future. The epoch is
+  there so a daemon that dies inside its own window cannot block every future
+  restart — a stale marker ages out by itself;
+* the adopt path declines to open a ride whose start falls inside a window
+  already ended and written up. The evidence is the per-ride
+  `report-request-<session>-<HHMM>.json` file (and `lastTrip` in `state.json`
+  for a clean ride, which writes no request) — the artifacts that survive a
+  restart, which is the whole point, since the daemon that has to know is a
+  fresh one. There is **no grace either side of the window**, deliberately:
+  on that same evening ride 2 began 3m47s after ride 1 ended on the same
+  session id, and a daemon restarted during ride 2 must still recover its
+  start;
+* the "Report pending" page is no longer sent at trip end at all. See
+  *The wrap-up* below.
+
+Check the condition by hand at any time:
+
+```
+ride-watch/restart-ok.sh; echo $?          # 0 = a restart is allowed now
+```
 
 **Drift hazard:** `~/.config/systemd/user/ride-watch.service` is a real file,
 not a symlink to the copy in this directory, so the two can diverge silently.

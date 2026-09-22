@@ -221,9 +221,22 @@ The steps:
    rewrite a row that is not yours. `ride-watch/report-prompt.md`'s *Promote the
    findings to the backlog* section is the long form of this step.
 
+   **Name the ride in what you write.** Every row or observation you add carries
+   this ride's session id (the request file's `session`) or its report filename
+   — which is the backlog's own convention anyway: a tier header names the ride
+   it was opened from, a row cites the report it came out of. It is also how the
+   daemon knows the promotion happened. Since 2026-09-22 it looks for one of
+   those strings appearing in a plan file, not merely for the file changing: on
+   2026-09-21 another session made an unrelated edit fourteen seconds after a
+   wrap-up's report landed, the daemon took that for the promotion, closed the
+   console, and the ride's two real bugs reached the backlog hours later by hand
+   (backlog 24.2).
+
    **You have time for this and the daemon knows it.** This console is kept open
-   until that file actually changes — the daemon digests it when the ride ends and
-   compares — for up to eight minutes after your report lands. Before 2026-09-17
+   until that file names this ride — the daemon digests both plan files when the
+   ride ends and compares — for up to eight minutes after your report lands. An
+   edit that names some other ride is not yours and does not close the window.
+   Before 2026-09-17
    it was not: the pane went two minutes after the report file appeared, and on
    09-15 two rides' reports (15:53:04 and ~16:00) were written and promoted
    nothing because of it. If you write the report and stop, the rider gets paged

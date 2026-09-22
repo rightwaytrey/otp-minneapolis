@@ -1,9 +1,13 @@
 [Unit]
 Description=Restart ride-watch when its source changes on disk
 Documentation=file:///home/rwt/projects/otp-minneapolis/ride-watch/README.md
-# NOT INSTALLED BY DEFAULT. See "Knowing which daemon is running" in README.md
-# for the argument and the install command. Nothing here restarts anything
-# until a human runs `systemctl --user enable --now ride-watch-restart.path`.
+# INSTALLED AND ENABLED since 2026-08-31 — this comment still said "NOT
+# INSTALLED BY DEFAULT" three weeks later, on the evening it restarted the
+# daemon mid-wrap-up, and the 24.1 investigation had to rule out a manual
+# restart against it. See "Knowing which daemon is running" in README.md for the
+# argument, the install command and what the restart is now gated on.
+# `systemctl --user is-enabled ride-watch-restart.path` is the only answer that
+# counts; this line is a comment and can go stale again.
 
 [Path]
 # Every way the file can change, not just `git commit`: a pull, a checkout, a
