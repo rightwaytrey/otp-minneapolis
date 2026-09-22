@@ -71,10 +71,10 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `missed-bus-while-riding` | `MISSED_BUS` notification while riding is held | page |
 | `notification-repeat` | the same alert (id stem + title) twice in 5 minutes — and the same message too, where the stem's titles differ only in their numbers | page |
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
-| `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip | warn |
+| `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip, measured from the newest fix TIMESTAMP the stream holds — never from when the daemon last looked (19.2) | warn |
 | `position-teleport` | consecutive fixes >150m apart within 2s with **both** accuracies <30m, twice in a rolling minute | warn (page at 5 in a minute) |
 | `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m (the anchor's percentage is re-based on an itinerary swap, which changes the denominator and not the rider) | warn |
-| `reroute-storm` | more than 3 **`autoApply: true`** `START_REROUTE` in 5 minutes | warn |
+| `reroute-storm` | more than 3 automatic re-plans in 5 minutes: **`autoApply: true`** `START_REROUTE`, plus every `AUTO_REPLAN` that has no `START_REROUTE` behind it (the quiet re-plan dispatches none) | warn |
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
 | `destination-unreachable` | the app raised `DESTINATION_UNREACHABLE` itself | info |
 | `unreachable-but-routable` | ...and a `REROUTE_SNAPSHOT` in the last 3 min ends within 100m of the destination it gave up on | page |
@@ -1158,13 +1158,34 @@ cannot clobber the live status file. Use `--watch-dir DIR` to send output
 somewhere else. It prints every finding with its local time and the pushes that
 *would* have gone out.
 
+**What a replay cannot show, and it is not a small thing.** Replay reads
+*every* line and drives its clock off the events (`clock_ms = max(event t)`),
+so two whole classes of live failure do not exist in it:
+
+- **the daemon's own blindness.** A backlog the follower skipped, or a batch
+  that had not reached this host's rsync mirror yet, is simply read here. The
+  2026-09-19 `gps-gap "no GPS fix for 99s"` and the 2026-09-21 `"136 s"` (19.2)
+  are both invisible to `--replay` on the code that produced them — replaying
+  those two day files on 888fc96 files neither.
+- **an outage that stops ALL telemetry.** With no events the replay clock does
+  not advance, so the gap never opens. 2026-09-21's real 80 s hole at 16:06:05
+  is in the file and no replay of it reports a thing.
+
+So a rule about *staleness* is verified against the live shape, not a replay:
+hand the daemon the tail of a real day file with `watch.stream_path` pointing
+at the whole of it, set `watch.clock_ms`, and call `check_timers()`. That is
+what `TestGapIsMeasuredFromTheNewestFix` does, and what the two harnesses in
+19.2's build did on the real 09-19 and 09-21 records. A replay over every day
+file is still the right *regression* check — it proves nothing else moved.
+
 ## Tuning the rules
 
 Thresholds are module constants at the top of `ride_watch.py` —
 `STOP_COLLAPSE_MAX_PROGRESS`, `DEVIATED_STREAK_MS`, `GPS_GAP_MS`,
 `REROUTE_STORM_COUNT`, `DISTANCE_SPIKE_FAR_M`, `NOTIFICATION_REPEAT_COUNT`,
 `MOTION_PROGRESS_PCT`, `MOTION_DISPLACEMENT_M`, `STOP_COLLAPSE_NEAR_STOP_M`,
-`ARRIVAL_RADIUS_M`, `TELEPORT_MIN_M`,
+`ARRIVAL_RADIUS_M`, `TELEPORT_MIN_M`, `FIX_TIMESTAMP_MAX_LAG_MS`,
+`REPLAN_PAIR_WINDOW_MS`,
 `TELEPORT_WARN_COUNT`, `ARRIVED_NEVER_ENDED_MS`, `MAX_PAGES_PER_TRIP`,
 `PUSH_MIN_INTERVAL_MS`, `PAGE_COALESCE_MS`, `PAGE_RANK`, and so on.
 
@@ -1195,7 +1216,7 @@ states the convention outright.
 python3 ride-watch/test_ride_watch.py
 ```
 
-563 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
+621 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
 (both the firing case and the case that must stay quiet), the state machine, and
 page ranking (supersession inside the window, tie-breaking, flush on a quiet log,
 flush on trip end).
