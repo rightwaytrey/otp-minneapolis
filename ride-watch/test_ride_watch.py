@@ -47,6 +47,13 @@ def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
     it is slow, it is not reproducible, and a test asserting on what is or
     is not in the stream would be asserting on what the rider did this
     morning. Tests that want records there write them to this path.
+
+    plan_paths is pinned for the third time over the same reason, and since
+    24.2 it matters more than it did: arming a report deadline now READS both
+    plan files (to count how often they already name the ride) rather than
+    only hashing them, so leaving the default would have every ride-ending
+    test read a megabyte of the rider's real backlog. Tests about the
+    promotion gate write to these two.
     """
     log = Log(os.path.join(watch_dir, "daemon.log"), echo=False)
     reports = os.path.join(watch_dir, "reports")
@@ -56,6 +63,8 @@ def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
                       thread_enabled=thread_enabled, report_dir=reports,
                       kill_thread=kill_thread)
     watch.stream_path = os.path.join(watch_dir, "stream.jsonl")
+    watch.plan_paths = [os.path.join(watch_dir, "backlog.md"),
+                        os.path.join(watch_dir, "record.md")]
     return watch
 
 
@@ -1055,6 +1064,115 @@ class TestRules(RuleTestCase):
         watch = self.run_stream(b, finalize=False)
         self.assertEqual(len(self.find(watch, "notification-repeat")), 1)
 
+    # -- 24.5: a title that counts down is not a name ------------------------
+
+    def departure_changed(self, b, title, message):
+        """One of the 09-21 16:1x DEPARTURE_CHANGED pushes, verbatim.
+
+        All four share the id stem `DEPARTURE_CHANGED_1:2:t64A-b156-sl1C-v64
+        :plan`; only the trailing Date.now() differs.
+        """
+        return b.notification(
+            title=title, message=message, ntype="DEPARTURE_CHANGED",
+            nid="DEPARTURE_CHANGED_1:2:t64A-b156-sl1C-v64:plan_%d" % b.t)
+
+    def test_k_a_countdown_in_the_title_colliding_is_not_a_repeat(self):
+        """2026-09-21 16:19:18, and it cost that ride its one page (24.5).
+
+        Three `DEPARTURE_CHANGED` pushes for the 465 whose titles read
+        "465 · 5 min", "465 · 6 min", "465 · 5 min" — the first and third
+        collided on 5 by coincidence, with a push of the same alert sitting
+        between them in another bucket and all three messages different. The
+        daemon paged "same notification 2x in 5 min: 465 · 5 min".
+        """
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        self.departure_changed(b.advance(1000), "465 · 5 min",
+                               "3 min later · 4 min slack")
+        self.departure_changed(b.advance(103 * 1000), "465 · 6 min",
+                               "5 min later · 5 min slack")
+        self.departure_changed(b.advance(184 * 1000), "465 · 5 min",
+                               "7 min later · 5 min slack")
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("notification-repeat", self.rules(watch))
+
+    def test_k_the_fourth_departure_push_does_not_fire_it_either(self):
+        """The 16:21:20 push made the two "465 · 5 min" titles adjacent, which
+        is what a window-scoped memory of the titles would have missed: by
+        then the "6 min" push that proves the title moves has aged out."""
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        self.departure_changed(b.advance(1000), "465 · 5 min",
+                               "3 min later · 4 min slack")
+        self.departure_changed(b.advance(103 * 1000), "465 · 6 min",
+                               "5 min later · 5 min slack")
+        self.departure_changed(b.advance(184 * 1000), "465 · 5 min",
+                               "7 min later · 5 min slack")
+        self.departure_changed(b.advance(122 * 1000), "465 · 5 min",
+                               "10 min later · 5 min slack")
+        watch = self.run_stream(b, finalize=False)
+        self.assertNotIn("notification-repeat", self.rules(watch))
+
+    def test_k_the_same_countdown_saying_the_same_thing_is_a_repeat(self):
+        """The gate is about a coincidence, not about the alert. Two pushes
+        at one reading that also say the same thing are a repeat and page."""
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        self.departure_changed(b.advance(1000), "465 · 5 min",
+                               "3 min later · 4 min slack")
+        self.departure_changed(b.advance(60 * 1000), "465 · 6 min",
+                               "5 min later · 5 min slack")
+        self.departure_changed(b.advance(60 * 1000), "465 · 5 min",
+                               "3 min later · 4 min slack")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "notification-repeat")), 1)
+
+    def test_k_two_identical_missed_bus_pushes_still_page(self):
+        """2026-09-21 17:06:06, the TRUE positive of the same evening: two
+        `MISSED_BUS` pushes 21 s apart, byte-identical but for the Date.now()
+        the app appends. Whatever 24.5 changes, this must survive."""
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        stem = ("MISSED_BUS_METRO Orange Line_I-35W & Lake St Station"
+                "_1790028180000")
+        for _ in range(2):
+            b.advance(21 * 1000).notification(
+                title="Missed bus", ntype="MISSED_BUS",
+                message="METRO Orange Line missed · next departure",
+                nid="%s_%d" % (stem, b.t))
+        hits = self.find(self.run_stream(b, finalize=False),
+                         "notification-repeat")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["context"]["key"], stem)
+
+    def test_k_a_title_that_changes_its_words_is_still_an_identity(self):
+        """8/27's `CONNECTION_WARNING_…` stem escalates "Tight connection" to
+        "Connection at risk", and 8/31 17:19:17 / 17:21:17's two "Connection
+        at risk" pushes — 4 min late, then 6 — are a real repeat.
+
+        Two titles of the same SHAPE is what says the title is a reading; two
+        titles that differ in their words is the app saying a new thing.
+        """
+        b = StreamBuilder().start().advance(1000).position().progress(stops=5)
+        stem = "CONNECTION_WARNING_539_I-35W & 98th Street Station Gate C"
+        b.advance(60 * 1000).notification(
+            title="Tight connection", ntype="CONNECTION_WARNING",
+            message="Tight connection — about 118s to catch 539.",
+            nid="%s_%d" % (stem, b.t))
+        for late in (4, 6):
+            b.advance(120 * 1000).notification(
+                title="Connection at risk", ntype="CONNECTION_WARNING",
+                message="Running %d min late — you may miss 539." % late,
+                nid="%s_%d" % (stem, b.t))
+        hits = self.find(self.run_stream(b, finalize=False),
+                         "notification-repeat")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["summary"],
+                         "same notification 2x in 2 min: Connection at risk")
+
+    def test_k_title_shape_takes_the_numbers_out_and_nothing_else(self):
+        self.assertEqual(ride_watch.title_shape("465 · 5 min"), "# · # min")
+        self.assertEqual(ride_watch.title_shape("465 · 6 min"), "# · # min")
+        self.assertNotEqual(ride_watch.title_shape("Tight connection"),
+                            ride_watch.title_shape("Connection at risk"))
+        self.assertEqual(ride_watch.title_shape(None), "")
+
     def test_l_progress_without_motion_warns(self):
         b = StreamBuilder().start().advance(1000).position()
         b.advance(1000).progress(leg=1, prog=10.0, stops=5)
@@ -1492,6 +1610,104 @@ class TestPageRanking(RuleTestCase):
         self.assertEqual(by_rule["riding-flip"]["paged"], False)
         for row in rows:
             self.assertNotEqual(row.get("paged"), "pending")
+
+
+class TestRestartInterlock(RuleTestCase):
+    """24.1. The restart path unit fires on any change to ride_watch.py and
+    its only question was "is there an active trip?". On 2026-09-21 16:43:53
+    that was true — the 16:05 ride had ended sixty seconds earlier — and the
+    restart took the console away one minute into the wrap-up.
+
+    The daemon now says in current-ride.md when a wrap-up is outstanding, and
+    restart-ok.sh is the condition that reads it.
+    """
+
+    SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "restart-ok.sh")
+
+    def status(self, watch):
+        watch.write_status(force=True)
+        return read_text(os.path.join(self.tmp, "current-ride.md"))
+
+    def restart_ok(self, text, now_ms=None):
+        path = os.path.join(self.tmp, "status-under-test.md")
+        with open(path, "w") as f:
+            f.write(text)
+        env = dict(os.environ, RIDE_WATCH_STATUS=path)
+        if now_ms is not None:
+            # The fixtures run on 2026-07-29; without this the script would
+            # compare their deadlines against today and call every one stale.
+            env["RIDE_WATCH_NOW"] = str(int(now_ms // 1000))
+        return subprocess.call([self.SCRIPT], env=env) == 0
+
+    def ended_ride(self):
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        return self.run_stream(b, finalize=False, thread=thread)
+
+    def test_an_outstanding_wrap_up_is_named_in_the_status_file(self):
+        watch = self.ended_ride()
+        text = self.status(watch)
+        self.assertIn("No active trip", text)          # ...and yet
+        self.assertIn("Wrap-up pending until", text)
+        self.assertIn("(epoch", text)
+        self.assertFalse(self.restart_ok(text, now_ms=watch.clock_ms))
+
+    def test_the_marker_clears_when_the_wrap_up_settles(self):
+        watch = self.ended_ride()
+        watch.report_deadlines = []
+        text = self.status(watch)
+        self.assertNotIn("Wrap-up pending", text)
+        self.assertTrue(self.restart_ok(text, now_ms=watch.clock_ms))
+
+    def test_the_marker_moves_to_the_promotion_window(self):
+        """The wrap-up is not over when the report appears — it is over when
+        the backlog has moved (15.8) — so the interlock has to cover the
+        second window too."""
+        watch = self.ended_ride()
+        entry = watch.report_deadlines[0]
+        entry["reportLandedMs"] = watch.clock_ms
+        text = self.status(watch)
+        self.assertIn("promotion for session", text)
+        self.assertIn("(epoch %d)"
+                      % ((watch.clock_ms + ride_watch.PROMOTION_DEADLINE_MS)
+                         // 1000), text)
+        self.assertFalse(self.restart_ok(text, now_ms=watch.clock_ms))
+
+    def test_an_idle_daemon_may_restart(self):
+        watch = quiet_watch(self.tmp, replay=False)
+        self.assertTrue(self.restart_ok(self.status(watch),
+                                        now_ms=watch.now_ms()))
+
+    def test_a_live_ride_may_not_restart(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=4)
+        watch = self.run_stream(b, finalize=False)
+        self.assertFalse(self.restart_ok(self.status(watch),
+                                         now_ms=watch.clock_ms))
+
+    def test_a_marker_whose_deadline_has_passed_does_not_block_for_ever(self):
+        """A daemon that dies inside its own window must not leave a file
+        that refuses every future restart."""
+        past = int(time.time()) - 600
+        self.assertTrue(self.restart_ok(
+            "No active trip. Last: x\n"
+            "Wrap-up pending until 00:00:00 (epoch %d) — report for s, r.md\n"
+            % past))
+
+    def test_an_unreadable_status_file_means_no_restart(self):
+        env = dict(os.environ,
+                   RIDE_WATCH_STATUS=os.path.join(self.tmp, "nope.md"))
+        self.assertNotEqual(subprocess.call([self.SCRIPT], env=env), 0)
+
+    def test_the_service_unit_uses_the_script(self):
+        """The unit in the repo is what gets installed by hand; a condition
+        written inline cannot use shell variables (systemd eats $NAME)."""
+        unit = read_text(os.path.join(os.path.dirname(self.SCRIPT),
+                                      "ride-watch-restart.service"))
+        self.assertIn("ExecCondition=", unit)
+        self.assertIn("restart-ok.sh", unit)
 
 
 class TestSurfaces(RuleTestCase):
@@ -2151,14 +2367,23 @@ class TestRideThread(RuleTestCase):
 
     # -- the fallback page ---------------------------------------------------
 
-    def test_a_ride_with_no_thread_and_findings_still_reaches_the_rider(self):
+    def test_a_ride_with_no_thread_and_findings_does_not_page_at_trip_end(self):
+        """25.2: it used to, in the same second as deciding it owed nothing.
+
+        The findings are not lost — the request file is written and the
+        deadline is armed unasked, so a live console can still be handed it —
+        but the rider is not interrupted about a report nobody was asked for.
+        """
         b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
         b.advance(1000).progress(stops=1, prog=21.0)
         b.advance(1000).stop()
         watch, thread = self.ride(b, ok=False)
-        fallback = [p for p in watch.push_log if p["kind"] == "fallback"]
-        self.assertEqual(len(fallback), 1)
-        self.assertIn("Report pending", fallback[0]["body"])
+        self.assertEqual([p for p in watch.push_log
+                          if p["kind"] == "fallback"], [])
+        self.assertEqual(len(watch.report_deadlines), 1)
+        self.assertIs(watch.report_deadlines[0]["asked"], False)
+        self.assertTrue(os.path.exists(
+            watch.report_deadlines[0]["requestPath"]))
 
     def test_a_working_thread_means_no_fallback_page(self):
         b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
@@ -3087,12 +3312,44 @@ class TestReportDeadline(RuleTestCase):
         watch = self.run_stream(b, finalize=False, thread=StubThread())
         self.assertEqual(watch.report_deadlines, [])
 
-    def test_a_failed_spawn_pages_now_and_does_not_also_arm(self):
-        """The old path still fires immediately when there is provably no
-        thread; the deadline is for the case it cannot see."""
+    def test_a_failed_spawn_pages_nothing_and_arms_an_unasked_deadline(self):
+        """25.2. Until 2026-09-22 a failed spawn paged in the same tick as the
+        trip ended — "Ride ended — N findings. Report pending; open Claude and
+        say 'ride report'" — while the next log line retired the pane with "no
+        wrap-up owed". 2026-09-21 17:54:19, and again at 16:43:54.
+
+        Nobody was asked, so nothing can be late and nothing is paged. The
+        deadline is armed anyway so a live console can still be handed the
+        request, and marked unasked so it lapses in silence if none is."""
         watch = self.ended_ride(thread_ok=False)
-        self.assertEqual(len(self.fallbacks(watch)), 1)
+        self.assertEqual(self.fallbacks(watch), [])
+        self.assertEqual(len(watch.report_deadlines), 1)
+        self.assertIs(watch.report_deadlines[0]["asked"], False)
+
+    def test_an_unasked_deadline_lapses_without_paging(self):
+        """The rest of 25.2: ten minutes later, still nothing, still no page.
+
+        And the pane is not spared for it — an unasked entry is a hope of
+        reassignment, not a console that is writing."""
+        watch = self.ended_ride(thread_ok=False)
+        self.assertEqual([r["why"] for r in watch.thread_reaps],
+                         ["trip ended (stop), no thread to write it up"])
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(self.fallbacks(watch), [])
         self.assertEqual(watch.report_deadlines, [])
+
+    def test_an_unasked_wrap_up_handed_to_a_live_console_can_be_paged(self):
+        """Reassignment is what the unasked entry is armed for. Once a thread
+        that is actually alive has been asked, missing it is a broken promise
+        like any other and pages at its new deadline."""
+        watch = self.ended_ride(thread_ok=False)
+        entry = watch.report_deadlines[0]
+        entry["asked"] = True                 # as _maybe_reassign_wrap_up does
+        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(len(self.fallbacks(watch)), 1)
+        self.assertIn("Report pending", self.fallbacks(watch)[0]["body"])
 
     def test_the_deadline_survives_a_daemon_restart(self):
         """Restart-on-commit is now a thing that happens to this process
@@ -4407,6 +4664,85 @@ class TestStartRecoveredFromTheStream(RuleTestCase):
         self.assertIn(watch.stream_path,
                       self.find(watch, "missed-start")[0]["context"]
                       ["recoveredFrom"])
+
+    # -- 24.1: a ride that is over and written up is not recovered ----------
+
+    def request_for(self, watch, start_ms, end_ms, session=SESSION):
+        """The per-ride artifact a finished ride leaves behind. It is the one
+        thing that survives a daemon restart, which is why the guard reads
+        it — the daemon that has to know is a fresh one."""
+        path = os.path.join(
+            watch.watch_dir, "report-request-%s-%s.json"
+            % (session, time.strftime("%H%M", time.localtime(start_ms / 1000))))
+        with open(path, "w") as f:
+            json.dump({"session": session, "startMs": start_ms,
+                       "endMs": end_ms, "findingsCount": 8,
+                       "reportPath": "/vault/2026-09-21-8dz3ar.md"}, f)
+        return path
+
+    def test_a_finished_written_up_ride_is_not_reopened(self):
+        """2026-09-21 16:43:53 (24.1). The path unit restarted the daemon one
+        minute into the 16:05 ride's wrap-up; the fresh process found the
+        16:31 START_GO_MODE records still in the stream and opened the
+        finished sub-ride off them — "7m36s late", "no GPS fix for 756s",
+        two deviated-streaks, a second console, and a "Ride ended — 5
+        findings. Report pending" page 25 s before the real report landed.
+
+        The 16:31 start lies inside the window of the request file the
+        previous daemon had already written."""
+        watch, b = self.missed_ride(drop_before=-1)
+        starts = [ev["t"] for ev in b.events
+                  if ev.get("type") == "START_GO_MODE"]
+        restarted = quiet_watch(self.tmp)
+        restarted.stream_path = watch.stream_path
+        self.request_for(restarted, starts[0] - 60000, b.events[-1]["t"] + 1000)
+        restarted.process(b.events[-1])
+        self.assertEqual(restarted.trips, {})
+        self.assertEqual(restarted.all_findings, [])
+        self.assertIn("already ended and written up",
+                      read_text(os.path.join(self.tmp, "daemon.log")))
+
+    def test_the_decline_is_logged_once_not_per_event(self):
+        watch, b = self.missed_ride(drop_before=-1)
+        starts = [ev["t"] for ev in b.events
+                  if ev.get("type") == "START_GO_MODE"]
+        restarted = quiet_watch(self.tmp)
+        restarted.stream_path = watch.stream_path
+        self.request_for(restarted, starts[0] - 60000, b.events[-1]["t"] + 1000)
+        for _ in range(5):
+            restarted.process(b.events[-1])
+        text = read_text(os.path.join(self.tmp, "daemon.log"))
+        self.assertEqual(text.count("already ended and written up"), 1)
+
+    def test_the_next_ride_on_the_same_session_is_still_recovered(self):
+        """The guard must not cost the case it exists beside: on 2026-09-21
+        ride 2 began 3m47s after ride 1 ended, on the same session id, and a
+        daemon restarted during ride 2 has to recover its start. No grace
+        either side of the window is what keeps that working."""
+        watch, b = self.missed_ride(drop_before=-1)
+        starts = [ev["t"] for ev in b.events
+                  if ev.get("type") == "START_GO_MODE"]
+        restarted = quiet_watch(self.tmp)
+        restarted.stream_path = watch.stream_path
+        # An EARLIER ride of the same session, over before this one began.
+        self.request_for(restarted, starts[0] - 3600 * 1000, starts[0] - 1000)
+        restarted.process(b.events[-1])
+        self.assertIn(SESSION, restarted.trips)
+        self.assertEqual(len(self.find(restarted, "missed-start")), 1)
+
+    def test_a_clean_ride_is_covered_by_state_json(self):
+        """A clean ride writes no request file, so the window comes out of
+        `lastTrip` in state.json — which is also what a fresh daemon reads."""
+        watch, b = self.missed_ride(drop_before=-1)
+        starts = [ev["t"] for ev in b.events
+                  if ev.get("type") == "START_GO_MODE"]
+        restarted = quiet_watch(self.tmp)
+        restarted.stream_path = watch.stream_path
+        restarted.last_trip_summary = {
+            "session": SESSION, "startMs": starts[0] - 60000,
+            "endMs": b.events[-1]["t"] + 1000, "findings": 0}
+        restarted.process(b.events[-1])
+        self.assertEqual(restarted.trips, {})
 
 
 class TestFollowerDiagnostics(unittest.TestCase):
@@ -7003,23 +7339,23 @@ class TestPromotionGate(RuleTestCase):
     was touched after 13:42.
     """
 
-    def ended_ride(self, real_bugs=1):
+    def ended_ride(self, real_bugs=1, fresh_plans=True):
+        # A backlog and a record file of our own, written BEFORE the ride
+        # ends: a test must never read or write the rider's real plan, and
+        # since 24.2 the arm reads both files rather than only hashing them.
+        # quiet_watch points plan_paths at these two names.
+        self.plan = os.path.join(self.tmp, "backlog.md")
+        self.record = os.path.join(self.tmp, "record.md")
+        for p in (self.plan, self.record):
+            if fresh_plans or not os.path.exists(p):
+                with open(p, "w") as f:
+                    f.write("# open rows\n")
         thread = StubThread()
         b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
         b.advance(1000).progress(stops=1, prog=21.0)
         b.advance(1000).stop()
         watch = self.run_stream(b, finalize=False, thread=thread)
-        # A backlog and a record file of our own: a test must never read or
-        # write the rider's real plan.
-        self.plan = os.path.join(self.tmp, "backlog.md")
-        self.record = os.path.join(self.tmp, "record.md")
-        for p in (self.plan, self.record):
-            with open(p, "w") as f:
-                f.write("# open rows\n")
-        watch.plan_paths = [self.plan, self.record]
-        # Re-arm so the entry carries digests of those files rather than of
-        # the rider's real ones.
-        watch.report_deadlines[0]["planDigests"] = watch._plan_digests()
+        self.assertEqual(watch.plan_paths, [self.plan, self.record])
         self.report = watch.report_deadlines[0]["reportPath"]
         self.thread = thread
         self.real_bugs = real_bugs
@@ -7036,8 +7372,24 @@ class TestPromotionGate(RuleTestCase):
                         " — app-behaved-correctly\n")
 
     def promote(self, path=None):
+        """A row that names the ride, which is what a promotion looks like.
+
+        The session id is there because the backlog's own convention puts it
+        there — a tier header names the ride it was opened from — and because
+        since 24.2 that is what the daemon reads. See
+        test_a_plan_change_that_does_not_name_the_ride_is_not_a_promotion.
+        """
         with open(path or self.plan, "a") as f:
-            f.write("\n| 18.1 | **a new row** | evidence |\n")
+            f.write("\n| 18.1 | **a new row** | ride `%s`, evidence |\n"
+                    % SESSION)
+
+    def churn(self, path=None):
+        """Somebody else writing to the same file. 24.2, exactly: on
+        2026-09-21 16:44:30 the pipeline session put "ON DEV as 2026.0921.1"
+        onto eight rows of a ride it had nothing to do with."""
+        with open(path or self.plan, "a") as f:
+            f.write("\n| 3.7 | **an unrelated row** | ON DEV as"
+                    " 2026.0921.1 |\n")
 
     def fallbacks(self, watch):
         return [p for p in watch.push_log
@@ -7197,6 +7549,154 @@ class TestPromotionGate(RuleTestCase):
             with open(self.report, "w") as f:
                 f.write(text.replace("\n", "\n"))
             self.assertEqual(watch._report_real_bugs(self.report), want, text)
+
+    # -- 24.2: "promoted" means the backlog names THIS ride -----------------
+
+    def test_a_plan_change_that_does_not_name_the_ride_is_not_a_promotion(self):
+        """24.2, verbatim. 2026-09-21 16:44:19 the wrap-up wrote its report
+        naming two real bugs and promoted nothing; at 16:44:30 the pipeline
+        session wrote "ON DEV as 2026.0921.1" onto eight unrelated rows, and
+        at 16:44:34 the daemon logged the ride as promoted — "changed since
+        16:42:53" — and retired its console. `grep -c 8dz3ar` on the backlog
+        was 0 at 17:15, and both bugs were promoted by hand hours later."""
+        watch = self.ended_ride()
+        self.write_report(n=2)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.churn()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(len(watch.report_deadlines), 1)
+        self.assertEqual(watch.thread_reaps, [])
+        self.assertEqual(self.fallbacks(watch), [])
+
+    def test_the_churn_then_the_real_promotion_still_settles(self):
+        """And the console is not lost by the churn: the row that does name
+        the ride, written afterwards, still ends the wrap-up."""
+        watch = self.ended_ride()
+        self.write_report(n=2)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.churn()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.promote()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertEqual([r["why"] for r in watch.thread_reaps],
+                         ["wrap-up landed and promoted"])
+
+    def test_churn_alone_reaches_the_promotion_deadline_and_pages(self):
+        """The failure the gate exists for: unrelated edits must not buy the
+        wrap-up its way out, so the window runs out and the rider is told."""
+        watch = self.ended_ride()
+        self.write_report(n=2)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        for _ in range(4):
+            self.churn()
+            watch.clock_ms += 60000
+            watch.check_timers()
+        watch.clock_ms += ride_watch.PROMOTION_DEADLINE_MS + 1000
+        watch.check_timers()
+        pages = self.fallbacks(watch)
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["kind"], "promotion")
+        self.assertIn("2 real bug(s)", pages[0]["body"])
+
+    def test_the_report_filename_names_the_ride_too(self):
+        """A row that cites the report rather than the session id — the
+        backlog's other convention ("report `2026-09-21-8dz3ar.md` §3") —
+        counts just the same."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        with open(self.plan, "a") as f:
+            f.write("\n| 18.2 | **a row** | report `%s` §3 |\n"
+                    % os.path.basename(self.report))
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_a_ride_the_backlog_already_names_can_still_be_promoted(self):
+        """The baseline is the COUNT, not the presence. A tier opened earlier
+        in the evening already names the session, and the wrap-up's own row
+        has to be able to register against that."""
+        with open(os.path.join(self.tmp, "backlog.md"), "w") as f:
+            f.write("# open rows\n\n## Tier 24 — from ride `%s`\n" % SESSION)
+        watch = self.ended_ride(fresh_plans=False)
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(len(watch.report_deadlines), 1)
+        self.promote()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_the_token_baseline_survives_a_daemon_restart(self):
+        """Same reason the digest does: restart-on-commit happens mid-evening
+        and the entry is restored out of state.json."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        restarted = quiet_watch(self.tmp)
+        entry = restarted.report_deadlines[0]
+        self.assertIn(SESSION, entry["rideTokens"])
+        self.assertEqual(set(entry["planMentions"]),
+                         {self.plan, self.record})
+        self.churn()
+        restarted.clock_ms = watch.clock_ms + 1000
+        restarted.check_timers()
+        self.assertEqual(len(restarted.report_deadlines), 1)
+        self.promote()
+        restarted.clock_ms += 1000
+        restarted.check_timers()
+        self.assertEqual(restarted.report_deadlines, [])
+
+    def test_an_entry_from_a_daemon_before_242_still_settles_on_a_change(self):
+        """No token baseline means the old test is the only one available;
+        applying the new one would hold such a wrap-up open for ever."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        del watch.report_deadlines[0]["rideTokens"]
+        del watch.report_deadlines[0]["planMentions"]
+        self.churn()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_the_mention_count_is_read_once_per_file_version(self):
+        """_settle_promotion runs on every tick of an open window and the
+        plan files are half a megabyte each."""
+        watch = self.ended_ride()
+        self.write_report()
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.churn()
+        reads = []
+        real = watch._plan_mentions
+
+        def counted(tokens, only=None, digests=None):
+            reads.append(sorted(only or watch.plan_paths))
+            return real(tokens, only=only, digests=digests)
+
+        watch._plan_mentions = counted
+        watch.clock_ms += 1000
+        watch.check_timers()
+        cached = len(watch._plan_mention_cache)
+        for _ in range(5):
+            watch.clock_ms += 1000
+            watch.check_timers()
+        self.assertEqual(len(reads), 6)          # asked six times...
+        # ...and read once: the five further ticks hit the cache, which is
+        # keyed on the file's digest and so only grows when a file changes.
+        self.assertEqual(len(watch._plan_mention_cache), cached)
 
 
 class TestRide0915(unittest.TestCase):
