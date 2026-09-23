@@ -162,6 +162,7 @@ if want web; then
 echo "${GREEN}=== 4/7  Flask sidecar + static web root ===${NC}"
 rsync -az \
   "$TRANSITNAV/preferences_api.py" "$TRANSITNAV/onboard_api.py" \
+  "$TRANSITNAV/places_api.py" \
   "$TRANSITNAV/build_gtfs_shapes.py" "$TRANSITNAV/gtfs_shapes.db" \
   "$TRANSITNAV/requirements-prefs-api.txt" \
   "$RUSER:$RTNAV/"

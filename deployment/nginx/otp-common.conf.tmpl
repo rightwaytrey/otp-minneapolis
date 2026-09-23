@@ -136,6 +136,25 @@
         client_max_body_size 4k;
     }
 
+    # A server copy of each device's saved places (backlog 28.1): GET/POST
+    # /api/places?deviceId=... -> Flask places_api.py on 127.0.0.1:8092, one
+    # JSON per device. PUBLIC (rate-limited) for the same reason as every route
+    # the bundled app calls: it runs at capacitor://localhost with no
+    # credential. Flask enforces its own per-IP limit and owns CORS. The body
+    # cap sits above places_api.py's MAX_BODY_BYTES (60,000) so Flask, not
+    # nginx, answers an oversized copy with a readable 413.
+    location /api/places {
+        auth_basic off;
+        limit_req zone=otp_log burst=10 nodelay;
+
+        proxy_pass http://127.0.0.1:8092;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        client_max_body_size 64k;
+    }
+
     # (The Go Mode push relay that used to live here at /api/go-notify is gone.
     # It forwarded alerts to the owner's personal Pushover account, which can
     # only ever notify one person — a rider who installs the app has no Pushover
