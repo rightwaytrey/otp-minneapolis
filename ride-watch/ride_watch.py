@@ -401,6 +401,26 @@ NOTIFICATION_STEM_TITLE_MAX = 64
 MOTION_PROGRESS_PCT = 5.0                  # percentage points gained
 MOTION_DISPLACEMENT_M = 15.0               # ...while the fix stayed this close
 MOTION_COOLDOWN_MS = 5 * 60 * 1000
+# ...and the percentage has to MEAN travel before a jump in it is evidence of
+# anything (26.8). Two kinds of tick fail that, both measured on 2026-09-22:
+# - A tick the app itself labels `deviated`. Its currentLegProgress is the
+#   projection of a rider who is not on the route onto the nearest segment of
+#   it, and off-route two segments can sit nearly equidistant: 08:16:52 the
+#   rider was on a road parallel to the bike path, distanceFromRoute 394-397 m,
+#   and `nearestPoint` flipped ~300 m along the path between two ticks while
+#   distanceFromRoute moved 3 m. That is the projection changing its mind, not
+#   the app inventing a journey.
+# - A leg too short to have a percentage. 08:39:26 and 08:44:50 were on a
+#   6.38 m BICYCLE leg, where a 1 m wobble is 15 points. 50 m is the floor: at
+#   5 points (MOTION_PROGRESS_PCT) that is 2.5 m of projection, inside the
+#   accuracy of any fix the phone produces.
+# The row also proposed skipping on UPDATE_ROUTE_MATCH `isOnRoute` false. That
+# arm is deliberately NOT here: it adds nothing the status test does not catch
+# on 2026-09-22, and across the 29 day files it would additionally drop
+# 2026-09-01 11:10:06 (0 % -> 100 % in one tick, status `completed`,
+# isOnRoute false at 132 m) — the one-tick snap that fired "You have arrived"
+# 159 m early (ride-0901 ride 3), a real defect.
+MOTION_MIN_LEG_M = 50.0
 # ...and the anchor has to be dropped when the DENOMINATOR changes, not only
 # when the rider moves. An itinerary swap re-bases currentLegProgress onto a
 # new leg 0, so the two ticks straddling it describe different quantities:
@@ -551,6 +571,30 @@ BOARDING_PROMPT_SPEED_SECONDS = 45.0       # ...and its seconds-of-travel term
 # trip sheet polls every ~20 s, so this is several missed polls.
 BOARDING_PROMPT_MAX_RADIUS_M = 2500.0      # ...and its cap
 BOARDING_PROMPT_FEED_MAX_AGE_MS = 2 * 60 * 1000
+#
+# missed-bus-still-coming / board-arrival-vehicle-far (26.7). Both ask the one
+# record the daemon kept nothing of before: which stop a trip's vehicle is
+# heading for (`nextStopId`) and where it is, per REALTIME_VEHICLE_POSITIONS_
+# RESPONSE entry. A record is believed for as long as the app believes it —
+# otprr transit-trust.ts:24 VEHICLE_RECORD_STALE_SEC = 120, measured on the
+# record's own clock (`seconds`, the AVL fix time), not on when it was polled.
+VEHICLE_RECORD_STALE_SEC = 120
+# How many trips' records to keep per session. One poll carries ~11 vehicles
+# for one route; a trip sheet polls one or two routes.
+TRIP_VEHICLE_KEEP = 64
+# ...and how many polls to remember per session, empty ones included, so a
+# finding can say what the feed looked like just before the call (25.4: on
+# 2026-09-22 7 of 236 polls came back with no vehicles at all, and until now
+# the daemon discarded exactly those).
+ROUTE_POLL_KEEP = 32
+# board-arrival-vehicle-far. "Bus here" with the trip's own vehicle this far
+# from the boarding stop. 2026-09-22 08:16:52 and 08:38:56: 6032 m and 6026 m,
+# records 13 s and 2 s old. The floor is generous on purpose — a 120 s-old
+# record of a bus at 15 m/s is 1.8 km stale — so it is scaled by the record's
+# own age at MAX_TRANSIT_SPEED: the rule only speaks when no feed lag could
+# explain the gap.
+BOARD_ARRIVAL_FAR_BASE_M = 400.0
+BOARD_ARRIVAL_FAR_SPEED_MPS = 15.0
 #
 # onboard-anchor-behind-rider. STOP_GO_MODE wipes the client's
 # `tracking.lastPosition`; an onboard flow begun before the next fix lands
@@ -1189,6 +1233,12 @@ PAGE_RANK = {
     # itinerary-backwards  every time on the trip sheet is suspect; the rider
     #                      is reading it right now to decide what to do
     "itinerary-backwards": 45,
+    # missed-bus-still-coming  the app has just dropped the bus the rider is
+    #                          waiting for and re-planned onto a later one,
+    #                          while the feed shows that bus still on its way.
+    #                          "Keep waiting" is an instruction, and it
+    #                          expires when the bus arrives.
+    "missed-bus-still-coming": 42,
     "missed-bus-while-riding": 40,
     # replan-not-converging  the app cannot get them there and has not said
     #                        so; "finish from here yourself" is the only
@@ -1600,6 +1650,30 @@ def leg_stop_points(leg):
     return out or None
 
 
+def _num_or_none(value):
+    """A float, or None for anything that is not a real number (bools too)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def leg_from_stop_id(leg):
+    """The boarding stop's GTFS id, e.g. '1:56831', or None.
+
+    The client's leg carries it twice — `from.stopId` and `from.stop.gtfsId`
+    (measured in 2026-09-22's 08:04:58 START_GO_MODE); either is read, because
+    the selection set has changed under this file before (see leg_stop_points).
+    A street leg's `from.stop` is null and so is this.
+    """
+    place = leg.get("from") if isinstance(leg, dict) else None
+    if not isinstance(place, dict):
+        return None
+    stop = place.get("stop")
+    sid = place.get("stopId") or (stop.get("gtfsId")
+                                  if isinstance(stop, dict) else None)
+    return sid if isinstance(sid, str) and sid else None
+
+
 def summarize_itinerary(payload):
     """Compact leg summary from a START_GO_MODE payload; None if unavailable."""
     if not isinstance(payload, dict):
@@ -1632,6 +1706,17 @@ def summarize_itinerary(payload):
             "headsign": leg.get("headsign"),
             "from": ((leg.get("from") or {}).get("name")),
             "to": ((leg.get("to") or {}).get("name")),
+            # Where the leg starts, as a place and (on a transit leg) as a
+            # stop id — the NAME alone could not say where the boarding stop
+            # is or which stop a vehicle record's `nextStopId` refers to, and
+            # both 26.7 rules ask exactly that. And the leg's own length in
+            # metres: progress-without-motion (26.8) cannot tell a 6.38 m
+            # access leg, where sub-metre jitter is ten points, from a real
+            # one without it.
+            "fromStopId": leg_from_stop_id(leg),
+            "fromLat": _num_or_none((leg.get("from") or {}).get("lat")),
+            "fromLon": _num_or_none((leg.get("from") or {}).get("lon")),
+            "distance": _num_or_none(leg.get("distance")),
             "startTime": leg.get("startTime"),
             "endTime": leg.get("endTime"),
             # The stops the leg still has to call at, in order, ending at the
@@ -1781,6 +1866,13 @@ class Trip:
         self.reroute_storm_last_ms = 0
         self.prev_dist = None
         self.last_route_match = None               # last UPDATE_ROUTE_MATCH
+        # 26.7: every board time the app showed this ride, keyed by the epoch
+        # itself -> {"source", "tMs", "leg"} from SET_LIVE_LEG_TIMES. A
+        # MISSED_BUS id carries the board epoch it judged against, and this is
+        # how the daemon says where that number came from.
+        self.live_board_times = {}
+        self.missed_bus_still_paged = False        # one page per ride
+        self.board_far_fired = set()               # (tripId, stopId)
         self.last_vehicle_match = None             # last UPDATE_VEHICLE_MATCH
         self.match_disagree_since_ms = None        # match tripId != riding's
         self.match_disagree_fired = False
@@ -1870,6 +1962,13 @@ class Trip:
             return True
         return self.riding is not None
 
+    def leg(self, idx):
+        """The summarized leg at `idx` of the current itinerary, or None."""
+        if not self.itinerary or not isinstance(idx, int) or isinstance(idx, bool):
+            return None
+        legs = self.itinerary.get("legs") or []
+        return legs[idx] if 0 <= idx < len(legs) else None
+
 
 # ---------------------------------------------------------------------------
 # The watcher
@@ -1918,6 +2017,16 @@ class RideWatch:
         # its boarding prompt said "No buses detected nearby" (15.2), and the
         # only way the daemon can tell an empty search from an empty road.
         self.route_vehicles = {}
+        # session -> {tripId: {"lat", "lon", "nextStopId", "nextStopName",
+        # "seconds", "vehicleId", "label", "routeId", "pollMs"}}: the newest
+        # record of each trip across polls (26.7). Per trip, not per poll,
+        # because the poll one second before 2026-09-22's first MISSED_BUS
+        # (08:38:54) simply did not carry trip 1:1346857 — the record from
+        # 08:38:38 is the freshest the app had, and it still said 98th St.
+        self.trip_vehicles = {}
+        # session -> deque of {"tMs", "routeId", "count"}, one per poll, EMPTY
+        # POLLS INCLUDED (25.4). The feed going blank is itself evidence.
+        self.route_polls = {}
         # session -> ms of the last UPDATE_NEARBY_VEHICLES. The matcher's only
         # output; its absence is what says the search never ran.
         self.nearby_vehicles_ms = {}
@@ -2378,6 +2487,8 @@ class RideWatch:
                 self._on_transition_leg(trip, t, obj.get("payload") or {})
             elif typ == "ADD_NOTIFICATION":
                 self._on_notification(trip, t, obj.get("payload") or {})
+            elif typ == "SET_LIVE_LEG_TIMES":
+                self._on_live_leg_times(trip, t, obj.get("payload"))
             elif typ == "START_REROUTE":
                 self._on_start_reroute(trip, t, obj.get("payload") or {})
             elif typ == "AUTO_REPLAN":
@@ -3898,7 +4009,16 @@ class RideWatch:
                 kept.append({"lat": float(lat), "lon": float(lon),
                              "vehicleId": v.get("vehicleId"),
                              "tripId": v.get("tripId"),
-                             "label": v.get("label")})
+                             "label": v.get("label"),
+                             "nextStopId": v.get("nextStopId"),
+                             "nextStopName": v.get("nextStopName"),
+                             "seconds": _num_or_none(v.get("seconds"))})
+            # Every poll is noted, the empty ones first among them: it used to
+            # `return` right here, which made the daemon structurally blind to
+            # 25.4's blackouts. The boarding-prompt feed below still only
+            # takes non-empty polls — its question is "what did the app have",
+            # and an empty poll does not erase what it had a poll ago.
+            self._note_route_poll(session, t, route, kept)
             if not kept:
                 return
             feeds = self.route_vehicles.setdefault(session, {})
@@ -3910,6 +4030,58 @@ class RideWatch:
                 del feeds[stale]
             return
         self._rule_boarding_prompt_empty(session, t, trip)
+
+    def _note_route_poll(self, session, t, route, kept):
+        """Remember the poll, and the newest record of every trip in it."""
+        polls = self.route_polls.get(session)
+        if polls is None:
+            polls = self.route_polls[session] = collections.deque(
+                maxlen=ROUTE_POLL_KEEP)
+        polls.append({"tMs": int(t), "routeId": route, "count": len(kept)})
+        if not kept:
+            return
+        recs = self.trip_vehicles.setdefault(session, {})
+        for v in kept:
+            trip_id = v.get("tripId")
+            if not trip_id:
+                continue
+            old = recs.get(trip_id)
+            # Newest by the record's own clock; a poll can hand back an older
+            # AVL fix than the last one did.
+            if old is not None and old.get("seconds") is not None and (
+                    v.get("seconds") is None
+                    or v["seconds"] < old["seconds"]):
+                continue
+            rec = dict(v)
+            rec["routeId"] = route
+            rec["pollMs"] = int(t)
+            recs[trip_id] = rec
+        if len(recs) > TRIP_VEHICLE_KEEP:
+            for stale in sorted(recs, key=lambda k: recs[k]["pollMs"]
+                                )[:-TRIP_VEHICLE_KEEP]:
+                del recs[stale]
+
+    def _trip_vehicle(self, session, trip_id, t):
+        """(record, ageSec) for the trip's newest vehicle record, or None.
+
+        None when there is no record or it is older than
+        VEHICLE_RECORD_STALE_SEC on its own clock — the app would not believe
+        it either (transit-trust.ts:133).
+        """
+        rec = (self.trip_vehicles.get(session) or {}).get(trip_id)
+        if rec is None:
+            return None
+        if rec.get("seconds") is not None:
+            age = t / 1000.0 - rec["seconds"]
+        else:
+            age = (t - rec["pollMs"]) / 1000.0
+        if age > VEHICLE_RECORD_STALE_SEC:
+            return None
+        return rec, max(0.0, age)
+
+    def _recent_polls(self, session, t, window_ms=VEHICLE_RECORD_STALE_SEC * 1000):
+        return [dict(q) for q in (self.route_polls.get(session) or ())
+                if 0 <= t - q["tMs"] <= window_ms]
 
     def _rule_boarding_prompt_empty(self, session, t, trip):
         """"I'm on the bus" searched nothing while the feed held the bus.
@@ -5169,6 +5341,31 @@ class RideWatch:
         if not isinstance(prog, (int, float)) or trip.last_fix is None:
             return
         span = self._note_progress_freeze(trip, t, leg, prog)
+        # 26.8: a percentage that does not measure travel cannot be evidence
+        # of travel — a tick the app labels `deviated`, or a leg shorter than
+        # MOTION_MIN_LEG_M. Such a tick runs through ALL of the bookkeeping
+        # below exactly as before, and where it would have fired it is
+        # SUPPRESSED rather than skipped: it re-anchors and spends the
+        # cooldown, it just files nothing. Two cheaper versions were built and
+        # measured over the 29 day files first:
+        # - Dropping the anchor on such a tick lost 2026-09-22 09:27:43, which
+        #   is 12.17's freeze: the continuity gate pinned the projection at
+        #   5.635 % (distanceFromRoute 101.5 m bit for bit, every tick
+        #   labelled deviated) for 19 s while the rider covered 107 m, then
+        #   released it on an on_track tick to 23.15 %. That release tick is
+        #   the defect, and its "from" is the pinned value only a kept anchor
+        #   still holds.
+        # - Keeping the anchor but not spending the cooldown un-masked seven
+        #   firings that the removed ones had been standing in front of (e.g.
+        #   09-15 09:46:15, 09-21 16:42:25) — a replay of this change must
+        #   only take findings away.
+        untrusted = None
+        if p.get("status") == "deviated":
+            untrusted = "status deviated"
+        else:
+            leg_m = (trip.leg(leg) or {}).get("distance")
+            if isinstance(leg_m, (int, float)) and leg_m < MOTION_MIN_LEG_M:
+                untrusted = "leg only %.1fm long" % leg_m
         anchor = trip.motion_anchor
         fresh = {"fix": trip.last_fix, "progress": prog, "leg": leg, "tMs": t,
                  "swapSeq": trip.swap_seq, "afterSwap": None}
@@ -5202,6 +5399,14 @@ class RideWatch:
         if trip.motion_fired_ms and t - trip.motion_fired_ms <= MOTION_COOLDOWN_MS:
             return
         trip.motion_fired_ms = t
+        if untrusted:
+            self.log.info(
+                "progress-without-motion suppressed at %s (%s): leg progress"
+                " %s -> %s while the fix moved %.0fm is not travel"
+                % (fmt_hms(t), untrusted, fmt_pct(anchor["progress"]),
+                   fmt_pct(prog), moved))
+            trip.motion_anchor = fresh
+            return
         summary = "leg progress %s -> %s while the fix moved %.0fm" % (
             fmt_pct(anchor["progress"]), fmt_pct(prog), moved)
         context = {"fromPct": anchor["progress"], "toPct": prog,
@@ -6070,10 +6275,224 @@ class RideWatch:
                 {"notificationId": nid, "message": p.get("message"),
                  "riding": trip.riding.get("tripId")},
                 push_body="Missed-bus alert while aboard %s. Ignore it." % route)
+        if nid.startswith("MISSED_BUS") or p.get("type") == "MISSED_BUS":
+            self._rule_missed_bus_still_coming(trip, t, p)
+        if (nid.startswith("BOARD_BUS_ARRIVING")
+                or p.get("type") == "BOARD_BUS_ARRIVING"):
+            self._rule_board_arrival_vehicle_far(trip, t, p)
         if (nid.startswith("DESTINATION_UNREACHABLE")
                 or p.get("type") == "DESTINATION_UNREACHABLE"):
             self._on_destination_unreachable(trip, t, p)
         self._rule_notification_repeat(trip, t, p)
+
+    def _on_live_leg_times(self, trip, t, payload):
+        """Remember every board time the app showed, and where it came from.
+
+        SET_LIVE_LEG_TIMES is `{legIndex: {boardEpoch, boardSource, ...}}`,
+        re-dispatched ~every 20 s. `boardSource` is 'stop' when the time came
+        from the boarding stop's own departures query and 'trip' when it came
+        from the trip query — which on 2026-09-22 (26.1) was the SCHEDULED
+        08:15:00 flagged realtime, shown from 08:22:09 for 17 minutes, and
+        exactly the epoch the 08:38:55 MISSED_BUS judged against.
+        """
+        if not isinstance(payload, dict):
+            return
+        for leg_key, entry in payload.items():
+            if not isinstance(entry, dict):
+                continue
+            epoch = entry.get("boardEpoch")
+            if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+                continue
+            epoch = int(epoch)
+            source = entry.get("boardSource")
+            seen = trip.live_board_times.get(epoch)
+            if seen is not None and seen.get("source") == source:
+                continue
+            trip.live_board_times[epoch] = {
+                "source": source, "tMs": int(t), "leg": leg_key,
+                "realtime": entry.get("boardRealtime")}
+
+    @staticmethod
+    def _notification_epoch(nid):
+        """The board epoch inside a MISSED_BUS id, or None.
+
+        `MISSED_BUS_<route>_<stop name>_<boardEpoch>_<Date.now()>` — the route
+        and stop are free text (they contain spaces and '&'), so the numbers
+        are read from the right.
+        """
+        parts = (nid or "").split("_")
+        if len(parts) < 3:
+            return None
+        try:
+            return int(parts[-2])
+        except ValueError:
+            return None
+
+    def _missed_bus_leg(self, trip, nid):
+        """(index, leg) of the transit leg a MISSED_BUS is about, or None.
+
+        The one whose boarding stop the id names, at or after the leg the
+        rider is on; failing a name match, the first transit leg from there.
+        """
+        legs = (trip.itinerary or {}).get("legs") or []
+        cur = (trip.progress or {}).get("currentLegIndex")
+        start = cur if isinstance(cur, int) and not isinstance(cur, bool) \
+            and 0 <= cur < len(legs) else 0
+        first = None
+        for i in range(start, len(legs)):
+            leg = legs[i]
+            if not leg.get("transit"):
+                continue
+            if first is None:
+                first = (i, leg)
+            name = leg.get("from")
+            if name and ("_%s_" % name) in nid:
+                return i, leg
+        return first
+
+    def _rule_missed_bus_still_coming(self, trip, t, p):
+        """"Missed bus" while the bus has not reached the stop yet (26.7).
+
+        It is the call that costs the rider a bus: the app re-plans
+        (START_REROUTE reason missed-bus, autoApply) onto a later departure
+        while the one they are waiting for is still on its way. Two pieces of
+        evidence, either one enough:
+
+        - the id's own board epoch is a time the SAME stream showed with
+          `boardSource 'trip'` — the scheduled time dressed as realtime that
+          26.1 is about, not a reading of the stop;
+        - the trip's own vehicle record, fresh by VEHICLE_RECORD_STALE_SEC,
+          still names the boarding stop as its `nextStopId`.
+
+        2026-09-22 08:38:55.108 has both: epoch 1790082900000 (08:15:00) was
+        shown as 'trip' from 08:22:09, and at 08:38:38.236 vehicle 8148 on
+        trip 1:1346857 was IN_TRANSIT_TO 1:56831 (I-35W & 98th St), its record
+        36 s old — 17 s before the call. The re-plan's own call 32 s later
+        (08:39:27, epoch 08:26:00) has both too, on trip 1:1346052.
+
+        Page only on the vehicle arm: it is the direct observation that the
+        bus has not gone by, and it is what the page says. The epoch arm alone
+        says the app's arithmetic was built on a schedule, which is a finding
+        for the report, not an instruction for the rider. One page a ride.
+        """
+        nid = p.get("id") or ""
+        epoch = self._notification_epoch(nid)
+        found = self._missed_bus_leg(trip, nid)
+        leg_idx, leg = found if found else (None, {})
+        trip_id = leg.get("tripId")
+        stop_id = leg.get("fromStopId")
+        board = trip.live_board_times.get(epoch) if epoch is not None else None
+        epoch_arm = bool(board and board.get("source") == "trip")
+        vehicle_arm = False
+        rec_age = None
+        if trip_id and stop_id:
+            rec_age = self._trip_vehicle(trip.session, trip_id, t)
+            if rec_age is not None and rec_age[0].get("nextStopId") == stop_id:
+                vehicle_arm = True
+        if not (epoch_arm or vehicle_arm):
+            return
+        stop = leg.get("from") or stop_id or "the stop"
+        route = leg.get("route") or leg.get("headsign") or "the bus"
+        why = []
+        ctx = {"notificationId": nid, "message": p.get("message"),
+               "boardEpoch": epoch, "legIndex": leg_idx, "tripId": trip_id,
+               "stopId": stop_id, "stop": leg.get("from"),
+               "epochArm": epoch_arm, "vehicleArm": vehicle_arm,
+               "recentPolls": self._recent_polls(trip.session, t)}
+        if epoch_arm:
+            why.append("its board time %s is the trip-sourced time the app"
+                       " has shown since %s" % (fmt_hms(epoch),
+                                                fmt_hms(board["tMs"])))
+            ctx["boardTimeShown"] = board
+        if vehicle_arm:
+            rec, age = rec_age
+            dist = None
+            if leg.get("fromLat") is not None and leg.get("fromLon") is not None:
+                dist = meters_between((rec["lat"], rec["lon"]),
+                                      (leg["fromLat"], leg["fromLon"]))
+            why.append("vehicle %s on trip %s still has %s next (record %ds"
+                       " old%s)" % (rec.get("label") or rec.get("vehicleId"),
+                                    trip_id, stop, int(round(age)),
+                                    ", %.1f km out" % (dist / 1000.0)
+                                    if dist is not None else ""))
+            ctx["vehicle"] = {k: rec.get(k) for k in (
+                "vehicleId", "label", "lat", "lon", "nextStopId",
+                "nextStopName", "seconds", "pollMs")}
+            ctx["recordAgeSec"] = round(age, 1)
+            if dist is not None:
+                ctx["vehicleToStopM"] = round(dist, 1)
+        summary = "MISSED_BUS for %s at %s while the bus is still coming: %s" % (
+            route, stop, "; ".join(why))
+        if vehicle_arm and not trip.missed_bus_still_paged:
+            trip.missed_bus_still_paged = True
+            self._finding(
+                trip, t, "missed-bus-still-coming", "page", summary, ctx,
+                push_body="Missed-bus alert is wrong: %s still headed to %s."
+                          % (route, stop))
+        else:
+            self._finding(trip, t, "missed-bus-still-coming", "warn",
+                          summary, ctx)
+
+    def _rule_board_arrival_vehicle_far(self, trip, t, p):
+        """"Bus here" with the trip's own bus kilometres away (26.7).
+
+        BOARD_BUS_ARRIVING ids are `BOARD_BUS_ARRIVING_<stopId>_<tripId>_
+        arriving_<Date.now()>`. 2026-09-22 08:16:52 (trip 1:1346857) and
+        08:38:56 (1:1346052): both vehicles 6.0 km south of I-35W & 98th St,
+        both with the stop as `nextStopId` — which is all 26.3 says the app
+        checked. Warn, never a page: by the time the rider reads a page the
+        bus's real arrival is what they are looking at anyway; what this is
+        for is the report. Once per (trip, stop) a ride.
+        """
+        nid = p.get("id") or ""
+        rest = nid[len("BOARD_BUS_ARRIVING_"):] if nid.startswith(
+            "BOARD_BUS_ARRIVING_") else ""
+        rest = rest.split("_arriving_")[0]
+        legs = (trip.itinerary or {}).get("legs") or []
+        leg = None
+        for cand in legs:
+            tid = cand.get("tripId")
+            if cand.get("transit") and tid and rest.endswith("_" + tid):
+                leg = cand
+                break
+        if leg is not None:
+            trip_id = leg["tripId"]
+            stop_id = rest[:-(len(trip_id) + 1)] or leg.get("fromStopId")
+        else:
+            stop_id, _, trip_id = rest.partition("_")
+            leg = next((c for c in legs if c.get("transit")
+                        and c.get("fromStopId") == stop_id), None)
+        if not trip_id or not stop_id or leg is None:
+            return
+        if leg.get("fromLat") is None or leg.get("fromLon") is None:
+            return
+        key = (trip_id, stop_id)
+        if key in trip.board_far_fired:
+            return
+        rec_age = self._trip_vehicle(trip.session, trip_id, t)
+        if rec_age is None:
+            return
+        rec, age = rec_age
+        dist = meters_between((rec["lat"], rec["lon"]),
+                              (leg["fromLat"], leg["fromLon"]))
+        limit = BOARD_ARRIVAL_FAR_BASE_M + BOARD_ARRIVAL_FAR_SPEED_MPS * age
+        if dist <= limit:
+            return
+        trip.board_far_fired.add(key)
+        stop = leg.get("from") or stop_id
+        self._finding(
+            trip, t, "board-arrival-vehicle-far", "warn",
+            "\"Bus here\" at %s while vehicle %s on trip %s is %.1f km away"
+            " (record %ds old, next stop %s)"
+            % (stop, rec.get("label") or rec.get("vehicleId"), trip_id,
+               dist / 1000.0, int(round(age)),
+               rec.get("nextStopName") or rec.get("nextStopId")),
+            {"notificationId": nid, "tripId": trip_id, "stopId": stop_id,
+             "stop": leg.get("from"), "vehicleToStopM": round(dist, 1),
+             "limitM": round(limit, 1), "recordAgeSec": round(age, 1),
+             "vehicle": {k: rec.get(k) for k in (
+                 "vehicleId", "label", "lat", "lon", "nextStopId",
+                 "nextStopName", "seconds", "pollMs")}})
 
     def _rule_notification_repeat(self, trip, t, p):
         """The same alert, over and over, at a rider who cannot make it stop.
