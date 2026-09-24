@@ -28,11 +28,14 @@ cd "$REPO" || exit 1
 
 # --permission-mode is pinned rather than inherited: the mode a Claude session
 # starts in comes from whatever the project was last left in (auto, plan, …),
-# and a ride thread's permissions must not depend on that. `manual` + the
-# allowlist in ride-thread-settings.json means the routine job never prompts and
-# anything outside it prompts the rider, which is the intended fallback.
+# and a ride thread's permissions must not depend on that. `dontAsk` + the
+# allowlist in ride-thread-settings.json means the routine job runs and anything
+# outside it is REFUSED, and the turn goes on. It used to be `manual`, where
+# anything outside the list asked the rider: mid-ride on a phone an ask is a
+# hang, and three wrap-ups were lost that way after 12.4 first closed (the
+# latest a multi-line `python3 -c` at 2026-09-23 16:06:54; backlog 12.4).
 ARGS=(--remote-control "$NAME"
-      --permission-mode manual
+      --permission-mode dontAsk
       --settings "$HERE/ride-thread-settings.json"
       --append-system-prompt "$(cat "$HERE/ride-thread-sysprompt.md")")
 if [ -n "$PROMPT" ]; then ARGS+=("$PROMPT"); fi

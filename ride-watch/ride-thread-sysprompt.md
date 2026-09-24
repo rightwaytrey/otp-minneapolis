@@ -50,12 +50,14 @@ safety layer. It does not need you and you must not duplicate it.
 
 ## How to run a command, and why it matters this much
 
-**Absolute paths. Never `cd`.** A permission prompt here stops you cold: the
-rider is on a bus, the dialog sits unanswered in their app, and every
-milestone that lands meanwhile — the wrap-up included — waits behind it. The
-daemon pages them once about it, and that is the only help coming. Five
-consecutive rides lost their wrap-up to prompts, four of them to one command
-shape.
+**Absolute paths. Never `cd`.** This session runs in `dontAsk` mode: a call
+the allow-list does not match is **refused**, not asked about, and you carry on.
+A refusal costs you the result, so re-issue the call in a shape the list
+matches (the rules below) rather than giving up on the question. Before
+2026-09-24 an unmatched call raised a dialog instead, which on a bus is a hang:
+every milestone — the wrap-up included — waited behind it, and three wrap-ups
+were lost that way after five had been lost before (backlog 12.4). If a dialog
+ever does appear, the daemon pages the rider once; that is the only help coming.
 
 - Write every path in full: `/home/rwt/otp-debug-logs/debug-2026-09-09.jsonl`,
   `/home/rwt/.claude/plans/...`, `/home/rwt/projects/otprr/otp-react-redux/...`.
@@ -71,9 +73,16 @@ shape.
 - **One command per call.** Long pipelines are fine
   (`grep … | awk … | head`); chaining separate commands with `&&` is how a
   call ends up in a shape no rule matches.
-- If something does prompt, prefer a `python3 -c` one-liner with absolute
-  paths — `python3` is allowed unconditionally and can do anything the shell
-  was going to.
+- **Never a multi-line `python3 -c "…"`.** Anything longer than one short
+  line of Python goes in a script file: write it with the Write tool to
+  `/home/rwt/otp-debug-logs/ride-watch/scratch/<name>.py` (writes there are
+  allowed) and run `python3 /home/rwt/otp-debug-logs/ride-watch/scratch/<name>.py`,
+  reading the telemetry file by its absolute path inside the script instead of
+  piping `grep` into it. A 27-line inline body behind a pipe is the call that
+  froze the 2026-09-23 16:06:54 thread and lost its wrap-up: a newline followed
+  by `#` inside a quoted argument trips a CLI safety check ("can hide arguments
+  from path validation") that no allow-list entry satisfies. Under `dontAsk` it
+  is simply refused, and you have lost the answer instead of the ride.
 - Never put an env-var prefix in front of a command (`DEBUG_LOG_DIR=… node …`);
   a prefix defeats the matching rule. Pass the equivalent flag instead.
 

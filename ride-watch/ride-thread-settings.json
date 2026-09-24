@@ -5,7 +5,8 @@
     "in their phone app and stops the watcher until they tap it, so the whole",
     "routine job -- read telemetry, grep it, build a fixture, write the vault",
     "report -- has to be allowed up front. Anything NOT listed here still",
-    "prompts, which is the intended fallback for the unexpected.",
+    "is REFUSED (the mode is dontAsk since 2026-09-24, backlog 12.4 reopened):",
+    "under the old manual mode it prompted, and a prompt mid-ride is a hang.",
     "The deny list encodes the standing mid-ride prohibitions (never edit code,",
     "never restart a service, never deploy): denies beat allows, so even the",
     "broad project .claude/settings.json this session also loads cannot let the",
@@ -45,10 +46,15 @@
     "A sixth (2026-09-21): the daemon no longer types into this pane. It",
     "appends milestones to <name>.events.log and the thread watches that file",
     "with the Monitor tool, armed by its kickoff prompt -- so Monitor is",
-    "allowed, and tail (already listed) is what it runs underneath."
+    "allowed, and tail (already listed) is what it runs underneath.",
+    "A seventh (2026-09-24, 12.4 reopened): three wrap-ups were lost to prompts",
+    "after 12.4 closed, the last on a multi-line `python3 -c` behind a pipe.",
+    "Every new command shape was a new way to hang, so the mode is now dontAsk:",
+    "an unmatched call is refused and the turn continues. The daemon's",
+    "thread-blocked page stays as the backstop for anything that still asks."
   ],
   "permissions": {
-    "defaultMode": "manual",
+    "defaultMode": "dontAsk",
     "allow": [
       "Read(//home/rwt/**)",
       "Monitor",
