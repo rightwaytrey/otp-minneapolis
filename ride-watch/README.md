@@ -720,7 +720,8 @@ read anywhere under `~`, a read-only Bash set (`python3`, `tail`, `grep`, `ls`,
 `git log`/`show`/`diff`, `node …/build-fixture.js`), and writes **only** under
 `~/obsidian-vault/Claude/`, `~/otp-debug-logs/ride-watch/` and — since
 2026-09-13, for the wrap-up's promotion step — `~/.claude/plans/`. Anything else
-prompts, which is the intended fallback. The deny list encodes the mid-ride
+is refused and the turn goes on (`dontAsk`, below) — an ask mid-ride is a hang,
+which is how three wrap-ups were lost (backlog 12.4). The deny list encodes the mid-ride
 prohibitions (`systemctl`, `docker`, `git commit/push`, `*deploy*`, edits under
 `~/projects`) and beats the broad project `.claude/settings.json` this session
 also loads.
@@ -732,7 +733,8 @@ Three gotchas worth keeping, all found empirically:
 - **`permissions.defaultMode` loses** to whatever mode the project was last left
   in — the first test thread came up in *auto* mode despite the file saying
   `manual`. The mode is therefore pinned on the command line in the runner
-  (`--permission-mode manual`).
+  (`--permission-mode dontAsk` since 2026-09-24; it was `manual`, where anything
+  unlisted asked the rider).
 - **One unlisted command stops the thread dead**, and it took five consecutive
   wrap-ups to notice. `ride-0957` issued `… | awk 'NR<4 || NR%12==0'` at
   10:10:16 and emitted nothing at all for the eleven minutes until its pane was
