@@ -9757,5 +9757,292 @@ class TestProgressWithoutMotionNeedsTravel(RuleTestCase):
         self.assertIn("11:10:06", times)
 
 
+
+# ---------------------------------------------------------------------------
+# 29.2 — live slack the re-plan gate did not see; a bus the rider watched go
+# ---------------------------------------------------------------------------
+
+REAL_LOG_0923 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-09-23.jsonl")
+# What the two 29.2 rules read, on top of 26.7's.
+RIDE_TYPES_0923 = RIDE_TYPES_0922 | {
+    "AUTO_REPLAN", "ONBOARD_CANDIDATE_SNAPSHOT", "SET_DEPARTURE_OVERRIDE"}
+# Ride 1 of muek9u3n-n8e67r (15:42:03-15:57:12) and ride 2 (15:57:47-16:07:58).
+RIDE1_0923 = (1790196120000, 1790197035000)
+RIDE2_0923 = (1790197060000, 1790197700000)
+
+
+def quiet_replan_snapshot(b, access_end_ms, reason="quiet-replan-scoped",
+                          board=None):
+    """ONBOARD_CANDIDATE_SNAPSHOT as recordQuietReplanPlan dispatches it.
+
+    A scoped re-plan's response is the access chain alone; a full one carries
+    its own board leg (`board` = (tripId, startMs)).
+    """
+    legs = [{"mode": "BICYCLE", "transitLeg": False, "startTime": b.t,
+             "endTime": access_end_ms}]
+    if board is not None:
+        legs.append({"mode": "BUS", "transitLeg": True, "tripId": board[0],
+                     "startTime": board[1], "endTime": board[1] + 600000})
+    return b.action("ONBOARD_CANDIDATE_SNAPSHOT", {
+        "request": {"reason": reason, "arriveBy": False,
+                    "from": {"lat": 44.8226665, "lon": -93.2984158,
+                             "name": "Current location"}},
+        "response": {"data": {"plan": {"itineraries": [{"legs": legs}]}}},
+        "tMs": b.t})
+
+
+def auto_replan(b, refused="access-misses-board",
+                reason="quiet-replan-scoped"):
+    return b.action("AUTO_REPLAN", {
+        "accepted": refused is None, "autoApply": True, "originGapM": 0.86,
+        "projectedM": 0.86, "reason": reason, "refusedBecause": refused,
+        "tMs": b.t})
+
+
+def board_live(b, board_ms, realtime=True, floor=False, leg=1):
+    return b.action("SET_LIVE_LEG_TIMES", {str(leg): {
+        "boardEpoch": board_ms, "boardSource": "stop",
+        "boardRealtime": realtime, "boardIsFloor": floor,
+        "alightEpoch": board_ms + 600000, "realtime": True}})
+
+
+class TestReplanRefusedWithLiveSlack(RuleTestCase):
+    """29.2: 2026-09-23 15:49:33 refused a bike leg ending 15:54:00 as
+    missing a bus the card showed at 15:57:22 (planned 15:53:42)."""
+
+    PLANNED = T0 + 600000
+
+    def refused(self, live_ms, access_end_ms, snapshot_lead_ms=1,
+                twice=False, **live_kw):
+        b = StreamBuilder().start(missed_bus_itinerary(board_ms=self.PLANNED))
+        b.advance(1000).position().progress(leg=0, prog=10.0)
+        b.advance(1000)
+        board_live(b, live_ms, **live_kw)
+        quiet_replan_snapshot(b, access_end_ms)
+        b.advance(snapshot_lead_ms)
+        auto_replan(b)
+        if twice:
+            b.advance(35000)
+            board_live(b, live_ms + 40000, **live_kw)
+            quiet_replan_snapshot(b, access_end_ms + 14000)
+            b.advance(1)
+            auto_replan(b)
+        return self.run_stream(b)
+
+    def test_live_slack_beyond_the_gate_s_is_a_warning(self):
+        watch = self.refused(self.PLANNED + 220000, self.PLANNED + 18000)
+        found = self.find(watch, "replan-refused-with-live-slack")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["slackMs"], 202000)
+        self.assertEqual(ctx["plannedBoardMs"], self.PLANNED)
+        self.assertEqual(ctx["liveBoardEpochMs"], self.PLANNED + 220000)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    def test_once_per_trip(self):
+        """15:50:08 refused again with 3m49s; the second is not filed."""
+        watch = self.refused(self.PLANNED + 220000, self.PLANNED + 18000,
+                             twice=True)
+        self.assertEqual(
+            len(self.find(watch, "replan-refused-with-live-slack")), 1)
+
+    def test_slack_inside_the_gate_s_own_is_quiet(self):
+        watch = self.refused(self.PLANNED + 28000, self.PLANNED + 18000)
+        self.assertEqual(
+            self.find(watch, "replan-refused-with-live-slack"), [])
+
+    def test_a_floored_or_scheduled_board_time_is_not_live(self):
+        for kw in ({"floor": True}, {"realtime": False}):
+            watch = self.refused(self.PLANNED + 220000, self.PLANNED + 18000,
+                                 **kw)
+            self.assertEqual(
+                self.find(watch, "replan-refused-with-live-slack"), [], kw)
+
+    def test_no_candidate_snapshot_no_verdict(self):
+        """Trip recording off: the verdict arrives with nothing to judge."""
+        b = StreamBuilder().start(missed_bus_itinerary(board_ms=self.PLANNED))
+        b.advance(1000).position().progress(leg=0, prog=10.0)
+        board_live(b, self.PLANNED + 220000)
+        auto_replan(b)
+        watch = self.run_stream(b)
+        self.assertEqual(
+            self.find(watch, "replan-refused-with-live-slack"), [])
+
+    def test_a_snapshot_from_another_re_plan_is_not_this_one(self):
+        watch = self.refused(self.PLANNED + 220000, self.PLANNED + 18000,
+                             snapshot_lead_ms=20000)
+        self.assertEqual(
+            self.find(watch, "replan-refused-with-live-slack"), [])
+
+    def test_other_refusals_are_not_this_rule(self):
+        b = StreamBuilder().start(missed_bus_itinerary(board_ms=self.PLANNED))
+        b.advance(1000).position().progress(leg=0, prog=10.0)
+        board_live(b, self.PLANNED + 220000)
+        quiet_replan_snapshot(b, self.PLANNED + 18000)
+        auto_replan(b, refused="arrives-later")
+        watch = self.run_stream(b)
+        self.assertEqual(
+            self.find(watch, "replan-refused-with-live-slack"), [])
+
+    def test_a_full_re_plan_onto_another_run_is_not_measured_here(self):
+        b = StreamBuilder().start(missed_bus_itinerary(board_ms=self.PLANNED))
+        b.advance(1000).position().progress(leg=0, prog=10.0)
+        board_live(b, self.PLANNED + 220000)
+        quiet_replan_snapshot(b, self.PLANNED + 18000,
+                              reason="quiet-replan-full",
+                              board=("1:999", self.PLANNED))
+        auto_replan(b, reason="quiet-replan-full")
+        watch = self.run_stream(b)
+        self.assertEqual(
+            self.find(watch, "replan-refused-with-live-slack"), [])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0923),
+                         "%s not present" % REAL_LOG_0923)
+    def test_the_real_0923_refusal_fires_once(self):
+        watch = replay_real_window(self, REAL_LOG_0923, RIDE1_0923,
+                                   types=RIDE_TYPES_0923)
+        found = hits_of(watch, "replan-refused-with-live-slack")
+        self.assertEqual([f["tsMs"] for f in found], [1790196573260],
+                         [(f["time"], f["summary"]) for f in found])
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["candidateAccessEndMs"], 1790196840000)  # 15:54:00
+        self.assertEqual(ctx["liveBoardEpochMs"], 1790197042000)      # 15:57:22
+        self.assertEqual(ctx["plannedBoardMs"], 1790196822000)        # 15:53:42
+
+
+def at_stop_progress(b, waiting=True, leg=0):
+    return b.action("UPDATE_PROGRESS", {
+        "currentLegIndex": leg, "currentLegProgress": 99.0,
+        "status": "on_track", "waitingAtBoardingStop": waiting})
+
+
+class TestAtStopWhenBusLeft(RuleTestCase):
+    """29.2: 2026-09-23 vehicle 8223 left I-35W & 98th St (poll 15:55:23)
+    with the rider at the stop and waitingAtBoardingStop, and no boarding."""
+
+    AT_STOP = (STOP_98TH[1] + 0.0001, STOP_98TH[2])      # ~11 m north
+    FAR = (STOP_98TH[1] + 0.0018, STOP_98TH[2])          # ~200 m north
+
+    def stream(self, where=AT_STOP, waiting=True, after_status="IN_TRANSIT_TO",
+               after_stop=STOP_NEXT, trip_id="1:1346857", ride=None,
+               riding_first=False, tail_ms=65000, stop_early=False):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        if riding_first:
+            b.advance(500).action("SET_RIDING", {"tripId": "1:1346857",
+                                                 "legIndex": 1})
+        b.advance(1000).position(lat=where[0], lon=where[1])
+        at_stop_progress(b, waiting=waiting)
+        stopped = orange_vehicle(b, trip_id=trip_id, where=STOP_98TH[1:],
+                                 age_s=20)
+        stopped["stopStatus"] = "STOPPED_AT"
+        vehicle_poll(b, [stopped])
+        b.advance(20000).position(lat=where[0], lon=where[1])
+        at_stop_progress(b, waiting=waiting)
+        moved = orange_vehicle(b, trip_id=trip_id, next_stop=after_stop,
+                               where=STOP_98TH[1:], age_s=20)
+        moved["stopStatus"] = after_status
+        vehicle_poll(b, [moved])
+        self.left_ms = b.t
+        if ride is not None:
+            b.advance(ride).action("SET_RIDING", {"tripId": trip_id,
+                                                  "legIndex": 1})
+        if stop_early:
+            b.advance(10000).action("STOP_GO_MODE")
+            return b
+        for _ in range(tail_ms // 5000):
+            b.advance(5000).position(lat=where[0], lon=where[1])
+        return b
+
+    def test_the_bus_leaving_without_the_rider_is_a_warning(self):
+        watch = self.run_stream(self.stream())
+        found = self.find(watch, "at-stop-when-bus-left")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertEqual(found[0]["tsMs"], self.left_ms)
+        ctx = found[0]["context"]
+        self.assertLess(ctx["riderToStopM"], 30)
+        self.assertGreaterEqual(ctx["detectedMs"] - self.left_ms, 60000)
+        self.assertEqual(ctx["before"]["stopStatus"], "STOPPED_AT")
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    def test_a_boarding_inside_the_grace_is_quiet(self):
+        watch = self.run_stream(self.stream(ride=40000))
+        self.assertEqual(self.find(watch, "at-stop-when-bus-left"), [])
+
+    def test_already_riding_it_is_quiet(self):
+        watch = self.run_stream(self.stream(riding_first=True))
+        self.assertEqual(self.find(watch, "at-stop-when-bus-left"), [])
+
+    def test_waiting_at_the_stop_alone_is_enough(self):
+        """The app's own verdict, with the fix 200 m out."""
+        watch = self.run_stream(self.stream(where=self.FAR))
+        self.assertEqual(len(self.find(watch, "at-stop-when-bus-left")), 1)
+
+    def test_a_rider_neither_near_nor_waiting_is_quiet(self):
+        watch = self.run_stream(self.stream(where=self.FAR, waiting=False))
+        self.assertEqual(self.find(watch, "at-stop-when-bus-left"), [])
+
+    def test_near_without_the_waiting_flag_is_enough(self):
+        watch = self.run_stream(self.stream(waiting=False))
+        self.assertEqual(len(self.find(watch, "at-stop-when-bus-left")), 1)
+
+    def test_still_stopped_at_the_stop_is_not_leaving(self):
+        watch = self.run_stream(self.stream(after_status="STOPPED_AT",
+                                            after_stop=STOP_98TH[0]))
+        self.assertEqual(self.find(watch, "at-stop-when-bus-left"), [])
+
+    def test_another_trip_s_bus_is_not_this_one(self):
+        watch = self.run_stream(self.stream(trip_id="1:1346052"))
+        self.assertEqual(self.find(watch, "at-stop-when-bus-left"), [])
+
+    def test_a_ride_ended_inside_the_grace_is_dropped(self):
+        watch = self.run_stream(self.stream(stop_early=True))
+        self.assertEqual(self.find(watch, "at-stop-when-bus-left"), [])
+
+    def test_the_status_is_kept_on_the_trip_s_record(self):
+        b = self.stream(tail_ms=0)
+        watch = self.run_stream(b, finalize=False)
+        rec, _ = watch._trip_vehicle(SESSION, "1:1346857", b.t)
+        self.assertEqual(rec["stopStatus"], "IN_TRANSIT_TO")
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0923),
+                         "%s not present" % REAL_LOG_0923)
+    def test_the_real_0923_departure_fires(self):
+        watch = replay_real_window(self, REAL_LOG_0923, RIDE1_0923,
+                                   types=RIDE_TYPES_0923)
+        found = hits_of(watch, "at-stop-when-bus-left")
+        self.assertEqual([f["tsMs"] for f in found], [1790196923244],
+                         [(f["time"], f["summary"]) for f in found])
+        ctx = found[0]["context"]
+        self.assertEqual(ctx["tripId"], "1:1346795")
+        self.assertEqual(ctx["after"]["nextStopId"], "1:51110")
+        self.assertTrue(ctx["waitingAtBoardingStop"])
+
+
+class TestLiveSlackRulesStayQuiet(unittest.TestCase):
+    """29.2's negatives: ride 2 of 09-23 (bike only) and all of 09-22."""
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0923),
+                         "%s not present" % REAL_LOG_0923)
+    def test_ride_2_of_0923_is_quiet(self):
+        watch = replay_real_window(self, REAL_LOG_0923, RIDE2_0923,
+                                   types=RIDE_TYPES_0923)
+        for rule in ("replan-refused-with-live-slack",
+                     "at-stop-when-bus-left"):
+            self.assertEqual(hits_of(watch, rule), [], rule)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_0922),
+                         "%s not present" % REAL_LOG_0922)
+    def test_the_whole_0922_file_is_quiet(self):
+        tmp = tempfile.mkdtemp(prefix="ride-watch-real-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch = ride_watch.run_replay(REAL_LOG_0922, watch=quiet_watch(tmp))
+        for rule in ("replan-refused-with-live-slack",
+                     "at-stop-when-bus-left"):
+            self.assertEqual(hits_of(watch, rule), [], rule)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
