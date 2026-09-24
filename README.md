@@ -165,7 +165,7 @@ Linode however you meant it:
 
 ```bash
 # the Linode
-scripts/check-config-ladder.py --deployed              # the four size rungs, on the box
+scripts/check-config-ladder.py --deployed              # the four size rungs + every rendered location, on the box
 scripts/check-debug-log-payload.py --target prod       # POST 900 KB and read it back
 scripts/deploy-manifest.py verify --ssh rwt@<tailnet-ip>
 
