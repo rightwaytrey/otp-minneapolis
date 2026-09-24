@@ -71,6 +71,8 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `missed-bus-while-riding` | `MISSED_BUS` notification while riding is held | page |
 | `missed-bus-still-coming` | `MISSED_BUS` while the bus is still on its way: the trip's own vehicle record (fresh by the app's `VEHICLE_RECORD_STALE_SEC`, 120 s on the record's clock) still has the boarding stop as `nextStopId`, **or** the id's board epoch is a time the same ride showed with `boardSource 'trip'` | page on the vehicle arm, once a ride (warn otherwise) |
 | `board-arrival-vehicle-far` | `BOARD_BUS_ARRIVING` ("Bus here") while that trip's vehicle is more than 400 m + 15 m/s × the record's age from the boarding stop | warn, once per trip and stop |
+| `replan-refused-with-live-slack` | `AUTO_REPLAN refusedBecause 'access-misses-board'` while the candidate's access end (its `ONBOARD_CANDIDATE_SNAPSHOT`, `request.reason quiet-replan-*`, ≤ 5 s before) is more than 15 s before the held **live** board time (`SET_LIVE_LEG_TIMES`, `boardRealtime` and not `boardIsFloor`, ≤ 90 s old) — the gate measured the plan's `startTime` instead (29.1) | warn, once per trip |
+| `at-stop-when-bus-left` | the held plan's boarding trip's vehicle stops reading `STOPPED_AT` the boarding stop while the rider is not riding it and is within 30 m of the stop (fix ≤ 30 s old) or `waitingAtBoardingStop` (tick ≤ 30 s old), and no `SET_RIDING` follows within 60 s. Stamped at the poll that showed the departure; a ride that ends inside the 60 s drops it | warn, once per trip and stop |
 | `notification-repeat` | the same alert (id stem + title) twice in 5 minutes — and the same message too, where the stem's titles differ only in their numbers | page |
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
 | `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip, measured from the newest fix TIMESTAMP the stream holds — never from when the daemon last looked (19.2) | warn |
@@ -282,6 +284,26 @@ typed the complaint out by hand on a bike.
   next stop — a real miss. `board-arrival-vehicle-far` separates cleanly:
   every honest "Bus here" on disk had the bus 12–290 m out, every one it
   fires on 2.5–6.0 km (ten, across seven days — 26.3's app defect).
+
+- **`replan-refused-with-live-slack`** and **`at-stop-when-bus-left`** (29.2)
+  are the two things 2026-09-23's ride 1 (`muek9u3n-n8e67r`) cost the rider
+  and the daemon said nothing about. At **15:49:33** a quiet re-plan whose
+  bike leg ended 15:54:00 was refused as missing a bus planned for 15:53:42
+  while the card showed it live at 15:57:22 — 3m22s to spare; 15:50:08 did
+  it again (3m49s) and is not filed a second time. The candidate is only
+  in the stream as the `ONBOARD_CANDIDATE_SNAPSHOT` the same thunk records
+  1 ms earlier, and only with trip recording on; a verdict without one is
+  logged, not judged. It should go quiet once 29.1 moves the gate onto the
+  live time. At **15:55:23** the poll showed vehicle 8223 on the rider's
+  trip go from `STOPPED_AT` I-35W & 98th St to `IN_TRANSIT_TO` Knox (AVL
+  15:54:34) with the rider 44 m out and `waitingAtBoardingStop`; no
+  `SET_RIDING` followed. It needs the feed's `stopStatus`, which the
+  `trip_vehicles` record now keeps beside 26.7's `nextStopId`. Over every
+  day file 08-xx/09-xx (30) the two fire on exactly those two moments; on
+  every other day, and on ride 2, nothing. Every other departure of a
+  planned trip from its planned boarding stop that the feed showed between
+  09-15 and 09-24 (16 of them) came with `SET_RIDING` already held, so the
+  rule never armed on a real boarding and its 60 s grace is untested on one.
 
 - **`early-leg-transition`** (2026-09-09, backlog 13.4) watches the one thing
   no rule here watched: the app advancing to the next leg. On 09-09 at

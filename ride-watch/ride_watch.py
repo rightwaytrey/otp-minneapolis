@@ -596,6 +596,41 @@ ROUTE_POLL_KEEP = 32
 BOARD_ARRIVAL_FAR_BASE_M = 400.0
 BOARD_ARRIVAL_FAR_SPEED_MPS = 15.0
 #
+# replan-refused-with-live-slack (29.2). The app's access-misses-board gate
+# (otprr replan-acceptance.ts accessBoardOverrunMs, slack
+# AUTO_REPLAN_ACCESS_BOARD_SLACK_MS = 15000) measures a quiet re-plan's access
+# end against the board leg's `startTime` — the plan-time prediction — while
+# the card shows the live board time (29.1). 2026-09-23 15:49:33: the
+# candidate's bike leg ended 15:54:00 and the live board (SET_LIVE_LEG_TIMES
+# leg 1, 'stop', realtime, 15:49:33.256) was 15:57:22 — 3m22s of slack, and
+# the plan was refused; 15:50:08 again with 15:54:14 against 15:58:03 (3m49s).
+# The AUTO_REPLAN record is scalars only; the candidate itself is the
+# ONBOARD_CANDIDATE_SNAPSHOT tagged `request.reason: quiet-replan-*` that the
+# same thunk dispatches 1 ms earlier (go-mode.ts recordQuietReplanPlan), and
+# only when trip recording is on.
+REPLAN_LIVE_SLACK_MS = 15000               # == the client's own slack
+# The snapshot and its verdict are one thunk: 1 ms apart on 09-23.
+REPLAN_SNAPSHOT_PAIR_MS = 5000
+# A live board time older than this is not what the card was showing; the app
+# re-dispatches SET_LIVE_LEG_TIMES every ~20 s.
+REPLAN_LIVE_BOARD_MAX_AGE_MS = 90 * 1000
+#
+# at-stop-when-bus-left (29.2). The trip's own vehicle goes from STOPPED_AT
+# the boarding stop to anything else while the rider is at that stop, and no
+# SET_RIDING follows. 2026-09-23: vehicle 8223 on trip 1:1346795 read
+# STOPPED_AT 1:56831 (I-35W & 98th St) in the polls of 15:54:21 and 15:54:41,
+# then IN_TRANSIT_TO 1:51110 in the poll of 15:55:23 (AVL 15:54:34); the rider
+# was 15 m from the stop at 15:55:15 with waitingAtBoardingStop true since
+# 15:55:00, and never boarded.
+BUS_LEFT_AT_STOP_M = 30.0
+# The fix that places the rider must be about now, not a minute ago.
+BUS_LEFT_FIX_MAX_AGE_MS = 30 * 1000
+# ...and so must the progress tick that says waitingAtBoardingStop.
+BUS_LEFT_PROGRESS_MAX_AGE_MS = 30 * 1000
+# How long a boarding is given to be recognised before "did not board" is
+# believed. This is the row's number.
+BUS_LEFT_BOARD_GRACE_MS = 60 * 1000
+#
 # onboard-anchor-behind-rider. STOP_GO_MODE wipes the client's
 # `tracking.lastPosition`; an onboard flow begun before the next fix lands
 # falls to `findAnchorIndex` index 0 and builds the alight list from the FIRST
@@ -1873,6 +1908,14 @@ class Trip:
         self.live_board_times = {}
         self.missed_bus_still_paged = False        # one page per ride
         self.board_far_fired = set()               # (tripId, stopId)
+        # 29.2: the newest SET_LIVE_LEG_TIMES entry per leg key ("1"), with
+        # the flags the app's own board-time trust reads, and when it came.
+        self.live_board_latest = {}
+        self.replan_live_slack_fired = False       # once per trip
+        # 29.2 at-stop-when-bus-left: the departure waiting out its grace for
+        # a SET_RIDING, and the (tripId, stopId) pairs already judged.
+        self.bus_left_pending = None
+        self.bus_left_fired = set()
         self.last_vehicle_match = None             # last UPDATE_VEHICLE_MATCH
         self.match_disagree_since_ms = None        # match tripId != riding's
         self.match_disagree_fired = False
@@ -2024,6 +2067,10 @@ class RideWatch:
         # (08:38:54) simply did not carry trip 1:1346857 — the record from
         # 08:38:38 is the freshest the app had, and it still said 98th St.
         self.trip_vehicles = {}
+        # session -> the last quiet re-plan candidate (29.2): {"tMs",
+        # "reason", "accessEndMs", "boardTripId", "boardStartMs"}, from the
+        # ONBOARD_CANDIDATE_SNAPSHOT its AUTO_REPLAN verdict follows.
+        self.quiet_replan_candidate = {}
         # session -> deque of {"tMs", "routeId", "count"}, one per poll, EMPTY
         # POLLS INCLUDED (25.4). The feed going blank is itself evidence.
         self.route_polls = {}
@@ -2415,6 +2462,9 @@ class RideWatch:
             # the map. Same reason it sits here: on 09-13 every one of these
             # arrived with no trip open.
             self._on_candidate_snapshot(session, t, obj.get("payload"), trip)
+            # The quiet access re-plan records its candidate under the same
+            # type, tagged `request.reason` (29.2).
+            self._note_quiet_replan_candidate(session, t, obj.get("payload"))
         elif typ in ("REALTIME_VEHICLE_POSITIONS_RESPONSE",
                      "UPDATE_NEARBY_VEHICLES", "SHOW_BOARDING_PROMPT"):
             # Above the trip chain because the boarding prompt and the feed
@@ -3789,6 +3839,7 @@ class RideWatch:
         self.session_fix = dict((k, v) for k, v in self.session_fix.items()
                                 if k in keep)
         for cache in (self.route_vehicles, self.nearby_vehicles_ms,
+                      self.quiet_replan_candidate,
                       self.onboard_anchor, self.session_last_gesture,
                       self.session_timeouts, self.session_href):
             for key in [k for k in cache if k not in keep]:
@@ -4012,6 +4063,10 @@ class RideWatch:
                              "label": v.get("label"),
                              "nextStopId": v.get("nextStopId"),
                              "nextStopName": v.get("nextStopName"),
+                             # STOPPED_AT / IN_TRANSIT_TO / INCOMING_AT:
+                             # whether the bus is AT `nextStopId` or on
+                             # its way to it (at-stop-when-bus-left, 29.2).
+                             "stopStatus": v.get("stopStatus"),
                              "seconds": _num_or_none(v.get("seconds"))})
             # Every poll is noted, the empty ones first among them: it used to
             # `return` right here, which made the daemon structurally blind to
@@ -4056,6 +4111,11 @@ class RideWatch:
             rec["routeId"] = route
             rec["pollMs"] = int(t)
             recs[trip_id] = rec
+            if (old is not None and old.get("stopStatus") == "STOPPED_AT"
+                    and old.get("nextStopId")
+                    and not (rec.get("stopStatus") == "STOPPED_AT"
+                             and rec.get("nextStopId") == old["nextStopId"])):
+                self._on_vehicle_left_stop(session, t, trip_id, old, rec)
         if len(recs) > TRIP_VEHICLE_KEEP:
             for stale in sorted(recs, key=lambda k: recs[k]["pollMs"]
                                 )[:-TRIP_VEHICLE_KEEP]:
@@ -4257,6 +4317,10 @@ class RideWatch:
         # ...and a refusal burst still inside its quiet window: the ride ending
         # is the end of that launch by definition.
         self._flush_wake_lock(trip, t, force=True)
+        # ...and a departure whose grace has run out by the end. One still
+        # inside its grace is dropped: a rider who stops Go Mode seconds after
+        # the doors close may as well be aboard (29.2).
+        self._check_bus_left(trip, t, ending=True)
         # ...and any panel the rider was fighting with. Before the deletion
         # loop below, so the burst is still filed on this ride rather than
         # landing trip-less in the ledger after the report request quoted
@@ -4980,6 +5044,8 @@ class RideWatch:
                               {"lastFixMs": trip.last_pos_ms})
             # deviated-streak may mature between UPDATE_PROGRESS ticks
             self._check_deviated_streak(trip, now)
+            # ...and a departure the rider did not board matures the same way.
+            self._check_bus_left(trip, now)
             self._check_stalled(trip, now)
             # A refusal burst matures the same way: the last warn of a ladder
             # is followed by silence, not by another event, so nothing but the
@@ -5033,6 +5099,9 @@ class RideWatch:
             # needs it to rebuild the radius the app's matcher would have
             # used (speedAdjustedRadius).
             "riderSpeedMps": p.get("riderSpeedMps"),
+            # The client's own "the rider is at the boarding stop" verdict
+            # (at-stop-when-bus-left, 29.2).
+            "waitingAtBoardingStop": p.get("waitingAtBoardingStop"),
             "tMs": t,
         }
         self._note_destination_distance(trip, p.get("distanceToDestination"))
@@ -5712,6 +5781,14 @@ class RideWatch:
 
     def _on_set_riding(self, trip, t, p):
         self._clear_arrival(trip, t, "boarded a vehicle")
+        # A boarding inside the grace answers at-stop-when-bus-left (29.2).
+        if trip.bus_left_pending is not None:
+            self.log.info(
+                "at-stop-when-bus-left: SET_RIDING at %s answers the %s"
+                " departure (trip %s); not filed"
+                % (fmt_hms(t), fmt_hms(trip.bus_left_pending["tMs"]),
+                   p.get("tripId")))
+            trip.bus_left_pending = None
         new = {
             "tripId": p.get("tripId"),
             "vehicleId": p.get("vehicleId"),
@@ -6311,6 +6388,19 @@ class RideWatch:
             trip.live_board_times[epoch] = {
                 "source": source, "tMs": int(t), "leg": leg_key,
                 "realtime": entry.get("boardRealtime")}
+        # The newest reading per leg, whatever its epoch: the time the card
+        # held at a given moment is what replan-refused-with-live-slack asks.
+        for leg_key, entry in payload.items():
+            if not isinstance(entry, dict):
+                continue
+            epoch = entry.get("boardEpoch")
+            if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+                continue
+            trip.live_board_latest[str(leg_key)] = {
+                "boardEpoch": int(epoch), "tMs": int(t),
+                "source": entry.get("boardSource"),
+                "realtime": entry.get("boardRealtime"),
+                "isFloor": entry.get("boardIsFloor")}
 
     @staticmethod
     def _notification_epoch(nid):
@@ -6493,6 +6583,238 @@ class RideWatch:
              "vehicle": {k: rec.get(k) for k in (
                  "vehicleId", "label", "lat", "lon", "nextStopId",
                  "nextStopName", "seconds", "pollMs")}})
+
+    # -- 29.2: live slack the gate did not see; a bus the rider watched go --
+
+    def _note_quiet_replan_candidate(self, session, t, payload):
+        """Keep the quiet re-plan's candidate, for the verdict 1 ms behind it.
+
+        `recordQuietReplanPlan` (otprr go-mode.ts) dispatches the fetch's
+        request/response as an ONBOARD_CANDIDATE_SNAPSHOT tagged
+        `request.reason: 'quiet-replan-scoped' | 'quiet-replan-full'`, then
+        `autoReplanRejected` dispatches AUTO_REPLAN. A scoped re-plan fetches
+        the access chain alone and splices it onto the held plan, so the
+        board it must meet is the held plan's; a full one carries its own.
+        """
+        req = (payload or {}).get("request")
+        if not isinstance(req, dict):
+            return
+        reason = req.get("reason")
+        if not (isinstance(reason, str) and reason.startswith("quiet-replan")):
+            return
+        resp = (payload or {}).get("response")
+        try:
+            itins = resp["data"]["plan"]["itineraries"]
+        except (KeyError, TypeError):
+            return
+        if not isinstance(itins, list) or not itins or \
+                not isinstance(itins[0], dict):
+            return
+        legs = [lg for lg in (itins[0].get("legs") or [])
+                if isinstance(lg, dict)]
+        board = next((i for i, lg in enumerate(legs)
+                      if lg.get("transitLeg")), None)
+        board_trip = board_start = None
+        if board is None:
+            access = legs[-1] if legs else None
+        elif board == 0:
+            access = None               # starts at a stop: nothing to overrun
+        else:
+            access = legs[board - 1]
+            bl = legs[board]
+            board_trip = bl.get("tripId") or (
+                (bl.get("trip") or {}).get("gtfsId")
+                if isinstance(bl.get("trip"), dict) else None)
+            board_start = _num_or_none(bl.get("startTime"))
+        access_end = _num_or_none((access or {}).get("endTime"))
+        self.quiet_replan_candidate[session] = {
+            "tMs": int(t), "reason": reason,
+            "accessEndMs": int(access_end) if access_end else None,
+            "boardTripId": board_trip,
+            "boardStartMs": int(board_start) if board_start else None}
+
+    def _held_board_leg(self, trip):
+        """(index, leg) of the held plan's next boarding, or None."""
+        legs = (trip.itinerary or {}).get("legs") or []
+        cur = (trip.progress or {}).get("currentLegIndex")
+        start = cur if isinstance(cur, int) and not isinstance(cur, bool) \
+            and 0 <= cur < len(legs) else 0
+        for i in range(start, len(legs)):
+            if legs[i].get("transit"):
+                return i, legs[i]
+        return None
+
+    def _rule_replan_refused_with_live_slack(self, trip, t, p):
+        """A quiet re-plan refused as too late for a bus it had time for.
+
+        WARN, once per trip (29.2). `refusedBecause: 'access-misses-board'`
+        means the candidate's access end overran the board leg's `startTime`
+        by more than 15 s — but that startTime is the plan-time prediction,
+        and the card was showing the live time (29.1). This rule re-asks the
+        gate's question against the held LIVE board time, trusted the way
+        29.1 trusts it (`boardRealtime` and not `boardIsFloor`), and speaks
+        when the candidate would have made it with more than the gate's own
+        15 s to spare. 2026-09-23 15:49:33: 15:54:00 against 15:57:22.
+
+        Blind without the candidate snapshot, which the app records only with
+        trip recording on; a verdict with no snapshot is logged, not judged.
+        Should go quiet once 29.1 ships: the gate then measures the same way.
+        """
+        if p.get("refusedBecause") != "access-misses-board":
+            return
+        if trip.replan_live_slack_fired:
+            return
+        cand = self.quiet_replan_candidate.get(trip.session)
+        if (cand is None or not (0 <= t - cand["tMs"] <= REPLAN_SNAPSHOT_PAIR_MS)
+                or (p.get("reason") and cand["reason"] != p.get("reason"))):
+            self.log.info("replan-refused-with-live-slack: no candidate"
+                          " snapshot beside the %s refusal; not judged"
+                          % fmt_hms(t))
+            return
+        if cand["accessEndMs"] is None:
+            return
+        found = self._held_board_leg(trip)
+        if found is None:
+            return
+        idx, leg = found
+        if cand["boardTripId"] and leg.get("tripId") and \
+                cand["boardTripId"] != leg.get("tripId"):
+            # A full re-plan onto a different run: the held live time is not
+            # the board this candidate had to meet.
+            return
+        live = trip.live_board_latest.get(str(idx))
+        if (live is None or not live.get("realtime") or live.get("isFloor")
+                or t - live["tMs"] > REPLAN_LIVE_BOARD_MAX_AGE_MS):
+            return
+        slack = live["boardEpoch"] - cand["accessEndMs"]
+        if slack <= REPLAN_LIVE_SLACK_MS:
+            return
+        planned = leg.get("startTime")
+        planned = int(planned) if isinstance(planned, (int, float)) \
+            and not isinstance(planned, bool) else cand["boardStartMs"]
+        trip.replan_live_slack_fired = True
+        stop = leg.get("from") or leg.get("fromStopId") or "the stop"
+        route = leg.get("route") or leg.get("headsign") or "the bus"
+        self._finding(
+            trip, t, "replan-refused-with-live-slack", "warn",
+            "re-plan refused as missing the %s at %s, but its access ends %s"
+            " and the live board time is %s (%ds to spare; the gate measured"
+            " the plan's %s)"
+            % (route, stop, fmt_hms(cand["accessEndMs"]),
+               fmt_hms(live["boardEpoch"]), int(slack // 1000),
+               fmt_hms(planned) if planned else "startTime"),
+            {"reason": p.get("reason"),
+             "refusedBecause": p.get("refusedBecause"),
+             "candidateAccessEndMs": cand["accessEndMs"],
+             "candidateReason": cand["reason"],
+             "candidateMs": cand["tMs"],
+             "liveBoardEpochMs": live["boardEpoch"],
+             "liveBoardSource": live.get("source"),
+             "liveBoardSeenMs": live["tMs"],
+             "plannedBoardMs": planned,
+             "slackMs": int(slack),
+             "gateSlackMs": REPLAN_LIVE_SLACK_MS,
+             "legIndex": idx, "tripId": leg.get("tripId"),
+             "stopId": leg.get("fromStopId"), "stop": leg.get("from")})
+
+    def _on_vehicle_left_stop(self, session, t, trip_id, old, rec):
+        """A trip's vehicle stopped reading STOPPED_AT the stop it was at.
+
+        at-stop-when-bus-left (29.2) arms here when the stop is the held
+        plan's boarding stop for that very trip, the rider is not riding it,
+        and the rider is at the stop — within BUS_LEFT_AT_STOP_M on a fresh
+        fix, or the app's own `waitingAtBoardingStop` on a fresh tick. It is
+        filed once the grace passes with no SET_RIDING (_check_bus_left).
+        """
+        trip = self.trips.get(session)
+        if trip is None or trip.arrived_ms is not None:
+            return
+        stop_id = old.get("nextStopId")
+        key = (trip_id, stop_id)
+        if key in trip.bus_left_fired or trip.bus_left_pending is not None:
+            return
+        legs = (trip.itinerary or {}).get("legs") or []
+        leg_idx, leg = next(((i, lg) for i, lg in enumerate(legs)
+                             if lg.get("transit") and lg.get("tripId") == trip_id
+                             and lg.get("fromStopId") == stop_id),
+                            (None, None))
+        if leg is None:
+            return
+        riding = trip.riding or {}
+        if riding.get("tripId") == trip_id:
+            return
+        cur = (trip.progress or {}).get("currentLegIndex")
+        if isinstance(cur, int) and not isinstance(cur, bool) and cur > leg_idx:
+            return                      # the plan is already past this leg
+        dist = None
+        fix = self.session_fix.get(session)
+        if (fix is not None and leg.get("fromLat") is not None
+                and leg.get("fromLon") is not None
+                and 0 <= t - fix[2] <= BUS_LEFT_FIX_MAX_AGE_MS):
+            dist = meters_between((fix[0], fix[1]),
+                                  (leg["fromLat"], leg["fromLon"]))
+        prog = trip.progress or {}
+        waiting = (prog.get("waitingAtBoardingStop") is True
+                   and isinstance(prog.get("tMs"), (int, float))
+                   and 0 <= t - prog["tMs"] <= BUS_LEFT_PROGRESS_MAX_AGE_MS)
+        near = dist is not None and dist <= BUS_LEFT_AT_STOP_M
+        if not (near or waiting):
+            return
+        trip.bus_left_fired.add(key)
+        trip.bus_left_pending = {
+            "tMs": int(t), "tripId": trip_id, "stopId": stop_id,
+            "stop": leg.get("from") or old.get("nextStopName"),
+            "route": leg.get("route") or leg.get("headsign"),
+            "legIndex": leg_idx,
+            "riderToStopM": round(dist, 1) if dist is not None else None,
+            "waitingAtBoardingStop": waiting,
+            "before": {k: old.get(k) for k in (
+                "vehicleId", "label", "lat", "lon", "stopStatus",
+                "nextStopId", "nextStopName", "seconds", "pollMs")},
+            "after": {k: rec.get(k) for k in (
+                "vehicleId", "label", "lat", "lon", "stopStatus",
+                "nextStopId", "nextStopName", "seconds", "pollMs")}}
+        self.log.info("at-stop-when-bus-left: armed at %s, trip %s left %s"
+                      " (%s -> %s), rider %s; waiting %ds for SET_RIDING"
+                      % (fmt_hms(t), trip_id, stop_id, old.get("stopStatus"),
+                         rec.get("stopStatus"),
+                         "%.0f m away" % dist if dist is not None
+                         else "unplaced", BUS_LEFT_BOARD_GRACE_MS // 1000))
+
+    def _check_bus_left(self, trip, now, ending=False):
+        """File a pending at-stop-when-bus-left once its grace has passed."""
+        pend = trip.bus_left_pending
+        if pend is None:
+            return
+        if now - pend["tMs"] < BUS_LEFT_BOARD_GRACE_MS:
+            if ending:
+                self.log.info("at-stop-when-bus-left: ride ended %ds after"
+                              " the %s departure, inside the grace; dropped"
+                              % ((now - pend["tMs"]) // 1000,
+                                 fmt_hms(pend["tMs"])))
+                trip.bus_left_pending = None
+            return
+        trip.bus_left_pending = None
+        after = pend["after"]
+        where = ("%.0f m from it" % pend["riderToStopM"]
+                 if pend["riderToStopM"] is not None else "")
+        if pend["waitingAtBoardingStop"]:
+            where = (where + ", " if where else "") + "waitingAtBoardingStop"
+        ctx = dict(pend)
+        ctx["graceMs"] = BUS_LEFT_BOARD_GRACE_MS
+        ctx["detectedMs"] = int(now)
+        self._finding(
+            trip, pend["tMs"], "at-stop-when-bus-left", "warn",
+            "%s left %s (vehicle %s now %s %s, AVL %s) with the rider at the"
+            " stop (%s) and no SET_RIDING in %ds"
+            % (pend["route"] or "the bus", pend["stop"] or pend["stopId"],
+               after.get("label") or after.get("vehicleId"),
+               after.get("stopStatus"),
+               after.get("nextStopName") or after.get("nextStopId"),
+               fmt_hms(after["seconds"] * 1000)
+               if isinstance(after.get("seconds"), (int, float)) else "?",
+               where, BUS_LEFT_BOARD_GRACE_MS // 1000),
+            ctx)
 
     def _rule_notification_repeat(self, trip, t, p):
         """The same alert, over and over, at a rider who cannot make it stop.
@@ -6691,6 +7013,7 @@ class RideWatch:
         if not isinstance(p, dict):
             return
         reason = p.get("reason")
+        self._rule_replan_refused_with_live_slack(trip, t, p)
         paired = self._pair_pending_reroute(trip, t, reason)
         if paired is not None:
             self.log.info(
