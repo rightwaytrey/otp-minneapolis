@@ -37,11 +37,20 @@ The client rungs ship inside the app bundle on the rider's phone, so --deployed
 takes them from the repo and says so — it is checking that what is ON THE BOX
 can carry what the app will send it.
 
+--deployed also compares the SET of `location` blocks in the installed
+/etc/nginx/snippets/otp-common.conf with this checkout's render of
+deployment/nginx/otp-common.conf.tmpl for that host (`house` for --ssh local,
+`prod` otherwise), and names every missing or extra one with the install
+command. render-nginx.py --check compares the two renders with each other and
+never looks at /etc/nginx, which is how the house ran 09-06's snippet, three
+locations short, until 09-24 (backlog 30.1).
+
 Exit: 0 ladder holds, 1 ladder broken, 75 SKIP (a repo or host could not be
 resolved — loudly, because a check that quietly no-ops is worse than no check).
 """
 
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
@@ -117,6 +126,16 @@ DEBUG_LOG_LOCATION = "/api/debug-log"
 DEFAULT_SSH = os.environ.get("LADDER_SSH", "rwt@100.126.171.72")
 LIVE_NGINX_SNIPPET = "/etc/nginx/snippets/otp-common.conf"
 LIVE_PREFS_API = "~/projects/transitnav/preferences_api.py"
+RENDER_NGINX = OTPMIN / "deployment" / "render-nginx.py"
+
+# How the rider installs the snippet on each host, printed verbatim in a FAIL so
+# the fix is one copy-paste. Both need root on the target. The house path is the
+# one 30.1 found stale: nothing but install-house-nginx.sh writes rwtpc4's
+# /etc/nginx, and nothing ran it between 09-06 and 09-24.
+INSTALL_CMD = {
+    "house": "cd ~/projects/otp-minneapolis/deployment && sudo ./install-house-nginx.sh --install",
+    "prod": "cd ~/projects/otp-minneapolis/deployment && ./deploy-app.sh {host} --only nginx",
+}
 PREFS_UNIT = "prefs-api"
 
 
@@ -266,8 +285,96 @@ systemctl --user is-active {PREFS_UNIT} 2>/dev/null | sed 's/^/unit_state=/' || 
     return text["nginx"], text["prefs"], meta
 
 
-def check_deployed(ssh):
+# --------------------------------------------------------------------------
+# --deployed: is every location the repo renders for this host installed?
+#
+# nginx-render-parity (render-nginx.py --check) compares the house RENDER with
+# the prod RENDER. It says nothing about what is in /etc/nginx on either box,
+# and that is how rwtpc4 ran its 09-06 snippet until 09-24 with /api/places and
+# both /api/carpool/ blocks missing while every check was green (backlog 30.1).
+# This compares the host's render with the host's installed snippet, by the
+# SET of location specs: a missing location is a 404 that no size rung notices.
+# Bodies are deliberately not compared -- the installed file carries real
+# secrets and upstreams where the render carries masks, so a body diff would
+# be red forever and read as noise.
+
+
+def env_for_ssh(ssh):
+    """The value set a probe target is rendered with: `local` is the house
+    (rwtpc4 inspects itself; its sshd refuses loopback), anything else is the
+    Linode. --env overrides this if a third box ever appears."""
+    return "house" if ssh in ("local", "-") else "prod"
+
+
+def _load_renderer():
+    spec = importlib.util.spec_from_file_location("render_nginx", RENDER_NGINX)
+    if spec is None or not RENDER_NGINX.is_file():
+        die_skip(f"deployment/render-nginx.py not found at {RENDER_NGINX}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def rendered_locations(env):
+    """{location spec} in THIS checkout's render of otp-common.conf.tmpl for
+    `env`, rendered with masked secrets (a spec never contains a placeholder,
+    and the check must not need deployment/.env)."""
+    rn = _load_renderer()
+    try:
+        values = rn.resolve(env, True)
+        body = rn.render_one(rn.TMPL_DIR / "otp-common.conf.tmpl", env, values, mask=True)
+        return set(rn.parse_locations(body))
+    except SystemExit:
+        # render-nginx.py dies loudly on a broken template; its message is
+        # already on stderr. That is a repo problem nginx-render-parity owns,
+        # and the comparison here cannot be made -- SKIP, not PASS.
+        die_skip(f"could not render otp-common.conf.tmpl for env `{env}`")
+
+
+def installed_locations(text):
+    rn = _load_renderer()
+    try:
+        return set(rn.parse_locations(text))
+    except SystemExit:
+        die_skip(f"could not parse the location blocks of the installed {LIVE_NGINX_SNIPPET}")
+
+
+def location_drift(rendered, installed):
+    """(missing, extra): specs the render has that the box lacks, and the
+    reverse. Pure, so the fixture test can drive it without a host."""
+    return sorted(rendered - installed), sorted(installed - rendered)
+
+
+def install_command(env, ssh):
+    host = ssh.split("@", 1)[-1] if ssh not in ("local", "-") else "<SERVER_IP>"
+    return INSTALL_CMD[env].format(host=host)
+
+
+def location_failures(nginx_text, env, ssh, where):
+    missing, extra = location_drift(rendered_locations(env), installed_locations(nginx_text))
+    print(
+        f"\n  nginx locations: installed {where}:{LIVE_NGINX_SNIPPET} vs this "
+        f"checkout's `{env}` render of otp-common.conf.tmpl: "
+        f"{len(missing)} missing, {len(extra)} extra"
+    )
+    if not (missing or extra):
+        return []
+    lines = []
+    for spec in missing:
+        lines.append(f"missing on the box: location {spec}")
+    for spec in extra:
+        lines.append(f"extra on the box (not in the `{env}` render): location {spec}")
+    return [
+        f"the installed nginx snippet on {where} does not match the repo's `{env}` "
+        "render — requests to a missing location fall through to the SPA or 404:\n"
+        + "\n".join(f"      {l}" for l in lines)
+        + f"\n    Install it (root, rider): {install_command(env, ssh)}"
+    ]
+
+
+def check_deployed(ssh, env=None):
     where = "this machine" if ssh in ("local", "-") else ssh
+    env = env or env_for_ssh(ssh)
     js = read(DEBUG_LOG_JS, "otprr debug-log.js")
     nginx_text, prefs_text, meta = read_host(ssh)
 
@@ -322,6 +429,8 @@ def check_deployed(ssh):
             f"says {repo_nginx:,} — the nginx config has not been deployed."
         )
 
+    failures.extend(location_failures(nginx_text, env, ssh, where))
+
     # gunicorn has no --reload: a file newer than the unit is not being served.
     started = meta.get("unit_started", "")
     started_epoch = meta.get("unit_started_epoch", "")
@@ -352,18 +461,20 @@ def check_deployed(ssh):
         )
 
     if failures:
-        print("\nFAIL: the deployed payload ladder is broken.", file=sys.stderr)
+        print("\nFAIL: what is deployed does not carry the ladder or match the repo.",
+              file=sys.stderr)
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         print(
             "\nThe caps must move TOGETHER, and they must be DEPLOYED together. "
-            "nginx is installed only by deployment/deploy-app.sh --only nginx, "
-            "which needs root on the target.",
+            f"nginx on this host (`{env}`) is installed only by: "
+            f"{install_command(env, ssh)} (root on the target).",
             file=sys.stderr,
         )
         return 1
 
-    print("\nOK: the box carries the full ladder, and matches the repo.")
+    print("\nOK: the box carries the full ladder, every rendered location is "
+          "installed, and it matches the repo.")
     return 0
 
 
@@ -424,8 +535,12 @@ def main():
         "--ssh", default=DEFAULT_SSH,
         help=f"host to inspect with --deployed (default: {DEFAULT_SSH}); "
              "`local` inspects this machine directly, with no ssh")
+    ap.add_argument(
+        "--env", choices=sorted(INSTALL_CMD),
+        help="value set to render for the location comparison (default: `house` "
+             "for --ssh local, `prod` for anything else)")
     args = ap.parse_args()
-    return check_deployed(args.ssh) if args.deployed else check_repo()
+    return check_deployed(args.ssh, args.env) if args.deployed else check_repo()
 
 
 if __name__ == "__main__":
