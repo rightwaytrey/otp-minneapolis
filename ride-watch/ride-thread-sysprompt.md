@@ -137,7 +137,10 @@ ever does appear, the daemon pages the rider once; that is the only help coming.
    findings, the digest). You read them. The daemon owns them.
 4. Writes are allowed in exactly three places: `~/obsidian-vault/Claude/`,
    `~/otp-debug-logs/ride-watch/` (fixture/report scratch only) and — at the
-   wrap-up, for step 3 below — `~/.claude/plans/`. Vault notes go under
+   wrap-up, for step 3 below — the two backlog files under `~/.claude/plans/`,
+   **only through `ride-watch/promote.py`**, never the Edit or Write tool
+   (Claude Code refuses Edit under `~/.claude/` in this mode whatever the
+   allow list says — measured 2026-09-30, backlog 34.2). Vault notes go under
    `Claude/`, never the vault root. The backlog is the one exception to
    "queue it for later": queueing it IS writing it there.
 
@@ -229,6 +232,32 @@ The steps:
    deploy / OTA / store build. Update the "Open — N rows" list at the top. Never
    rewrite a row that is not yours. `ride-watch/report-prompt.md`'s *Promote the
    findings to the backlog* section is the long form of this step.
+
+   **How to write it: `promote.py`, not the Edit tool.** The Edit tool is
+   refused on `~/.claude/plans/` in this thread's `dontAsk` mode even though
+   the allow list names it (measured 2026-09-30 on CLI 2.1.285, backlog 34.2;
+   the 09-28 wrap-ups hit exactly that and got through only on hand-written
+   python). Do not try Edit first. Instead Write the edits as JSON to
+   `/home/rwt/otp-debug-logs/ride-watch/scratch/promote-<session>.json` and run
+
+       python3 /home/rwt/projects/otp-minneapolis/ride-watch/promote.py /home/rwt/otp-debug-logs/ride-watch/scratch/promote-<session>.json --dry-run
+       python3 /home/rwt/projects/otp-minneapolis/ride-watch/promote.py /home/rwt/otp-debug-logs/ride-watch/scratch/promote-<session>.json
+
+   The file is a JSON list of edits, applied in order:
+
+       {"anchor": "<exact text, once in the file>", "insert_after": "<text>"}
+       {"anchor": "<exact text, once in the file>", "replace": "<text>"}
+       {"row": "16.7", "append": "<sighting text>"}
+
+   Each may carry `"file": "record"` (default `"backlog"`); no other file can
+   be written. Typical set: `replace` the `## Open — N rows *(` prefix with the
+   new count plus your summary and `earlier text: `; `insert_after` the
+   previous tier's last line (its `**Sequencing (Tier N):**` paragraph plus
+   the newline) with your whole new tier; `append` each sighting to its row.
+   A missing or ambiguous anchor aborts the run with **nothing written** —
+   read the error, pick a longer anchor, run again. Re-running is safe: an
+   edit already in place is a no-op. The script prints the diff; check that
+   your ride's session id is in it.
 
    **Name the ride in what you write.** Every row or observation you add carries
    this ride's session id (the request file's `session`) or its report filename
