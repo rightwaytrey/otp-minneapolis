@@ -2710,6 +2710,52 @@ class TestBackwardsItineraryRules(RuleTestCase):
         self.assertEqual(hits[0]["context"]["leg"], 1)
         self.assertEqual(hits[0]["context"]["byMs"], 680170)
 
+    # 34.1, 2026-09-28 16:04:37: the plan said the bus left 2m13s before the
+    # bike leg ended, the live board (and the sheet) said the bike leg's end
+    # to the second. The reading arrives before the swap and names no trip.
+    def _live_then_swap(self, swapped_trip="1:100", realtime=True, age=1000):
+        b = StreamBuilder().start().advance(1000)
+        b.action("SET_LIVE_LEG_TIMES", {"1": {
+            "boardEpoch": T0 + 600000, "boardSource": "stop",
+            "boardRealtime": realtime, "boardIsFloor": False}})
+        b.advance(age)
+        payload = backwards_itinerary(133000)
+        payload["itinerary"]["legs"][1]["tripId"] = swapped_trip
+        b.start(payload)
+        return self.find(self.run_stream(b), "itinerary-backwards")
+
+    def test_a_live_board_on_the_same_trip_does_not_page(self):
+        hits = self._live_then_swap()
+        self.assertEqual([h["severity"] for h in hits], ["warn"])
+        self.assertTrue(hits[0]["context"]["planTimeOnly"])
+        self.assertEqual(hits[0]["context"]["byMs"], 133000)
+        self.assertEqual(hits[0]["context"]["liveBoard"], {"1": T0 + 600000})
+
+    def test_a_live_board_from_a_different_trip_still_pages(self):
+        """A swap onto a different run keeps the leg index, not the bus."""
+        hits = self._live_then_swap(swapped_trip="1:200")
+        self.assertEqual([h["severity"] for h in hits], ["page"])
+        self.assertEqual(hits[0]["context"]["byMs"], 133000)
+
+    def test_a_scheduled_or_stale_live_board_still_pages(self):
+        self.assertEqual(
+            [h["severity"] for h in self._live_then_swap(realtime=False)],
+            ["page"])
+        self.assertEqual(
+            [h["severity"] for h in self._live_then_swap(
+                age=ride_watch.REPLAN_LIVE_BOARD_MAX_AGE_MS + 1000)],
+            ["page"])
+
+    def test_a_live_board_alone_raises_no_inversion(self):
+        """2026-09-17 17:53:34: board 17:57:00, plan 18:02:32, bike leg ends
+        17:58:15. The plan reads in order; the live board only excuses."""
+        b = StreamBuilder().start().advance(1000)
+        b.action("SET_LIVE_LEG_TIMES", {"1": {
+            "boardEpoch": T0 + 300000, "boardSource": "stop",
+            "boardRealtime": True, "boardIsFloor": False}})
+        b.advance(1000).start(backwards_itinerary(0))
+        self.assertEqual(self.find(self.run_stream(b), "itinerary-backwards"), [])
+
     def test_a_forward_itinerary_is_silent(self):
         b = StreamBuilder().start()
         self.assertEqual(self.find(self.run_stream(b), "itinerary-backwards"), [])
@@ -9710,6 +9756,34 @@ class TestProgressWithoutMotionNeedsTravel(RuleTestCase):
         found = self.find(watch, "progress-without-motion")
         self.assertEqual(len(found), 1, self.rules(watch))
         self.assertIn("5.6", found[0]["summary"])
+
+    def test_c_a_platform_wait_files_nothing_and_says_so(self):
+        """2026-09-28 17:03:20: "92% -> 99% while the fix moved 3m" on a
+        rider standing at the I-35W & Lake St platform, on_track, a 446 m
+        leg, UPDATE_PROGRESS.waitingAtBoardingStop true."""
+        b = StreamBuilder().start(missed_bus_itinerary(access_m=446.0))
+        b.advance(1000).position().action("UPDATE_PROGRESS", {
+            "currentLegIndex": 0, "currentLegProgress": 92.0,
+            "status": "on_track", "waitingAtBoardingStop": True})
+        b.advance(1000).position_metres_north(3).action("UPDATE_PROGRESS", {
+            "currentLegIndex": 0, "currentLegProgress": 99.0,
+            "status": "on_track", "waitingAtBoardingStop": True})
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "progress-without-motion"), [])
+        with open(watch.log.path) as f:
+            self.assertIn("suppressed at", f.read().split(
+                "waiting at boarding stop")[0][-200:])
+
+    def test_c_the_same_jump_not_waiting_still_fires(self):
+        b = StreamBuilder().start(missed_bus_itinerary(access_m=446.0))
+        b.advance(1000).position().action("UPDATE_PROGRESS", {
+            "currentLegIndex": 0, "currentLegProgress": 92.0,
+            "status": "on_track", "waitingAtBoardingStop": False})
+        b.advance(1000).position_metres_north(3).action("UPDATE_PROGRESS", {
+            "currentLegIndex": 0, "currentLegProgress": 99.0,
+            "status": "on_track", "waitingAtBoardingStop": False})
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1)
 
     def test_a_suppressed_tick_spends_the_cooldown(self):
         """Suppressed, not skipped: a replay of 26.8 must only take findings

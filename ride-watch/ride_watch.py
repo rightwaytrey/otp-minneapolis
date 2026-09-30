@@ -3705,28 +3705,81 @@ class RideWatch:
         this is a walk over what we have.
         """
         legs = (summary or {}).get("legs") or []
-        worst = None
-        for i in range(1, len(legs)):
-            prev_end = legs[i - 1].get("endTime")
-            start = legs[i].get("startTime")
-            if not isinstance(prev_end, (int, float)):
-                continue
-            if not isinstance(start, (int, float)):
-                continue
-            by = prev_end - start
-            if by > LEG_INVERSION_MS and (worst is None or by > worst[1]):
-                worst = (i, by)
-        if worst is None:
+
+        def worst_inversion(start_of):
+            worst = None
+            for i in range(1, len(legs)):
+                prev_end = legs[i - 1].get("endTime")
+                start = start_of(i)
+                if not isinstance(prev_end, (int, float)):
+                    continue
+                if not isinstance(start, (int, float)):
+                    continue
+                by = prev_end - start
+                if by > LEG_INVERSION_MS and (worst is None or by > worst[1]):
+                    worst = (i, by)
+            return worst
+
+        # 34.1: the sheet renders a transit leg's start from the live board
+        # (buildLiveItinerary), not from the plan's startTime. On 2026-09-28
+        # 16:04:37 the plan said the bus left 16:06:27 while the board — and
+        # the sheet, and the 29.1 acceptance gate — said 16:08:40, the bike
+        # leg's end to the second, and this rule paged a sheet that read in
+        # order. Use the live reading only when it is one the app itself
+        # would trust (realtime, not a floor, fresh) AND it was taken on this
+        # leg's run: the reading precedes the swap, so after a re-plan onto a
+        # different trip the same leg index is a different bus.
+        live_used = {}
+
+        def live_start(i):
+            planned = legs[i].get("startTime")
+            leg_trip = legs[i].get("tripId")
+            live = trip.live_board_latest.get(str(i))
+            if (not leg_trip or live is None or live.get("tripId") != leg_trip
+                    or not live.get("realtime") or live.get("isFloor")
+                    or t - live["tMs"] > REPLAN_LIVE_BOARD_MAX_AGE_MS):
+                return planned
+            live_used[i] = live["boardEpoch"]
+            return live["boardEpoch"]
+
+        # The live board only EXCUSES a plan-time inversion; it never raises
+        # one of its own. Measured over the day files: on 2026-09-17 17:53:34
+        # (ride mu63yfrb-ekv1fl) the board said 17:57:00 for a bus the plan
+        # had at 18:02:32, behind a bike leg ending 17:58:15 — a live time
+        # earlier than the rider can reach the stop is a missed-bus question
+        # the board-time rules own, not a sheet the planner wrote backwards.
+        plan_worst = worst_inversion(lambda i: legs[i].get("startTime"))
+        if plan_worst is None:
             return
-        idx, by = worst
+        worst = worst_inversion(live_start)
+        leg_rows = [{k: leg.get(k) for k in
+                     ("mode", "route", "startTime", "endTime")}
+                    for leg in legs]
+        if worst is None:
+            # The schedule row still inverts but the board the rider reads
+            # does not: audit it, do not page it.
+            idx, by = plan_worst
+            self._finding(
+                trip, t, "itinerary-backwards", "warn",
+                "leg %d's planned start is %s before leg %d ends, but the live"
+                " board (%s) does not run backwards"
+                % (idx, fmt_ms_span(by), idx - 1,
+                   fmt_hms(live_used[idx]) if idx in live_used else "?"),
+                {"byMs": int(by), "leg": idx, "planTimeOnly": True,
+                 "liveBoard": {str(k): v for k, v in live_used.items()},
+                 "legs": leg_rows})
+            return
+        # The page states the plan-time figure it always stated; the live
+        # comparison (which can only be as deep or deeper) rides in context.
+        idx, by = plan_worst
         self._finding(
             trip, t, "itinerary-backwards", "page",
             "leg %d starts %s before leg %d ends — the trip sheet runs backwards"
             % (idx, fmt_ms_span(by), idx - 1),
-            {"byMs": int(by), "leg": idx,
-             "legs": [{k: leg.get(k) for k in
-                       ("mode", "route", "startTime", "endTime")}
-                      for leg in legs]},
+            {"byMs": int(by), "leg": idx, "liveByMs": int(worst[1]),
+             "liveLeg": worst[0],
+             "liveBoard": {str(k): v for k, v in live_used.items()},
+             "legs": leg_rows},
             push_body="Trip times run backwards (leg %d starts %s before leg %d "
                       "ends). Check the trip sheet before you act on it."
                       % (idx, fmt_ms_span(by), idx - 1))
@@ -5431,6 +5484,12 @@ class RideWatch:
         untrusted = None
         if p.get("status") == "deviated":
             untrusted = "status deviated"
+        elif p.get("waitingAtBoardingStop") is True:
+            # (c), 2026-09-28 17:03:20: "92% -> 99% while the fix moved 3m"
+            # on a rider standing at the I-35W & Lake St platform. The app
+            # itself says they are waiting for the bus; the walk leg's last
+            # points are projection, not travel.
+            untrusted = "waiting at boarding stop"
         else:
             leg_m = (trip.leg(leg) or {}).get("distance")
             if isinstance(leg_m, (int, float)) and leg_m < MOTION_MIN_LEG_M:
@@ -6396,11 +6455,20 @@ class RideWatch:
             epoch = entry.get("boardEpoch")
             if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
                 continue
+            # 34.1: the payload names no trip, and it arrives BEFORE the
+            # START_GO_MODE that swaps the itinerary, so a reading keyed "1"
+            # may belong to the previous itinerary's leg 1. Stamp the run the
+            # held leg was on when the reading came, so a reader can tell.
+            try:
+                held = trip.leg(int(leg_key))
+            except (TypeError, ValueError):
+                held = None
             trip.live_board_latest[str(leg_key)] = {
                 "boardEpoch": int(epoch), "tMs": int(t),
                 "source": entry.get("boardSource"),
                 "realtime": entry.get("boardRealtime"),
-                "isFloor": entry.get("boardIsFloor")}
+                "isFloor": entry.get("boardIsFloor"),
+                "tripId": (held or {}).get("tripId")}
 
     @staticmethod
     def _notification_epoch(nid):
