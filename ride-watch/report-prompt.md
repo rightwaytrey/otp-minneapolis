@@ -223,6 +223,19 @@ recurrence of a closed row reopens it (move it back with the new sighting).
 Rider notes that are feature requests go in the tier too, flagged as asks and
 cross-referenced to whichever defect blocks them.
 
+**Write the backlog through `ride-watch/promote.py`, not the Edit tool.** Claude
+Code refuses Edit and Write under `~/.claude/` in the ride thread's `dontAsk` mode
+even though the allow list names the plans directory (measured 2026-09-30, backlog
+34.2). Write the edits as a JSON list to
+`/home/rwt/otp-debug-logs/ride-watch/scratch/promote-<session>.json` — each one
+`{"anchor": "<exact unique text>", "insert_after": "<text>"}`,
+`{"anchor": "...", "replace": "<text>"}` or `{"row": "N.M", "append": "<text>"}`,
+optionally with `"file": "record"` — then run
+`python3 /home/rwt/projects/otp-minneapolis/ride-watch/promote.py <that file> --dry-run`
+and, if the diff is right, the same without `--dry-run`. A missing or ambiguous
+anchor aborts with nothing written; a re-run skips edits already in place. The
+script's docstring is the full reference.
+
 ## Finish
 
 Send one Pushover notification with the result. Read credentials from

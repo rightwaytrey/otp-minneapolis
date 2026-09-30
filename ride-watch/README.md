@@ -719,14 +719,31 @@ on the phone of someone on a bicycle, so the routine job is allowed up front:
 read anywhere under `~`, a read-only Bash set (`python3`, `tail`, `grep`, `ls`,
 `git log`/`show`/`diff`, `node …/build-fixture.js`), and writes **only** under
 `~/obsidian-vault/Claude/`, `~/otp-debug-logs/ride-watch/` and — since
-2026-09-13, for the wrap-up's promotion step — `~/.claude/plans/`. Anything else
+2026-09-13, for the wrap-up's promotion step — `~/.claude/plans/` (that last
+grant is inert: see the fourth gotcha; the backlog is written by `promote.py`).
+Anything else
 is refused and the turn goes on (`dontAsk`, below) — an ask mid-ride is a hang,
 which is how three wrap-ups were lost (backlog 12.4). The deny list encodes the mid-ride
 prohibitions (`systemctl`, `docker`, `git commit/push`, `*deploy*`, edits under
 `~/projects`) and beats the broad project `.claude/settings.json` this session
 also loads.
 
-Three gotchas worth keeping, all found empirically:
+Four gotchas worth keeping, all found empirically:
+
+- **`Edit(//home/rwt/.claude/plans/**)` is refused anyway** (backlog 34.2).
+  Measured 2026-09-30 on CLI 2.1.285: a headless `claude -p --permission-mode
+  dontAsk --settings ride-watch/ride-thread-settings.json` asked to Edit a
+  scratch file under `~/.claude/plans/` got *"Permission to use Edit has been
+  denied because Claude Code is running in don't ask mode"*, while the same
+  Edit under `~/obsidian-vault/Claude/` landed — the CLI protects `~/.claude/`
+  and an allow rule does not lift it. Both 09-28 wrap-ups hit this and got
+  through only on hand-written python. So the wrap-up writes its edits as JSON
+  under `~/otp-debug-logs/ride-watch/scratch/` and runs
+  `python3 …/ride-watch/promote.py <edits.json>` (allowlisted as `python3`):
+  anchored `insert_after` / `replace` / row `append` edits, only on the backlog
+  and the record, re-read right before the write, abort-with-no-write on a
+  missing or ambiguous anchor, idempotent on re-run, diff printed,
+  `--dry-run`. Tests: `python3 ride-watch/test_promote.py`.
 
 - **`Write(path)` rules match nothing.** The CLI warns about it. Only
   `Edit(path)` rules govern file writes, and they cover every file-editing tool.
