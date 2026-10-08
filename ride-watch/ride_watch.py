@@ -748,6 +748,44 @@ ONBOARD_COMMIT_WINDOW_MS = 5 * 1000
 # the second marker inside this window is folded into the first.
 SESSION_RESTART_DEDUP_MS = 5 * 1000
 #
+# A relaunch inside a live trip that is not riding yet (37.2). 2026-09-30
+# 17:13:02: RESUME_GO_MODE came 4 s BEFORE SET_RIDING (17:13:06), so the rule
+# above returned on `riding is None` and the ride's only trace of the app dying
+# at the platform was an info `bundle-health`. The silent gap it carries runs
+# from the session's last record before the boot markers (`record-mode` /
+# `start`, same millisecond as the resume) to the relaunch: 17:11:39 -> 17:13:02.
+# A boot marker this close before the resume belongs to the same relaunch.
+SESSION_BOOT_PAIR_MS = 10 * 1000
+#
+# action-storm (37.2). 2026-09-30 17:09-17:11, session muomy26h-g1zujp: 90
+# SET_ACTIVE_ITINERARY / 45 SET_VISIBLE_ITINERARY in 130 s, ending in
+# "RangeError: Maximum call stack size exceeded" at 17:11:39 and an 83 s silent
+# relaunch. A warn, never a page: the rider sees the consequence, not the cause.
+#
+# The exclusion set is measured, not guessed: a scan of every
+# ~/otp-debug-logs/debug-2026-*.jsonl (08-25 .. 10-07, 43 files, re-POST
+# duplicates dropped as _is_duplicate_record does) for the peak count of each
+# (day, session, action type) in any 60 s window. With only the tick set
+# excluded, >= 30 fired 16 times: POSITION_RESPONSE (365 on 08-27, 363 08-29,
+# 156/118 09-01, 45 08-28, 41 08-31 -- one per in-flight request settling),
+# SET_LIVE_LEG_TIMES (61-64 on six rides, one per stop-time poll per leg),
+# SET_MAP_FOLLOW (45 08-28 16:41, 41 09-04 11:00, 30 09-13 11:41) and the storm.
+# SET_MAP_FOLLOW is the rider panning: every one of those windows is `false` at
+# irregular 0.1-2 s gaps interleaved with TOGGLE_MAP_FOLLOW taps, and otprr
+# GoModeMap.tsx dispatches it from the map's `dragstart` / `rotatestart`
+# gesture handlers. With all three excluded the 09-30 storm (46) is the only
+# firing; the next-highest type anywhere is ROUTING_RESPONSE at 21.
+ACTION_STORM_WINDOW_MS = 60 * 1000
+ACTION_STORM_COUNT = 30
+ACTION_STORM_DEDUP_MS = 5 * 60 * 1000
+ACTION_STORM_EXCLUDED = frozenset((
+    # the tick set
+    "UPDATE_POSITION", "UPDATE_ROUTE_MATCH", "UPDATE_PROGRESS",
+    "UPDATE_VEHICLE_MATCH", "UPDATE_NEARBY_VEHICLES", "CARD_DEPARTURE_MISMATCH",
+    # measured bursts that are normal (see above)
+    "POSITION_RESPONSE", "SET_LIVE_LEG_TIMES", "SET_MAP_FOLLOW",
+))
+#
 # note-unverifiable (17.11). Ride B, 15:53:50, rider note "Clicking does
 # nothing" with a screenshot — and nothing in the stream records that a tap
 # happened, so the claim could be neither confirmed nor contradicted.
@@ -1952,6 +1990,11 @@ class Trip:
         # second is news; only the first is worth one of two ride interrupts.
         self.restart_aboard_ms = 0
         self.restart_aboard_count = 0
+        # ...and while it was not aboard yet (37.2): warned, never paged, and
+        # kept apart from the two above so it cannot spend the aboard page or
+        # collapse a boot-recovery line into a relaunch the rider never heard.
+        self.restart_in_trip_ms = 0
+        self.restart_in_trip_count = 0
         # note-unverifiable fires once a ride: the statement is about the
         # instrumentation, not about the note (17.11).
         self.note_unverifiable_fired = False
@@ -2153,6 +2196,15 @@ class RideWatch:
         self.rider_query = {}      # session -> {"atMs", "keys"}
         # session -> an open burst of teardowns; see PANEL_TEARDOWN_QUIET_MS.
         self.panel_teardowns = {}
+        # action-storm (37.2): (session, type) -> deque of t inside the last
+        # ACTION_STORM_WINDOW_MS, and (session, type) -> last warn ms.
+        self.action_rate = {}
+        self.action_storm_last = {}
+        # The relaunch gap (37.2): session -> (t, label) of its latest record,
+        # the one before it, and the record before the latest boot marker.
+        self.session_last_record = {}
+        self.session_prior_record = {}
+        self.session_pre_boot = {}
         # Intake dedup ring (see RECORD_DEDUP_RING).
         self._seen_records = collections.deque()
         self._seen_record_keys = {}
@@ -2404,6 +2456,8 @@ class RideWatch:
         self._note_rider_gesture(session, t, kind, typ, obj)
         self._note_request_timeout(session, t, typ, obj)
         self._note_href(session, obj)
+        self._note_session_record(session, t, kind, typ, obj)
+        self._rule_action_storm(session, t, kind, typ, trip)
 
         if typ == "START_GO_MODE":
             self._on_start_go_mode(session, t, obj)
@@ -6037,9 +6091,10 @@ class RideWatch:
         (`mu346i5y-ng2uqc` throughout), so there is no evidence for how to
         bridge that and no rule written on a guess.
         """
-        if trip is None or trip.riding is None:
+        if trip is None or trip.arrived_ms is not None:
             return
-        if trip.arrived_ms is not None:
+        if trip.riding is None:
+            self._rule_session_restart_in_trip(session, t, obj, trip)
             return
         # `resumed-session` and RESUME_GO_MODE are one relaunch reported twice,
         # 3 ms apart on the real stream.
@@ -6069,6 +6124,118 @@ class RideWatch:
             "page" if first else "warn", summary, ctx,
             push_body=("The app restarted while you were on %s. Check the trip"
                        " sheet still shows your bus." % route) if first else None)
+
+    def _rule_session_restart_in_trip(self, session, t, obj, trip):
+        """The app relaunched inside a live trip the rider was not aboard yet.
+
+        37.2. 2026-09-30, session muomy26h-g1zujp, Orange Line at the
+        platform: an action storm ended in "RangeError: Maximum call stack size
+        exceeded" at 17:11:39, nothing at all for 83 s, then `record-mode` /
+        `start` / `resumed-session` / RESUME_GO_MODE at 17:13:02 and SET_RIDING
+        at 17:13:06. The aboard rule returned on `riding is None` four seconds
+        too early, and the daemon carried on as if nothing had happened.
+
+        A warn, never a page: the rider is standing at the stop looking at an
+        app that has just come back, and the page budget belongs to the bus.
+        What the report needs is the gap -- how long the app was dead -- which
+        runs from this session's last record before the boot markers to the
+        relaunch, and the leg it came back on.
+        """
+        if (trip.restart_in_trip_ms
+                and t - trip.restart_in_trip_ms <= SESSION_RESTART_DEDUP_MS):
+            return
+        trip.restart_in_trip_ms = t
+        trip.restart_in_trip_count += 1
+        marker = ("RESUME_GO_MODE" if obj.get("type") == "RESUME_GO_MODE"
+                  else "resumed-session")
+        last = self._record_before_relaunch(session, t)
+        gap_ms = (t - last[0]) if last else None
+        leg = (trip.progress or {}).get("currentLegIndex")
+        nth = ("" if trip.restart_in_trip_count == 1
+               else " (%d in this ride)" % trip.restart_in_trip_count)
+        if last:
+            gap = ("silent %ds before it (last record %s %s)"
+                   % (round(gap_ms / 1000.0), fmt_hms(last[0]), last[1]))
+        else:
+            gap = "no earlier record of this session"
+        summary = ("the app relaunched mid-trip before boarding (leg %s): %s,"
+                   " %s%s" % (leg if leg is not None else "?", marker, gap, nth))
+        self._finding(
+            trip, t, "session-restart-in-trip", "warn", summary,
+            {"marker": marker,
+             "lastRecordMs": last[0] if last else None,
+             "lastRecord": last[1] if last else None,
+             "gapMs": gap_ms,
+             "restartCount": trip.restart_in_trip_count,
+             "legIndex": leg,
+             "legProgressPct": (trip.progress or {}).get("currentLegProgress"),
+             "bundle": (self.device_bundles.get(trip.device) or {}).get("version"),
+             "swapSeq": trip.swap_seq})
+
+    def _note_session_record(self, session, t, kind, typ, obj):
+        """Every record's time and name, per session, for the relaunch gap.
+
+        A relaunch arrives as `record-mode`, `start`, then `resumed-session` /
+        RESUME_GO_MODE, all in one millisecond, so "the record before the
+        relaunch" is the record before the FIRST boot marker of the cluster,
+        not the record before the resume.
+        """
+        label = typ or kind or "record"
+        if kind == "session":
+            label = obj.get("event") or label
+        prior = self.session_last_record.get(session)
+        self.session_prior_record[session] = prior
+        if kind == "session" and obj.get("event") in ("record-mode", "start"):
+            boot = self.session_pre_boot.get(session)
+            if boot is None or t - boot[1] > SESSION_BOOT_PAIR_MS:
+                self.session_pre_boot[session] = (prior, t)
+        self.session_last_record[session] = (t, label)
+
+    def _record_before_relaunch(self, session, t):
+        """(t, label) of this session's last record before the relaunch at t."""
+        boot = self.session_pre_boot.get(session)
+        if boot is not None and 0 <= t - boot[1] <= SESSION_BOOT_PAIR_MS:
+            return boot[0]
+        return self.session_prior_record.get(session)
+
+    def _rule_action_storm(self, session, t, kind, typ, trip):
+        """One action type dispatched in a loop. 37.2 (warn, never a page).
+
+        Counted for every session, filed only inside a trip: the finding
+        belongs to a ride's report, and a storm on the planner screen with no
+        ride open has nobody to read it. See ACTION_STORM_EXCLUDED for the
+        measurement that set the threshold and the exclusions.
+        """
+        if kind != "action" or not typ or typ in ACTION_STORM_EXCLUDED:
+            return
+        key = (session, typ)
+        window = self.action_rate.get(key)
+        if window is None:
+            if len(self.action_rate) > 5000:
+                stale = [k for k, d in self.action_rate.items()
+                         if not d or t - d[-1] > ACTION_STORM_WINDOW_MS]
+                for k in stale:
+                    del self.action_rate[k]
+            window = self.action_rate[key] = collections.deque()
+        window.append(t)
+        while window and window[0] <= t - ACTION_STORM_WINDOW_MS:
+            window.popleft()
+        if len(window) < ACTION_STORM_COUNT or trip is None:
+            return
+        last = self.action_storm_last.get(key)
+        if last is not None and t - last <= ACTION_STORM_DEDUP_MS:
+            return
+        self.action_storm_last[key] = t
+        self._finding(
+            trip, t, "action-storm", "warn",
+            "%s dispatched %d times in %ds (%s-%s): the app is looping"
+            % (typ, len(window), ACTION_STORM_WINDOW_MS // 1000,
+               fmt_hms(window[0]), fmt_hms(t)),
+            {"type": typ, "count": len(window),
+             "windowMs": ACTION_STORM_WINDOW_MS,
+             "threshold": ACTION_STORM_COUNT,
+             "firstMs": window[0],
+             "legIndex": (trip.progress or {}).get("currentLegIndex")})
 
     # -- what the rider had touched, and what was hanging while they did ----
     #
@@ -7084,6 +7251,13 @@ class RideWatch:
         self._rule_replan_refused_with_live_slack(trip, t, p)
         paired = self._pair_pending_reroute(trip, t, reason)
         if paired is not None:
+            # The verdict on a START_REROUTE that was already counted: give
+            # that entry its outcome, so the storm summary can say whether it
+            # was refused (37.2).
+            for entry in trip.reroute_times:
+                if entry[0] == int(paired):
+                    entry[2] = p.get("accepted") is not False
+                    entry[3] = p.get("refusedBecause")
             self.log.info(
                 "AUTO_REPLAN %r at %s is the verdict on the START_REROUTE at"
                 " %s, not a second re-plan"
@@ -7106,24 +7280,52 @@ class RideWatch:
 
     def _count_toward_storm(self, trip, t, reason, auto_replan,
                             accepted=None, refused=None):
-        """One automatic re-plan. Count it, then ask whether they add up."""
-        trip.reroute_times.append((int(t), bool(auto_replan)))
+        """One automatic re-plan. Count it, then ask whether they add up.
+
+        Each entry keeps its verdict (37.2): 2026-09-30 17:35:46 read "4
+        reroutes within 5 min" when three had been refused (`arrives-later`)
+        and one applied, so the report described four swaps the rider never
+        saw. A START_REROUTE with `autoApply: true` has no verdict of its own;
+        it reads as applied unless its paired AUTO_REPLAN says otherwise.
+        Entry: [t, was AUTO_REPLAN, applied?, refusedBecause].
+        """
+        if auto_replan:
+            applied = (accepted is not False) and not refused
+        else:
+            applied = True
+        trip.reroute_times.append([int(t), bool(auto_replan), applied,
+                                   refused])
         while (trip.reroute_times
                and t - trip.reroute_times[0][0] > REROUTE_STORM_WINDOW_MS):
             trip.reroute_times.popleft()
         if (len(trip.reroute_times) > REROUTE_STORM_COUNT
                 and t - trip.reroute_storm_last_ms > REROUTE_STORM_WINDOW_MS):
             trip.reroute_storm_last_ms = t
-            quiet = sum(1 for _, was_auto in trip.reroute_times if was_auto)
+            quiet = sum(1 for e in trip.reroute_times if e[1])
+            why = collections.Counter(
+                e[3] or "refused" for e in trip.reroute_times if not e[2])
+            n_refused = sum(why.values())
+            n_applied = len(trip.reroute_times) - n_refused
+            if n_refused:
+                split = "%d refused (%s), %d applied" % (
+                    n_refused,
+                    ", ".join("%s x%d" % (k, v) for k, v in
+                              sorted(why.items(), key=lambda kv: (-kv[1], kv[0]))),
+                    n_applied)
+            else:
+                split = "%d applied" % n_applied
             self._finding(
                 trip, t, "reroute-storm", "warn",
-                "%d reroutes within 5 min" % len(trip.reroute_times),
+                "%d re-plans in 5 min: %s" % (len(trip.reroute_times), split),
                 {"count": len(trip.reroute_times),
                  "reason": reason,
                  # Which records the count is made of, because "4 reroutes"
                  # said nothing about whether the rider could have seen any
                  # of them (17.9d).
                  "quietReplans": quiet,
+                 "refused": n_refused,
+                 "refusedReasons": dict(why),
+                 "applied": n_applied,
                  "accepted": accepted,
                  "refusedBecause": refused})
 

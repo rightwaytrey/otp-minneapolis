@@ -7507,11 +7507,14 @@ class TestSessionRestartWhileAboard(RuleTestCase):
         self.assertEqual(len(self.find(watch, "session-restart-while-aboard")),
                          1)
 
-    def test_a_relaunch_with_no_riding_fact_says_nothing(self):
-        """The rider is on a bike or standing at a stop; a resume there is
-        the app doing its job."""
+    def test_a_relaunch_with_no_riding_fact_does_not_page(self):
+        """The rider is on a bike or standing at a stop: no aboard page. Since
+        37.2 it is a `session-restart-in-trip` warn instead (see
+        TestSessionRestartInTrip)."""
         watch = self.ride(riding=False)
         self.assertEqual(self.find(watch, "session-restart-while-aboard"), [])
+        found = self.find(watch, "session-restart-in-trip")
+        self.assertEqual([f["severity"] for f in found], ["warn"])
 
     def test_the_second_relaunch_is_filed_but_does_not_page(self):
         """09-15 ride A relaunched at 15:47:11 and again at 15:49:45. The
@@ -10116,6 +10119,195 @@ class TestLiveSlackRulesStayQuiet(unittest.TestCase):
         for rule in ("replan-refused-with-live-slack",
                      "at-stop-when-bus-left"):
             self.assertEqual(hits_of(watch, rule), [], rule)
+
+
+class TestActionStorm(RuleTestCase):
+    """37.2 (i): one action type dispatched in a loop.
+
+    2026-09-30 17:09-17:11, session muomy26h-g1zujp: 90 SET_ACTIVE_ITINERARY /
+    45 SET_VISIBLE_ITINERARY in 130 s (46 / 23 in the worst 60 s), then
+    "RangeError: Maximum call stack size exceeded" at 17:11:39 and an 83 s
+    silent relaunch. Nothing filed. The exclusion set is the measured one in
+    ACTION_STORM_EXCLUDED.
+    """
+
+    def burst(self, typ, n, gap_ms, trip=True, payload=None):
+        b = StreamBuilder()
+        if trip:
+            b.start().advance(1000).progress(leg=1, stops=5)
+        for i in range(n):
+            b.advance(gap_ms).action(typ, payload or {"index": i % 2})
+        return self.run_stream(b, finalize=False)
+
+    def test_the_0930_storm_is_one_warn(self):
+        """46 SET_ACTIVE_ITINERARY in 60 s: fails on master (no such rule)."""
+        watch = self.burst("SET_ACTIVE_ITINERARY", 46, 1300)
+        found = self.find(watch, "action-storm")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertEqual(found[0]["context"]["type"], "SET_ACTIVE_ITINERARY")
+        self.assertEqual(found[0]["context"]["count"], 30)
+        self.assertIn("SET_ACTIVE_ITINERARY", found[0]["summary"])
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    def test_position_responses_are_not_a_storm(self):
+        """373 in 60 s on 08-27: one per in-flight request settling."""
+        watch = self.burst("POSITION_RESPONSE", 373, 150)
+        self.assertEqual(self.find(watch, "action-storm"), [])
+
+    def test_live_leg_times_and_map_follow_are_not_a_storm(self):
+        for typ, n in (("SET_LIVE_LEG_TIMES", 129), ("SET_MAP_FOLLOW", 45)):
+            watch = self.burst(typ, n, 400, payload={"x": 1})
+            self.assertEqual(self.find(watch, "action-storm"), [], typ)
+
+    def test_ticks_are_not_a_storm(self):
+        watch = self.burst("UPDATE_VEHICLE_MATCH", 80, 500)
+        self.assertEqual(self.find(watch, "action-storm"), [])
+
+    def test_below_the_threshold_says_nothing(self):
+        """The next-highest type in 43 day files is ROUTING_RESPONSE at 21."""
+        self.assertEqual(self.find(
+            self.burst("SET_ACTIVE_ITINERARY", 29, 1000), "action-storm"), [])
+        # 30 of them, but spread over more than 60 s
+        self.assertEqual(self.find(
+            self.burst("SET_ACTIVE_ITINERARY", 30, 2100), "action-storm"), [])
+
+    def test_no_trip_no_finding(self):
+        watch = self.burst("SET_ACTIVE_ITINERARY", 46, 1000, trip=False)
+        self.assertEqual(self.find(watch, "action-storm"), [])
+
+    def test_one_warn_per_type_per_five_minutes(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        for _ in range(90):                      # 117 s of storm
+            b.advance(1300).action("SET_ACTIVE_ITINERARY", {"index": 1})
+        for _ in range(40):                      # a second type: its own warn
+            b.advance(1000).action("SET_VISIBLE_ITINERARY", {"index": 1})
+        b.advance(6 * 60 * 1000)
+        for _ in range(35):                      # a second storm, 6 min on
+            b.advance(1000).action("SET_ACTIVE_ITINERARY", {"index": 1})
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "action-storm")
+        self.assertEqual([f["context"]["type"] for f in found],
+                         ["SET_ACTIVE_ITINERARY", "SET_VISIBLE_ITINERARY",
+                          "SET_ACTIVE_ITINERARY"])
+
+
+class TestSessionRestartInTrip(RuleTestCase):
+    """37.2 (ii): the app relaunched in a live trip before boarding.
+
+    2026-09-30: last record 17:11:39 (the RangeError), then `record-mode` /
+    `start` / `resumed-session` / RESUME_GO_MODE all at 17:13:02, SET_RIDING
+    17:13:06. The aboard rule returned on `riding is None`.
+    """
+
+    def relaunch(self, b):
+        b._envelope(kind="session", event="record-mode")
+        b._envelope(kind="session", event="start")
+        b._envelope(kind="session", event="resumed-session")
+        b.advance(1).action("RESUME_GO_MODE", transit_itinerary())
+        return b
+
+    def test_the_0930_relaunch_warns_with_the_gap(self):
+        """Fails on master: the rule returned before looking."""
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(2000)
+        b._envelope(kind="error", message="RangeError: Maximum call stack")
+        silent_from = b.t
+        b.advance(83000)
+        self.relaunch(b)
+        b.advance(4000).riding()
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "session-restart-in-trip")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        f = found[0]
+        self.assertEqual(f["severity"], "warn")
+        self.assertEqual(f["context"]["marker"], "resumed-session")
+        self.assertEqual(f["context"]["lastRecordMs"], silent_from)
+        self.assertEqual(f["context"]["lastRecord"], "error")
+        self.assertEqual(f["context"]["gapMs"], 83000)
+        self.assertEqual(f["context"]["legIndex"], 1)
+        self.assertIn("silent 83s", f["summary"])
+        self.assertEqual(self.find(watch, "session-restart-while-aboard"), [])
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    def test_aboard_still_pages_unchanged(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).riding().vehicle_match().advance(60000)
+        watch = self.run_stream(self.relaunch(b), finalize=False)
+        found = self.find(watch, "session-restart-while-aboard")
+        self.assertEqual([f["severity"] for f in found], ["page"])
+        self.assertEqual(self.find(watch, "session-restart-in-trip"), [])
+
+    def test_a_pre_boarding_warn_does_not_spend_the_aboard_page(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(30000)
+        self.relaunch(b)
+        b.advance(5000).riding().vehicle_match().advance(120000)
+        self.relaunch(b)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "session-restart-in-trip")), 1)
+        self.assertEqual(
+            [f["severity"] for f in
+             self.find(watch, "session-restart-while-aboard")], ["page"])
+
+    def test_nothing_after_arrival(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).action("SET_ARRIVED", {}).advance(60000)
+        watch = self.run_stream(self.relaunch(b), finalize=False)
+        self.assertEqual(self.find(watch, "session-restart-in-trip"), [])
+
+
+class TestRerouteStormSaysWhatWasRefused(RuleTestCase):
+    """37.2 (iii): 2026-09-30 17:35:46 read "4 reroutes within 5 min" when
+    three re-plans had been refused (`arrives-later`) and one applied."""
+
+    def verdict(self, b, accepted, refused=None, reason="quiet-replan-full"):
+        return b.action("AUTO_REPLAN",
+                        {"accepted": accepted, "autoApply": True,
+                         "reason": reason, "refusedBecause": refused,
+                         "tMs": b.t})
+
+    def test_the_0930_window(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for gap, ok in ((1000, False), (61000, False), (54000, False),
+                        (179000, True)):
+            b.advance(gap)
+            self.verdict(b, ok, None if ok else "arrives-later")
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "reroute-storm")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["summary"],
+                         "4 re-plans in 5 min: 3 refused (arrives-later x3),"
+                         " 1 applied")
+        self.assertEqual(found[0]["context"]["refused"], 3)
+        self.assertEqual(found[0]["context"]["applied"], 1)
+
+    def test_a_start_reroute_takes_its_paired_verdict(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for i in range(4):
+            b.advance(45000).action("START_REROUTE",
+                                    {"autoApply": True,
+                                     "reason": "boarded-earlier"})
+            b.advance(2400)
+            self.verdict(b, i == 0, None if i == 0 else "arrives-later",
+                         reason="boarded-earlier")
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "reroute-storm")
+        self.assertEqual(len(found), 1)
+        # The storm fires on the 4th START_REROUTE, before its verdict lands.
+        self.assertIn("2 refused (arrives-later x2), 2 applied",
+                      found[0]["summary"])
+        entries = list(watch.trips[SESSION].reroute_times)
+        self.assertEqual([e[2] for e in entries], [True, False, False, False])
+
+    def test_all_applied(self):
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        for _ in range(4):
+            b.advance(45000)
+            self.verdict(b, True)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "reroute-storm")[0]["summary"],
+                         "4 re-plans in 5 min: 4 applied")
 
 
 if __name__ == "__main__":
