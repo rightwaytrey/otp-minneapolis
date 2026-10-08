@@ -261,6 +261,19 @@ ARRIVED_END_MS = 5 * 60 * 1000
 # and when 13.5 lands the rule should go quiet — which makes it that fix's
 # regression test.
 ARRIVED_NEVER_ENDED_MS = 270 * 1000
+# The client's own dwell (otprr AUTO_END_AFTER_ARRIVAL_MS). Since 3fc70a557
+# (2026-09-18) it is a wall-clock setTimeout armed on SET_ARRIVED, not a check
+# in the position tick: it fires at 180 s while the app runs, and at once on
+# wake when the webview was suspended at the moment it fell due.
+CLIENT_AUTO_END_MS = 3 * 60 * 1000
+# arrived-never-ended's "the app was asleep" test (13.5, 2026-10-08): a gap
+# this long in the session's record stream — of ANY kind, not just fixes —
+# spanning the moment the client's dwell fell due. An arrived app that is
+# running still records a POSITION_FETCHING every 30 s (the arrived tracking
+# interval) and flushes every 3 s (debug-log.js FLUSH_INTERVAL_MS), so four
+# missed polls is not a slow phone. On 10-08 ride 1 the gap was 518 s
+# (08:55:15.058 -> 09:03:53.057).
+ARRIVED_APP_SILENT_MS = 120 * 1000
 # arrived-far-from-destination (21.2, daemon half). The client's own arrival
 # radius, from otprr lib/util/go-mode/progress-calculator.ts ARRIVAL_RADIUS_M.
 # The app grants arrival either inside that radius OR on overallProgress
@@ -1876,6 +1889,9 @@ class Trip:
         self.arrived_leg = None                   # leg index when it latched
         self.arrived_source = None                # which evidence latched it
         self.arrived_never_ended_fired = False    # 18.3b, once per arrival
+        # (start, end) of the record-stream silence that spanned the client's
+        # dwell falling due, or None (13.5). end is None while still silent.
+        self.arrived_silence = None
         self.arrived_far_fired = False            # 21.2, once per arrival
         # START_GO_MODE's `roundTrip` block (round-trip feature, 09-05): the
         # outbound arrival of a round trip is a PAUSE at the stay, not the end
@@ -2097,6 +2113,10 @@ class RideWatch:
         # 1.7 s after a STOP_GO_MODE — so a rule that asks "where was the
         # rider" cannot reach for trip.last_fix. {session: (lat, lon, tMs)}.
         self.session_fix = {}
+        # session -> (tMs, SET_RIDING payload): a riding fact the app set while
+        # no trip was open here — the onboard flow's "I'm on the bus" runs
+        # BEFORE START_GO_MODE (40.1). Adopted by the trip that session starts.
+        self.pending_riding = {}
         # session -> {routeId: {"tMs", "vehicles": [(lat, lon, vehicleId,
         # tripId, label)]}}: the last REALTIME_VEHICLE_POSITIONS_RESPONSE the
         # trip sheet polled for a route. This is the feed the app HAD while
@@ -2441,6 +2461,7 @@ class RideWatch:
 
         trip = self.trips.get(session)
         if trip:
+            self._note_arrived_silence(trip, t)
             trip.last_event_ms = max(trip.last_event_ms, t)
             if not trip.device:
                 trip.device = obj.get("device")
@@ -2617,6 +2638,11 @@ class RideWatch:
             # per session either way; only the trip bookkeeping above is
             # trip-scoped.
             self._note_session_fix(session, t, obj.get("payload") or {})
+        elif typ in ("SET_RIDING", "CLEAR_RIDING", "SET_EARLY_ALIGHT"):
+            # No trip either: the onboard flow confirms the bus and dispatches
+            # SET_RIDING ~20 s before its START_GO_MODE (40.1), and this branch
+            # used to keep only fixes, so the fact was dropped on the floor.
+            self._note_pending_riding(session, t, typ, obj.get("payload"))
 
         # Time-based rules ride on the advancing clock.
         self.check_timers()
@@ -2642,6 +2668,8 @@ class RideWatch:
                 session, itinerary_one_liner(summary)))
             self._log_stream_window("trip start for %s" % session)
             self._begin_ride_thread(trip, t)
+            # After the thread exists, so its ledger carries the line (40.1).
+            self._adopt_pending_riding(trip, t, summary)
         else:
             # Itinerary replacement mid-trip.
             #
@@ -3586,6 +3614,7 @@ class RideWatch:
         trip.arrived_leg = (trip.progress or {}).get("currentLegIndex")
         trip.arrived_source = source
         trip.arrived_never_ended_fired = False
+        trip.arrived_silence = None
         self.log.info("arrived (%s): session=%s" % (source, trip.session))
         self._thread_event(trip, t, "arrived at destination")
         self._rule_arrived_far_from_destination(trip, t, source)
@@ -3637,10 +3666,28 @@ class RideWatch:
              "legIndex": p.get("currentLegIndex"),
              "arrivedSource": source})
 
+    def _note_arrived_silence(self, trip, t):
+        """Remember the silence an arrived app fell into, before t updates it.
+
+        Called for every record of the trip, BEFORE last_event_ms moves: in
+        replay the clock only advances on events, so by the time check_timers
+        runs the record that ended the silence has already closed it, and
+        `now - last_event_ms` reads 0. The gap has to be measured on the way
+        in. Only a gap that began before the client's dwell fell due counts —
+        an app that was alive at 180 s and went quiet later had its chance.
+        """
+        if trip.arrived_ms is None or trip.arrived_silence is not None:
+            return
+        prev = trip.last_event_ms
+        if (t - prev >= ARRIVED_APP_SILENT_MS
+                and prev < trip.arrived_ms + CLIENT_AUTO_END_MS
+                and t > trip.arrived_ms + CLIENT_AUTO_END_MS):
+            trip.arrived_silence = (prev, t)
+
     def _rule_arrived_never_ended(self, trip, t, ending=None):
         """The rider arrived and the app never closed the trip. (18.3b)
 
-        The client auto-ends AUTO_END_AFTER_ARRIVAL_MS (3 min) after arrival.
+        The client auto-ends CLIENT_AUTO_END_MS (3 min) after arrival.
         When it does not, this daemon closes the trip itself at ARRIVED_END_MS
         (5 min) and writes `endReason: arrived` — which reads exactly like the
         app having ended it. That is what hid this for a month: on 2026-09-17
@@ -3658,12 +3705,22 @@ class RideWatch:
           latched and a reason that is not `stop` IS the proof — STOP_GO_MODE
           is the only thing that ends a trip with reason `stop`.
 
-        The finding says whether fixes are still arriving, because the two
-        cases have different fixes and only the stream can tell them apart:
-        no fixes means the client's dwell timer is starved (it lives in the
-        arrived branch of handlePositionUpdate and is therefore tick-driven,
-        which is 13.5); fixes still arriving means the timer is running and
-        failing, which is a different bug in a different place.
+        Three cases, told apart by the stream (13.5, re-measured 2026-10-08):
+
+        - fixes still arriving: the app is running, its dwell timer fell due
+          and did not end the trip — a real failure. `warn`.
+        - the app went SILENT — no record of any kind for
+          ARRIVED_APP_SILENT_MS across the moment the dwell fell due: the
+          phone suspended the webview, so no timer of any kind could run.
+          Since otprr 3fc70a557 the dwell is a wall-clock setTimeout (it used
+          to sit in the position tick, which is what this text said until
+          10-08), and an overdue one fires on wake: 10-08 ride 1 arrived
+          08:55:01.105, went silent at 08:55:15, and STOP_GO_MODE came
+          09:03:53.172, 115 ms after the first post-wake record. Nothing for
+          the app to fix and nothing the rider can act on. `info`.
+        - no fixes but the app is still talking (POSITION_FETCHING every 30 s
+          with no response — 09-17 ride 2): the timer is wall-clock and the
+          app is alive, so it should have fired. `warn`.
         """
         if trip.arrived_ms is None or trip.arrived_never_ended_fired:
             return
@@ -3677,24 +3734,46 @@ class RideWatch:
         # "Still arriving" means inside the gps-gap threshold: a fix a minute
         # old is not a stream, it is the last thing the phone said.
         fixes_live = since_fix_ms <= GPS_GAP_MS
+        # A silence still open now counts too: on a live ride the rule fires
+        # at 270 s, long before the phone wakes and closes the gap.
+        silence = trip.arrived_silence
+        if (silence is None and not fixes_live
+                and t - trip.last_event_ms >= ARRIVED_APP_SILENT_MS
+                and trip.last_event_ms < trip.arrived_ms + CLIENT_AUTO_END_MS):
+            silence = (trip.last_event_ms, None)
+        app_silent = silence is not None and not fixes_live
+        if fixes_live:
+            why = ("position fixes still arriving, last %ds ago — the app is"
+                   " running and its auto-end did not fire"
+                   % (since_fix_ms // 1000))
+        elif app_silent:
+            gap_ms = (silence[1] if silence[1] is not None else t) - silence[0]
+            why = ("app silent %ds after arrival, %ds in all — suspended; the"
+                   " wall-clock auto-end fires on wake"
+                   % (max(0, silence[0] - trip.arrived_ms) // 1000,
+                      gap_ms // 1000))
+        else:
+            why = ("no position fix for %ds but the app is still talking —"
+                   " its wall-clock auto-end did not fire"
+                   % (since_fix_ms // 1000))
         self._finding(
-            trip, t, "arrived-never-ended", "warn",
-            "arrived %s and the app never ended the trip (%dm%02ds open;"
-            " %s)" % (fmt_hms(trip.arrived_ms), open_ms // 60000,
-                      (open_ms // 1000) % 60,
-                      ("position fixes still arriving, last %ds ago"
-                       % (since_fix_ms // 1000)) if fixes_live
-                      else ("no position fix for %ds — the client's dwell"
-                            " timer is tick-driven and has nothing to tick"
-                            " on (13.5)" % (since_fix_ms // 1000))),
+            trip, t, "arrived-never-ended", "info" if app_silent else "warn",
+            "arrived %s and %s (%dm%02ds open; %s)" % (
+                fmt_hms(trip.arrived_ms),
+                ("the trip stayed open while the app was asleep" if app_silent
+                 else "the app never ended the trip"),
+                open_ms // 60000, (open_ms // 1000) % 60, why),
             {"arrivedMs": trip.arrived_ms,
              "arrivedSource": trip.arrived_source,
              "openMs": open_ms,
              "thresholdMs": ARRIVED_NEVER_ENDED_MS,
-             "clientAutoEndMs": 3 * 60 * 1000,   # otprr AUTO_END_AFTER_ARRIVAL_MS
+             "clientAutoEndMs": CLIENT_AUTO_END_MS,  # otprr AUTO_END_AFTER_ARRIVAL_MS
              "lastFixMs": trip.last_pos_ms,
              "msSinceLastFix": since_fix_ms,
              "positionFixesStillArriving": fixes_live,
+             "appSilent": app_silent,
+             "silentFromMs": silence[0] if app_silent else None,
+             "silentUntilMs": silence[1] if app_silent else None,
              # Named so a report cannot mistake our close for the app's.
              "watcherClosedAtMs": (trip.arrived_ms + ARRIVED_END_MS),
              "endedBy": ending})
@@ -3715,6 +3794,7 @@ class RideWatch:
         trip.arrived_leg = None
         trip.arrived_source = None
         trip.arrived_never_ended_fired = False
+        trip.arrived_silence = None
         trip.arrived_far_fired = False
         self._thread_event(trip, t, "ride resumed after arrival (%s)" % why)
         self._mark_dirty()
@@ -3932,6 +4012,85 @@ class RideWatch:
             float(speed) if isinstance(speed, (int, float)) and speed > 0
             else None)
 
+    def _note_pending_riding(self, session, t, typ, payload):
+        """Mirror the app's riding fact for a session with no trip open (40.1).
+
+        The three reducers that write goMode.riding outside a trip: SET_RIDING
+        sets it (null payload clears it), CLEAR_RIDING and SET_EARLY_ALIGHT
+        clear it (otprr lib/reducers/go-mode.ts). STOP_GO_MODE does NOT clear
+        it in the app — a riding fact survives the screen being exited (7/12)
+        — and so does not clear it here either.
+        """
+        if typ == "SET_RIDING" and isinstance(payload, dict):
+            prev = self.pending_riding.get(session)
+            if prev is not None and prev[0] > t:
+                return                  # a replayed older record
+            if len(self.pending_riding) > SESSION_CACHE_MAX and \
+                    session not in self.pending_riding:
+                self._prune_session_caches()
+            self.pending_riding[session] = (int(t), payload)
+        else:
+            prev = self.pending_riding.get(session)
+            if prev is not None and prev[0] <= t:
+                del self.pending_riding[session]
+
+    def _adopt_pending_riding(self, trip, t, summary):
+        """Open a new trip already aboard, when the app opened it that way.
+
+        Mirrors the app's START_GO_MODE reducer exactly (otprr
+        lib/reducers/go-mode.ts `riding: reanchorRiding(state.isActive ||
+        ridingFactIsEvidenced(state.riding) ? state.riding : null, itinerary)`):
+        a fact is carried into a fresh trip only when it names a real vehicle
+        (not a synthetic `route:` id — the 09-01 GPS-only board that started
+        the next trip already aboard), and its legIndex is re-anchored onto
+        the new itinerary by tripId, then routeId, else -1 (aboard, leg
+        unknown — which _on_transition_leg deliberately never clears).
+
+        2026-10-08 `muzhvcww-h8y7qw`: SET_RIDING {tripId 1:1268952, vehicleId
+        1:8147, legIndex -1} at 09:15:44.713, START_GO_MODE 09:16:07.290; the
+        trip read "Riding: not aboard" for its whole 17-minute bus leg.
+        """
+        pending = self.pending_riding.pop(trip.session, None)
+        if pending is None:
+            return
+        set_ms, p = pending
+        vehicle = p.get("vehicleId")
+        if not (isinstance(vehicle, str) and vehicle
+                and not vehicle.startswith("route:")):
+            self.log.info("pending riding fact not adopted (unevidenced"
+                          " vehicle %r): session=%s" % (vehicle, trip.session))
+            return
+        legs = (summary or {}).get("legs") or []
+        leg_index = -1
+        if p.get("tripId"):
+            leg_index = next((i for i, l in enumerate(legs)
+                              if l.get("transit")
+                              and l.get("tripId") == p.get("tripId")), -1)
+        if leg_index < 0 and p.get("routeId"):
+            leg_index = next((i for i, l in enumerate(legs)
+                              if l.get("transit")
+                              and l.get("routeId") == p.get("routeId")), -1)
+        trip.riding = {
+            "tripId": p.get("tripId"),
+            "vehicleId": vehicle,
+            "routeId": p.get("routeId"),
+            "headsign": p.get("headsign"),
+            "legIndex": leg_index,
+            "boardedAt": p.get("boardedAt"),
+            "swap_seq": trip.swap_seq,
+            "setAtMs": set_ms,
+            "adoptedAtStartMs": t,
+        }
+        self.log.info(
+            "trip opened aboard: session=%s SET_RIDING %s (%d ms before"
+            " START_GO_MODE) trip %s vehicle %s -> leg %d"
+            % (trip.session, fmt_hms(set_ms), t - set_ms, p.get("tripId"),
+               vehicle, leg_index))
+        self._thread_event(trip, t, "opened aboard %s (trip %s), set %s"
+                           " before the trip started" % (
+                               p.get("headsign") or vehicle, p.get("tripId"),
+                               fmt_hms(set_ms)))
+
     def _prune_session_caches(self):
         """Keep the per-session boarding caches to the newest few sessions.
 
@@ -3948,6 +4107,7 @@ class RideWatch:
         for cache in (self.route_vehicles, self.nearby_vehicles_ms,
                       self.quiet_replan_candidate,
                       self.onboard_anchor, self.session_last_gesture,
+                      self.pending_riding,
                       self.session_timeouts, self.session_href):
             for key in [k for k in cache if k not in keep]:
                 del cache[key]
