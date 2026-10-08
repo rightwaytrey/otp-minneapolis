@@ -8534,14 +8534,79 @@ class TestArrivedNeverEnded(RuleTestCase):
         self.assertEqual(hits[0]["severity"], "warn")
 
     def test_it_says_when_the_fixes_have_stopped(self):
-        """13.5's case: the client's dwell timer lives in the arrived branch of
-        handlePositionUpdate, so with no fixes it has nothing to tick on."""
+        """No fixes, but the app is still talking (POSITION_FETCHING every
+        30 s, 09-17 ride 2's shape). Since otprr 3fc70a557 the dwell is a
+        wall-clock timer, so an app that is alive should have ended the trip:
+        still a warn, and no longer blamed on a "tick-driven" timer (13.5)."""
         b = self.arrived()
         self.idle(b, ride_watch.ARRIVED_NEVER_ENDED_MS + 30000)
         watch = self.run_stream(b)
         hit = self.find(watch, "arrived-never-ended")[0]
+        self.assertEqual(hit["severity"], "warn")
         self.assertFalse(hit["context"]["positionFixesStillArriving"])
-        self.assertIn("tick-driven", hit["summary"])
+        self.assertFalse(hit["context"]["appSilent"])
+        self.assertNotIn("tick-driven", hit["summary"])
+        self.assertIn("still talking", hit["summary"])
+
+    def test_a_suspended_phone_that_ends_on_wake_is_a_note(self):
+        """10-08 ride 1 (13.5): SET_ARRIVED 08:55:01.105, the last record
+        before the silence 08:55:15, the first after it 09:03:53.057 and
+        STOP_GO_MODE 115 ms later. The webview was asleep; the wall-clock
+        auto-end fired on wake. info, and the summary says so."""
+        b = self.arrived()
+        b.advance(14000).action("UPDATE_TRACKING_INTERVAL", {"interval": 30000})
+        b.advance(518000).action("POSITION_FETCHING", {})
+        b.advance(115).stop()
+        watch = self.run_stream(b)
+        hits = self.find(watch, "arrived-never-ended")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        hit = hits[0]
+        self.assertEqual(hit["severity"], "info")
+        self.assertTrue(hit["context"]["appSilent"])
+        self.assertEqual(hit["context"]["silentUntilMs"] -
+                         hit["context"]["silentFromMs"], 518000)
+        self.assertIn("suspended", hit["summary"])
+        self.assertIn("fires on wake", hit["summary"])
+
+    def test_a_silence_still_open_when_the_rule_fires_is_a_note(self):
+        """The live path: the rule fires at 270 s, long before the phone
+        wakes. The daemon's clock moves on another session's records."""
+        b = self.arrived()
+        other = StreamBuilder(session="other-session", t=b.t)
+        for _ in range((ride_watch.ARRIVED_NEVER_ENDED_MS + 30000) // 10000):
+            other.advance(10000).action("POSITION_FETCHING", {})
+        events = sorted(b.events + other.events, key=lambda e: e["t"])
+        watch = quiet_watch(self.tmp)
+        for ev in events:
+            watch.process(ev)
+        hits = self.find(watch, "arrived-never-ended")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        self.assertEqual(hits[0]["severity"], "info")
+        self.assertIsNone(hits[0]["context"]["silentUntilMs"])
+        self.assertIsNone(hits[0]["context"]["endedBy"])
+
+    def test_an_app_alive_when_the_dwell_fell_due_is_still_a_warn(self):
+        """Silence that starts AFTER 180 s does not excuse the app: it was
+        running when its timer fell due."""
+        b = self.arrived()
+        self.idle(b, ride_watch.CLIENT_AUTO_END_MS + 30000)
+        b.advance(ride_watch.ARRIVED_APP_SILENT_MS + 60000)
+        b.action("POSITION_FETCHING", {})
+        watch = self.run_stream(b)
+        hit = self.find(watch, "arrived-never-ended")[0]
+        self.assertEqual(hit["severity"], "warn")
+        self.assertFalse(hit["context"]["appSilent"])
+
+    def test_a_short_flush_gap_is_not_a_suspension(self):
+        """A 60 s hole (two missed polls) spanning the due moment is a slow
+        network, not a sleeping phone."""
+        b = self.arrived()
+        self.idle(b, ride_watch.CLIENT_AUTO_END_MS - 30000)
+        b.advance(60000).action("POSITION_FETCHING", {})
+        self.idle(b, 120000)
+        watch = self.run_stream(b)
+        hit = self.find(watch, "arrived-never-ended")[0]
+        self.assertEqual(hit["severity"], "warn")
 
     def test_it_says_when_the_fixes_are_still_arriving(self):
         """The other case, and it has a different fix: the timer is running
@@ -8633,6 +8698,159 @@ class TestArrivedNeverEnded(RuleTestCase):
         hits = self.find(watch, "arrived-never-ended")
         self.assertEqual([h["time"] for h in hits], ["21:46:20"])
         self.assertFalse(hits[0]["context"]["positionFixesStillArriving"])
+
+
+REAL_LOG_1008 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-10-08.jsonl")
+
+
+def replay_session(path, session, until_ms=None):
+    """A quiet watcher fed one session of a real day file, in file order."""
+    tmp = tempfile.mkdtemp(prefix="ride-watch-real-")
+    watch = quiet_watch(tmp)
+    with open(path) as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict) or obj.get("session") != session:
+                continue
+            if until_ms is not None and (obj.get("t") or 0) > until_ms:
+                continue
+            watch.process(obj)
+    return watch, tmp
+
+
+class TestRidingSetBeforeStart(RuleTestCase):
+    """40.1: the onboard flow sets the riding fact BEFORE START_GO_MODE.
+
+    2026-10-08 `muzhvcww-h8y7qw`: CONFIRM_VEHICLE + SET_RIDING {tripId
+    1:1268952, vehicleId 1:8147, legIndex -1} at 09:15:44.713, START_GO_MODE
+    at 09:16:07.290. The no-trip branch kept only fixes, so the trip read
+    "Riding: not aboard" for its whole bus leg. The app's START_GO_MODE reducer
+    keeps an evidenced fact and re-anchors it (reanchorRiding); so must we.
+    """
+
+    def onboard(self, payload=None, session=SESSION):
+        b = StreamBuilder(session=session)
+        b.action("BEGIN_ONBOARD_FLOW", {})
+        b.advance(3000).action("SET_RIDING", payload or {
+            "tripId": "1:100", "vehicleId": "1:900", "legIndex": -1,
+            "routeId": "1:5", "headsign": "Downtown", "boardedAt": b.t})
+        return b
+
+    def riding_at_start(self, b):
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips.get(SESSION)
+        self.assertIsNotNone(trip, "no trip opened")
+        return trip.riding
+
+    def test_a_fact_set_before_the_trip_is_adopted_and_anchored(self):
+        b = self.onboard()
+        b.advance(21000).start()
+        riding = self.riding_at_start(b)
+        self.assertIsNotNone(riding)
+        self.assertEqual(riding["vehicleId"], "1:900")
+        self.assertEqual(riding["tripId"], "1:100")
+        self.assertEqual(riding["legIndex"], 1)   # the bus leg, by tripId
+        self.assertEqual(riding["adoptedAtStartMs"] - riding["setAtMs"], 21000)
+
+    def test_it_anchors_by_route_when_the_trip_id_is_not_planned(self):
+        b = self.onboard({"tripId": "1:999", "vehicleId": "1:900",
+                          "legIndex": -1, "routeId": "1:5"})
+        b.advance(5000).start()
+        self.assertEqual(self.riding_at_start(b)["legIndex"], 1)
+
+    def test_an_unplanned_bus_stays_aboard_with_no_leg(self):
+        """reanchorRiding keeps the fact at -1: aboard, leg unknown."""
+        b = self.onboard({"tripId": "1:999", "vehicleId": "1:900",
+                          "legIndex": -1, "routeId": "1:77"})
+        b.advance(5000).start()
+        riding = self.riding_at_start(b)
+        self.assertIsNotNone(riding)
+        self.assertEqual(riding["legIndex"], -1)
+
+    def test_a_synthetic_route_vehicle_is_not_carried_in(self):
+        """ridingFactIsEvidenced: a `route:` id is a GPS-only guess, and the
+        app drops it on a fresh start (the 09-01 board that began the next
+        trip already aboard)."""
+        b = self.onboard({"tripId": "1:100", "vehicleId": "route:1:5",
+                          "legIndex": -1, "routeId": "1:5"})
+        b.advance(5000).start()
+        self.assertIsNone(self.riding_at_start(b))
+
+    def test_clear_riding_before_the_start_drops_it(self):
+        b = self.onboard()
+        b.advance(2000).action("CLEAR_RIDING", {})
+        b.advance(5000).start()
+        self.assertIsNone(self.riding_at_start(b))
+
+    def test_an_early_alight_before_the_start_drops_it(self):
+        b = self.onboard()
+        b.advance(2000).action("SET_EARLY_ALIGHT", {"tripId": "1:100"})
+        b.advance(5000).start()
+        self.assertIsNone(self.riding_at_start(b))
+
+    def test_a_null_set_riding_drops_it(self):
+        b = self.onboard()
+        b.advance(2000).events.append({
+            "type": "SET_RIDING", "payload": None, "t": b.t,
+            "session": SESSION, "recv": b.t / 1000.0, "kind": "action"})
+        b.advance(5000).start()
+        self.assertIsNone(self.riding_at_start(b))
+
+    def test_another_sessions_fact_is_not_adopted(self):
+        b = self.onboard(session="some-other-session")
+        b.session = SESSION
+        b.advance(5000).start()
+        self.assertIsNone(self.riding_at_start(b))
+
+    def test_it_is_adopted_once(self):
+        """A second trip on the same session starts clean unless the app sets
+        the fact again."""
+        b = self.onboard()
+        b.advance(5000).start()
+        b.advance(5000).stop()
+        b.advance(5000).start()
+        self.assertIsNone(self.riding_at_start(b))
+
+    def test_a_ride_already_open_still_takes_set_riding_directly(self):
+        b = StreamBuilder().start().advance(1000).riding(leg=1)
+        riding = self.riding_at_start(b)
+        self.assertEqual(riding["legIndex"], 1)
+        self.assertNotIn("adoptedAtStartMs", riding)
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_1008),
+                         "%s not present" % REAL_LOG_1008)
+    def test_the_real_1008_onboard_ride_opens_aboard_8147(self):
+        watch, tmp = replay_session(REAL_LOG_1008, "muzhvcww-h8y7qw",
+                                    until_ms=1791468968000)   # 09:16:08
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        trip = watch.trips.get("muzhvcww-h8y7qw")
+        self.assertIsNotNone(trip)
+        self.assertIsNotNone(trip.riding)
+        self.assertEqual(trip.riding["vehicleId"], "1:8147")
+        self.assertEqual(trip.riding["tripId"], "1:1268952")
+        self.assertEqual(trip.riding["legIndex"], 0)
+
+
+class TestArrivedNeverEndedReal1008(RuleTestCase):
+    """13.5 on the day it was re-measured: 10-08 ride 1 slept through its own
+    auto-end and fired it on wake. A note, not a warn."""
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_1008),
+                         "%s not present" % REAL_LOG_1008)
+    def test_the_real_0855_arrival_files_info(self):
+        watch, tmp = replay_session(REAL_LOG_1008, "muzhvcww-h8y7qw")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        watch.finalize_replay()
+        hits = self.find(watch, "arrived-never-ended")
+        self.assertEqual(len(hits), 1, [(h["time"], h["severity"])
+                                         for h in hits])
+        self.assertEqual(hits[0]["time"], "09:03:53")
+        self.assertEqual(hits[0]["severity"], "info")
+        self.assertTrue(hits[0]["context"]["appSilent"])
 
 
 class TestRealBugCountReadsTheTriageTable(RuleTestCase):
