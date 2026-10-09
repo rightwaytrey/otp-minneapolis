@@ -803,6 +803,28 @@ SESSION_RESTART_DEDUP_MS = 5 * 1000
 # A boot marker this close before the resume belongs to the same relaunch.
 SESSION_BOOT_PAIR_MS = 10 * 1000
 #
+# relaunch-other-install (44.1). 2026-10-08, ride mv03zgn5-s6x6bb on device
+# dev-mucordp1-bm86i7ym: the last record was UPDATE_PROGRESS at 17:48:14 at the
+# I-35W & 46th St platform, then nothing until 18:01:39, when a `bundle` boot
+# record came from a device id the daemon had never seen (dev-mv04qybg-08n856s6,
+# native 0.0.36, version `builtin`) with no RESUME_GO_MODE and no START_GO_MODE
+# after it. The dev app had come back wiped -- new web id, new Capgo Keychain id,
+# no downloaded bundles -- so it could not resume the ride, and the daemon, which
+# only matches a relaunch by session or device, let the trip time out at 18:03:17
+# with nothing filed. Same shape with the OTHER app: the rider opening the store
+# app (native 1.x) while the dev app's (0.0.x) ride has gone quiet.
+#
+# A warn, never a page. The boot record carries no position, so the match is
+# time only: the trip has been silent at least this long when the boot lands,
+# and not longer than SESSION_TIMEOUT_MS (past that the trip has ended anyway).
+# On the 10-08 day file the gap was 804 s; a relaunch of the SAME install keeps
+# its device id and is the session-restart rules' business, not this one's.
+RELAUNCH_OTHER_SILENT_MIN_MS = 60 * 1000
+# A device is "new" at its bundle record when its first record of any kind in
+# this process landed this close before it (record-mode / start come first, in
+# the same millisecond) and the persisted device_bundles has never named it.
+RELAUNCH_OTHER_NEW_DEVICE_MS = SESSION_BOOT_PAIR_MS
+#
 # action-storm (37.2). 2026-09-30 17:09-17:11, session muomy26h-g1zujp: 90
 # SET_ACTIVE_ITINERARY / 45 SET_VISIBLE_ITINERARY in 130 s, ending in
 # "RangeError: Maximum call stack size exceeded" at 17:11:39 and an 83 s silent
@@ -1444,6 +1466,22 @@ class Log:
 # ---------------------------------------------------------------------------
 
 
+def app_of_native(native):
+    """Which app a `native` version string belongs to, or None if unknown.
+
+    The dev app ships native 0.0.x (TransitNav Dev, org.rightwaytrey.transitnav
+    .dev); the App Store / TestFlight app and the Play build ship 1.x. Scripts
+    stamp 999.0.0 and are no app at all.
+    """
+    if not isinstance(native, str) or not native:
+        return None
+    if native.startswith("0.0."):
+        return "dev app"
+    if native.startswith("1."):
+        return "store app"
+    return None
+
+
 def fmt_hms(ms):
     if not ms:
         return "?"
@@ -2082,6 +2120,10 @@ class Trip:
         # collapse a boot-recovery line into a relaunch the rider never heard.
         self.restart_in_trip_ms = 0
         self.restart_in_trip_count = 0
+        # A boot from another install while this trip was silent (44.1): filed
+        # once a ride; later boots of the same kind only count.
+        self.relaunch_other_ms = None
+        self.relaunch_other_count = 0
         # note-unverifiable fires once a ride: the statement is about the
         # instrumentation, not about the note (17.11).
         self.note_unverifiable_fired = False
@@ -2160,6 +2202,10 @@ class RideWatch:
         os.makedirs(watch_dir, exist_ok=True)
         self.log = log or Log(os.path.join(watch_dir, "daemon.log"))
         self.trips = {}               # session -> Trip (active)
+        # device -> t of its first record in this process (44.1): what makes a
+        # device "never seen" at its boot record. Not persisted; the persisted
+        # device_bundles covers phones that booted before a daemon restart.
+        self.device_first_seen = {}
         self.all_findings = []        # every finding this process has emitted
         self.ended_trips = []         # Trip objects, for replay/test inspection
         self.recently_ended = {}      # session -> end_ms (blocks re-adoption)
@@ -2529,6 +2575,15 @@ class RideWatch:
 
         if self._is_duplicate_record(obj, t, session, kind, typ):
             return
+
+        device = obj.get("device")
+        if (isinstance(device, str) and device
+                and device not in self.device_first_seen):
+            self.device_first_seen[device] = t
+            if len(self.device_first_seen) > 64:
+                oldest = min(self.device_first_seen,
+                             key=self.device_first_seen.get)
+                del self.device_first_seen[oldest]
 
         trip = self.trips.get(session)
         if trip:
@@ -3193,6 +3248,8 @@ class RideWatch:
         """Session-scoped facts the app reports once per app start."""
         event = obj.get("event")
         if event == "bundle":
+            # Before _note_bundle, which would make the device "known".
+            self._rule_relaunch_other_install(session, t, obj)
             self._note_bundle(obj.get("device"), t, obj.get("version"),
                               obj.get("native"), source="bundle")
         elif event == "bundle_health":
@@ -6569,6 +6626,83 @@ class RideWatch:
             "page" if first else "warn", summary, ctx,
             push_body=("The app restarted while you were on %s. Check the trip"
                        " sheet still shows your bus." % route) if first else None)
+
+    def _rule_relaunch_other_install(self, session, t, obj):
+        """Another install booted while a live trip had gone silent (44.1).
+
+        2026-10-08 18:01:39: ride s6x6bb (device dev-mucordp1-bm86i7ym) had
+        been silent since 17:48:14 when a never-seen device booted the dev app
+        on `builtin` and opened no trip -- the app had come back as a fresh
+        install and the bus leg went untracked. The session-restart rules match
+        by session and device, so this boot belonged to no ride and the trip
+        timed out with nothing filed.
+
+        Fires on the boot's `bundle` record when, for an active trip on another
+        device that is not arrived: the trip has been silent for at least
+        RELAUNCH_OTHER_SILENT_MIN_MS (and less than SESSION_TIMEOUT_MS), and the
+        booting device is either never seen before or running the other app
+        (dev 0.0.x vs store 1.x, from `native`). One warn per ride, never a
+        page: by the time it is knowable the rider is already looking at an app
+        with no trip in it.
+        """
+        device = obj.get("device")
+        if not isinstance(device, str) or not device:
+            return
+        native = obj.get("native")
+        new_app = app_of_native(native)
+        first = self.device_first_seen.get(device)
+        never_seen = (device not in self.device_bundles
+                      and (first is None
+                           or t - first <= RELAUNCH_OTHER_NEW_DEVICE_MS))
+        for trip in self._active_trips():
+            if not trip.device or trip.device == device:
+                continue
+            if session in trip.sessions or trip.arrived_ms is not None:
+                continue
+            silent_ms = t - trip.last_event_ms
+            if (silent_ms < RELAUNCH_OTHER_SILENT_MIN_MS
+                    or silent_ms > SESSION_TIMEOUT_MS):
+                continue
+            trip_native = (trip.bundle_native
+                           or (self.device_bundles.get(trip.device) or {})
+                           .get("native"))
+            trip_app = app_of_native(trip_native)
+            other_app = bool(trip_app and new_app and trip_app != new_app)
+            if not never_seen and not other_app:
+                continue
+            trip.relaunch_other_count += 1
+            if trip.relaunch_other_ms is not None:
+                continue
+            trip.relaunch_other_ms = t
+            last = self.session_last_record.get(trip.session)
+            app = new_app or "unknown app"
+            if other_app:
+                what = ("the %s (native %s) opened instead of the %s this ride"
+                        " was on" % (app, native, trip_app))
+            else:
+                what = ("the %s came back as a new install (never-seen device"
+                        " %s, native %s, bundle %s)"
+                        % (app, device, native or "?",
+                           obj.get("version") or "?"))
+            summary = ("%s %ds after this ride went silent%s -- no trip in it,"
+                       " the rest of the ride is untracked"
+                       % (what, round(silent_ms / 1000.0),
+                          (" (last record %s %s)" % (fmt_hms(last[0]), last[1]))
+                          if last else ""))
+            self._finding(
+                trip, t, "relaunch-other-install", "warn", summary,
+                {"device": device, "session": session,
+                 "native": native if isinstance(native, str) else None,
+                 "app": new_app, "tripApp": trip_app,
+                 "version": obj.get("version"),
+                 "neverSeen": never_seen, "otherApp": other_app,
+                 "tripDevice": trip.device,
+                 "silentMs": silent_ms,
+                 "lastRecordMs": last[0] if last else None,
+                 "lastRecord": last[1] if last else None,
+                 "lastFix": list(trip.last_fix) if trip.last_fix else None,
+                 "legIndex": (trip.progress or {}).get("currentLegIndex"),
+                 "riding": trip.riding is not None})
 
     def _rule_session_restart_in_trip(self, session, t, obj, trip):
         """The app relaunched inside a live trip the rider was not aboard yet.
