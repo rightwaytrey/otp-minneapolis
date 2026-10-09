@@ -10528,5 +10528,280 @@ class TestRerouteStormSaysWhatWasRefused(RuleTestCase):
                          "4 re-plans in 5 min: 4 applied")
 
 
+
+# --- multiple stops (43.1) ---------------------------------------------------
+# The app's real shape, otprr gomode/multi-stop 17c751208: START_GO_MODE's
+# payload is {itinerary, multiStop, originalFrom, roundTrip} (beginGoMode,
+# lib/actions/go-mode.ts:1709) with multiStop = {index, roundTrip, segments,
+# stopNames} (lib/util/multi-stop.ts MultiStopPlan); arriving at a stop logs
+# the warn below right after SET_ARRIVED (go-mode.ts:7630); "Continue" is
+# endGoMode() -> STOP_GO_MODE then beginGoMode() -> START_GO_MODE, and the
+# segment warn after it (continueMultiStop, go-mode.ts:6339). One boot session
+# id throughout.
+
+MS_STOP = "Perennial Cycle"
+MS_DEST = "Micro Center"
+
+
+def multi_stop_payload(index, segments=2, stub=False, round_trip=None):
+    """A START_GO_MODE payload for segment `index` of a multi-stop trip."""
+    if stub:
+        # debug-log.js summarisePayload: an oversized full-capture payload
+        # (every segment's whole itinerary rides in multiStop.segments) is
+        # swapped for a shape hint with the keys and nothing else.
+        return {"__summary": True, "chars": 1180000,
+                "keys": ["itinerary", "multiStop", "originalFrom",
+                         "roundTrip"]}
+    seg0 = transit_itinerary()["itinerary"]
+    seg0["legs"][-1]["to"] = {"name": MS_STOP}
+    seg1 = replacement_itinerary()["itinerary"]
+    seg1["legs"][0]["from"] = {"name": MS_STOP}
+    seg1["legs"][-1]["to"] = {"name": MS_DEST}
+    segs = [seg0, seg1] + [replacement_itinerary(route_id="1:6",
+                                                 trip_id="1:60%d" % i,
+                                                 short="6")["itinerary"]
+                           for i in range(segments - 2)]
+    names = [MS_STOP] + ["Stop %d" % (i + 2) for i in range(segments - 2)] \
+        + [MS_DEST]
+    return {"itinerary": segs[index],
+            "multiStop": {"index": index, "roundTrip": None,
+                          "segments": segs, "stopNames": names},
+            "originalFrom": {"lat": 44.8168, "lon": -93.3101, "name": "Home"},
+            "roundTrip": round_trip}
+
+
+def ms_arrived_warn(b, stop=1, of=1, name=MS_STOP):
+    return b.console("warn", [
+        "[go-mode] multi-stop: arrived at stop %d of %d (%s); no auto-end,"
+        " waiting for the rider to continue" % (stop, of, name)])
+
+
+def ms_segment_warn(b, k=2, n=2, route="21"):
+    return b.console("warn", [
+        "[go-mode] multi-stop: segment %d of %d started fresh=true route=%s"
+        % (k, n, route)])
+
+
+class TestMultiStopPause(RuleTestCase):
+    """43.1's daemon half: a pause at a stop is not a trip that never ended.
+
+    Start segment 1 -> arrive at the stop -> pause -> Continue -> segment 2
+    -> arrive at the destination -> the app's 3-minute auto-end.
+    """
+
+    def segment_one(self, b=None, stub=False, segments=2):
+        b = b or StreamBuilder(device="dev-ms")
+        b.start(multi_stop_payload(0, segments=segments, stub=stub))
+        b.advance(1000).position().advance(500).progress(leg=0, prog=5.0)
+        b.advance(600000).position().advance(500).progress(
+            leg=2, prog=99.0, dest=12.0)
+        b.advance(15).action("SET_ARRIVED", b.t)
+        ms_arrived_warn(b.advance(2), of=segments - 1)
+        return b
+
+    def pause(self, b, ms, alive=True, step=30000):
+        """The errand. An app left open polls every 30 s (the arrived
+        tracking interval); a pocketed phone says nothing at all."""
+        if not alive:
+            return b.advance(ms)
+        done = 0
+        while done < ms:
+            b.advance(step).action("POSITION_FETCHING", {})
+            done += step
+        return b
+
+    def continue_(self, b, index=1, segments=2, stub=False, gap=420):
+        b.advance(900).stop()
+        b.advance(gap).start(multi_stop_payload(index, segments=segments,
+                                                stub=stub))
+        ms_segment_warn(b.advance(3), k=index + 1, n=segments)
+        return b
+
+    def final_leg(self, b, auto_end=True):
+        b.advance(1000).position().advance(500).progress(leg=0, prog=4.0)
+        b.advance(900000).position().advance(500).progress(
+            leg=2, prog=99.2, dest=20.0)
+        b.advance(15).action("SET_ARRIVED", b.t)
+        if auto_end:
+            b.advance(180000).console("warn", [
+                "[go-mode] auto-end: arrived 180s ago, ending the trip"])
+            b.advance(1).stop()
+        return b
+
+    def whole_ride(self, pause_ms=20 * 60000, alive=True, stub=False):
+        b = self.segment_one(stub=stub)
+        self.pause(b, pause_ms, alive=alive)
+        self.continue_(b, stub=stub)
+        return self.final_leg(b)
+
+    def test_read_multi_stop_reads_the_app_s_shape(self):
+        kind, plan = ride_watch.read_multi_stop(multi_stop_payload(1))
+        self.assertEqual(kind, "plan")
+        self.assertEqual(plan, {"index": 1, "segments": 2,
+                                "stopNames": [MS_STOP, MS_DEST]})
+        self.assertEqual(ride_watch.read_multi_stop(transit_itinerary()),
+                         ("none", None))
+        p = transit_itinerary()
+        p.update(multiStop=None, roundTrip=None, originalFrom=None)
+        self.assertEqual(ride_watch.read_multi_stop(p), ("none", None))
+        self.assertEqual(ride_watch.read_multi_stop(
+            multi_stop_payload(0, stub=True)), ("unknown", None))
+
+    def test_a_pause_at_a_stop_is_not_arrived_never_ended(self):
+        """Twenty minutes in the shop with the app open, polling every 30 s:
+        before 43.1 this filed arrived-never-ended at 270 s and the daemon
+        closed the ride at 5 min."""
+        watch = self.run_stream(self.whole_ride())
+        self.assertEqual(self.find(watch, "arrived-never-ended"), [],
+                         self.rules(watch))
+
+    def test_the_next_segment_continues_the_same_ride(self):
+        thread = StubThread()
+        watch = self.run_stream(self.whole_ride(), thread=thread)
+        self.assertEqual(len(watch.ended_trips), 1,
+                         [t.end_reason for t in watch.ended_trips])
+        trip = watch.ended_trips[0]
+        self.assertEqual(trip.end_reason, "stop")
+        self.assertEqual([i for _, i in trip.segments_started], [1])
+        self.assertEqual(trip.multi_stop["index"], 1)
+        self.assertEqual(len(thread.spawns), 1, thread.spawns)
+        self.assertEqual(len(thread.of_kind("end")), 1, thread.lines())
+        ledger = " | ".join(e.get("text", str(e)) if isinstance(e, dict)
+                            else str(e) for e in trip.thread_events)
+        self.assertIn("arrived at stop 1 of 1 (Perennial Cycle)", ledger)
+        self.assertIn("segment 2 of 2", ledger)
+        self.assertIn("arrived at destination", ledger)
+
+    def test_a_segment_start_is_not_a_swap_or_a_relaunch(self):
+        """No aboard-swap, no re-plan count, no relaunch warn — and the rider
+        rode a bus on segment 1, so the riding fact was set going in."""
+        b = StreamBuilder(device="dev-ms").start(multi_stop_payload(0))
+        b.advance(1000).position().advance(500).progress(leg=1, prog=20.0)
+        b.advance(500).vehicle_match().advance(10).riding()
+        b.advance(600000).progress(leg=2, prog=99.0, dest=10.0)
+        b.advance(15).action("SET_ARRIVED", b.t)
+        ms_arrived_warn(b.advance(2))
+        self.pause(b, 6 * 60000)
+        # The phone relaunched in the shop: the session is resumed under the
+        # same id (debug-log adoptSessionId), arrival and all.
+        b.advance(1000)._envelope(kind="session", event="resumed-session")
+        b.advance(3).action("RESUME_GO_MODE", {})
+        self.continue_(b)
+        self.final_leg(b)
+        watch = self.run_stream(b)
+        rules = self.rules(watch)
+        for rule in ("aboard-swap", "reroute-storm", "session-restart-in-trip",
+                     "session-restart-while-aboard", "itinerary-backwards",
+                     "resumed-trip", "session-churn", "action-storm",
+                     "arrived-never-ended"):
+            self.assertNotIn(rule, rules, rules)
+        trip = watch.ended_trips[0]
+        self.assertEqual(len(watch.ended_trips), 1)
+        self.assertIsNone(trip.riding)
+
+    def test_a_pocketed_phone_holds_the_ride_past_the_silence_timeout(self):
+        """An hour's errand with the webview asleep: SESSION_TIMEOUT_MS (15
+        min of silence) used to end the ride, and the next segment opened a
+        second one."""
+        watch = self.run_stream(self.whole_ride(pause_ms=60 * 60000,
+                                                alive=False))
+        self.assertEqual([t.end_reason for t in watch.ended_trips], ["stop"])
+        self.assertEqual(self.find(watch, "arrived-never-ended"), [])
+        self.assertEqual(self.find(watch, "gps-gap"), [])
+
+    def test_a_stubbed_payload_is_read_from_the_app_s_warns(self):
+        """Three stops' worth of segments can overflow the 1 MB full-capture
+        cap; the console warns carry the same facts."""
+        watch = self.run_stream(self.whole_ride(stub=True))
+        self.assertEqual(self.find(watch, "arrived-never-ended"), [],
+                         self.rules(watch))
+        self.assertEqual([t.end_reason for t in watch.ended_trips], ["stop"])
+        self.assertEqual(
+            [i for _, i in watch.ended_trips[0].segments_started], [1])
+
+    def test_three_segments_pause_twice(self):
+        b = self.segment_one(segments=3)
+        self.pause(b, 10 * 60000)
+        self.continue_(b, index=1, segments=3)
+        b.advance(1000).position().advance(500).progress(leg=0, prog=4.0)
+        b.advance(300000).progress(leg=2, prog=99.0, dest=8.0)
+        b.advance(15).action("SET_ARRIVED", b.t)
+        ms_arrived_warn(b.advance(2), stop=2, of=2, name="Stop 2")
+        self.pause(b, 10 * 60000)
+        self.continue_(b, index=2, segments=3)
+        self.final_leg(b)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "arrived-never-ended"), [])
+        self.assertEqual(len(watch.ended_trips), 1)
+        self.assertEqual(
+            [i for _, i in watch.ended_trips[0].segments_started], [1, 2])
+
+    def test_the_destination_arrival_is_unchanged(self):
+        """The LAST segment's arrival is an arrival: an app that never closes
+        it is still reported, and the watcher still closes it at 5 min."""
+        b = self.segment_one()
+        self.pause(b, 5 * 60000)
+        self.continue_(b)
+        self.final_leg(b, auto_end=False)
+        self.pause(b, ride_watch.ARRIVED_NEVER_ENDED_MS + 60000)
+        watch = self.run_stream(b)
+        hits = self.find(watch, "arrived-never-ended")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        self.assertEqual(hits[0]["severity"], "warn")
+        self.assertEqual([t.end_reason for t in watch.ended_trips],
+                         ["arrived"])
+
+    def test_stop_at_a_stop_ends_the_ride_at_the_stop(self):
+        """The rider tapped Stop on the arrival card and went home: no next
+        START comes. The ride ends at the STOP, as any stopped trip does."""
+        b = self.segment_one()
+        self.pause(b, 3 * 60000)
+        b.advance(1000).stop()
+        stop_ms = b.t
+        b.advance(5 * 60000).action("POSITION_FETCHING", {})
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual([(t.end_reason, t.end_ms) for t in watch.ended_trips],
+                         [("stop", stop_ms)])
+        self.assertEqual(self.find(watch, "arrived-never-ended"), [])
+        # ...and at replay EOF the same, with nothing after the STOP.
+        b2 = self.segment_one(StreamBuilder(session="ms-eof"))
+        b2.advance(1000).stop()
+        watch2 = self.run_stream(b2)
+        self.assertEqual([t.end_reason for t in watch2.ended_trips], ["stop"])
+
+    def test_an_unrelated_trip_after_a_stop_is_a_new_ride(self):
+        b = self.segment_one()
+        self.pause(b, 2 * 60000)
+        b.advance(1000).stop()
+        stop_ms = b.t
+        b.advance(20000).start(transit_itinerary())   # multiStop absent
+        b.advance(1000).position()
+        watch = self.run_stream(b)
+        self.assertEqual([(t.end_reason, t.end_ms) for t in
+                          watch.ended_trips][:1], [("stop", stop_ms)])
+        self.assertEqual(len(watch.ended_trips), 2)
+        self.assertIsNone(watch.ended_trips[1].multi_stop)
+
+    def test_a_pause_past_the_app_s_resume_window_closes_the_ride(self):
+        b = self.segment_one()
+        b.advance(ride_watch.MULTI_STOP_PAUSE_MAX_MS + 60000)
+        b.action("POSITION_FETCHING", {})
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual([t.end_reason for t in watch.ended_trips],
+                         ["timeout"])
+        self.assertEqual(self.find(watch, "arrived-never-ended"), [])
+
+    def test_a_round_trip_on_the_last_segment_is_carried(self):
+        b = self.segment_one()
+        self.pause(b, 60000)
+        b.advance(900).stop()
+        b.advance(400).start(multi_stop_payload(1, round_trip={
+            "destination": {"name": "Home"}, "returnItinerary": {"legs": []}}))
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips[SESSION]
+        self.assertTrue(trip.round_trip)
+        self.assertIsNone(trip.stop_pause)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

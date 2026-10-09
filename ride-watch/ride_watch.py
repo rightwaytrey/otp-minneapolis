@@ -293,6 +293,39 @@ ARRIVED_APP_SILENT_MS = 120 * 1000
 # 09-20 and 09-21 latched at 74.2 m and 73.7 m — the 75 m branch working
 # correctly — and neither fires.
 ARRIVAL_RADIUS_M = 75.0
+# Multiple stops (43.1; otprr gomode/multi-stop 17c751208). Go Mode guides a
+# trip through the rider's stops one SEGMENT at a time, and arriving at a stop
+# that is not the destination is a pause for an errand of unknown length, not
+# the end of the ride: the app refuses its 3-minute auto-end there
+# (armAutoEndTimer, `hasNextSegment(goMode.multiStop)`), keeps the trip
+# resumable for MULTI_STOP_PAUSE_MAX_MS (session-persistence.ts), and when the
+# rider taps "Continue to <next>" ends the segment and starts the next one
+# (continueMultiStop: endGoMode() -> STOP_GO_MODE, then beginGoMode() ->
+# START_GO_MODE carrying `multiStop {index, segments, stopNames}`), all under
+# the same boot session id. Before this, the daemon read the pause as
+# arrived-never-ended at 270 s, closed the ride at ARRIVED_END_MS, and took the
+# next segment for a new ride with its own thread and report.
+#
+# Two signals, because START_GO_MODE's payload is full only while it fits
+# MAX_FULL_PAYLOAD_CHARS (1,000,000; otprr debug-log.js) and `multiStop.segments`
+# carries every segment's whole itinerary — 148-220 KB each on the 10-08 rides,
+# so three stops can push it into the `{__summary, keys}` stub. The app also
+# logs, at warn so the sink carries it:
+#   "[go-mode] multi-stop: arrived at stop N of M (<name>); no auto-end, ..."
+#   "[go-mode] multi-stop: segment K of S started fresh=<bool> route=<...>"
+MULTI_STOP_ARRIVED_RE = re.compile(
+    r"\[go-mode\] multi-stop: arrived at stop (\d+) of (\d+)"
+    r"(?: \((.*)\);)?")
+MULTI_STOP_SEGMENT_RE = re.compile(
+    r"\[go-mode\] multi-stop: segment (\d+) of (\d+) started")
+# STOP_GO_MODE -> START_GO_MODE of the next segment. continueMultiStop fetches
+# the fresh segment plan BEFORE it dispatches endGoMode, so the two land
+# milliseconds apart; a STOP at a stop with no next START inside this window is
+# the rider stopping the trip there, and it ends at the STOP.
+SEGMENT_HANDOFF_MS = 60 * 1000
+# otprr session-persistence.ts MULTI_STOP_PAUSE_MAX_MS: past this the app will
+# not resume the paused trip, so neither does the daemon hold it open.
+MULTI_STOP_PAUSE_MAX_MS = 4 * 60 * 60 * 1000
 # One ride, two session ids. The app re-mounted at 18:52:55 and minted
 # `mthw8o2w-i8z1i6` 41 s after `mthw7svy-s4msqc` — same phone, same itinerary,
 # same frozen leg, seconds apart. The daemon read them as two rides: two
@@ -1760,6 +1793,33 @@ def leg_from_stop_id(leg):
     return sid if isinstance(sid, str) and sid else None
 
 
+def read_multi_stop(payload):
+    """What a START_GO_MODE payload says about multiple stops (43.1).
+
+    ("plan", {"index", "segments", "stopNames"}) for a segment of a multi-stop
+    trip; ("none", None) when the payload is whole and says it is not one —
+    every real START carries the `multiStop` key since beginGoMode passes it,
+    null for an ordinary trip; ("unknown", None) when the payload cannot say:
+    the `{__summary, keys}` stub an oversized payload is swapped for, or
+    anything that is not a dict.
+    """
+    if not isinstance(payload, dict) or payload.get("__summary") \
+            or not isinstance(payload.get("itinerary"), dict):
+        return "unknown", None
+    ms = payload.get("multiStop")
+    if not isinstance(ms, dict):
+        return "none", None
+    segments = ms.get("segments")
+    index = ms.get("index")
+    n = len(segments) if isinstance(segments, list) else None
+    if not isinstance(index, int) or not n or n < 2:
+        return "none", None
+    names = ms.get("stopNames")
+    names = [str(x) if x is not None else None for x in names] \
+        if isinstance(names, list) else []
+    return "plan", {"index": index, "segments": n, "stopNames": names}
+
+
 def summarize_itinerary(payload):
     """Compact leg summary from a START_GO_MODE payload; None if unavailable."""
     if not isinstance(payload, dict):
@@ -1898,6 +1958,17 @@ class Trip:
         # of the journey, and the app is right to latch it early-ish. The
         # stream marks it and arrived-far-from-destination steps aside.
         self.round_trip = False
+        # Multiple stops (43.1): {"index", "segments", "stopNames"} of the
+        # segment being guided, from START_GO_MODE's `multiStop` (or inferred
+        # from the app's console warns when the payload was stubbed); None for
+        # an ordinary trip. `stop_pause` is set while the rider is paused at a
+        # stop that is not the destination — arrival latched, next segment
+        # still to come — and `segment_stop_ms` holds the STOP_GO_MODE that
+        # ended the segment until the next one's START arrives.
+        self.multi_stop = None
+        self.stop_pause = None
+        self.segment_stop_ms = None
+        self.segments_started = []                # (tMs, 0-based index)
         # The last position fix with its metadata: (tMs, lat, lon, accuracy).
         # last_fix above is the coordinate alone and is reset by rules that do
         # not care when it arrived; position-teleport needs the pair.
@@ -2483,7 +2554,11 @@ class RideWatch:
         if typ == "START_GO_MODE":
             self._on_start_go_mode(session, t, obj)
         elif typ == "STOP_GO_MODE":
-            if trip:
+            if trip and self._paused_at_stop(trip):
+                # "Continue to <next>" ends the segment before it starts the
+                # next one (43.1). Held, not ended: the next START decides.
+                self._note_segment_stop(trip, t)
+            elif trip:
                 self._end_trip(trip, t, "stop")
         elif kind in ("boot-error", "boot-rejection"):
             # Keyed on `kind`, because there is no `typ` to key on: the crash
@@ -2559,6 +2634,7 @@ class RideWatch:
             if kind == "console":
                 self._rule_console(trip, t, obj)
                 self._rule_wake_lock_denied(trip, t, obj)
+                self._on_multi_stop_console(trip, t, obj)
             elif typ == "UPDATE_POSITION":
                 # The fix's own clock, not the action's and emphatically not
                 # the daemon's (19.2 — fix_time_ms says which and why).
@@ -2653,8 +2729,24 @@ class RideWatch:
         payload = obj.get("payload") or {}
         summary = summarize_itinerary(payload)
         trip = self.trips.get(session)
+        ms_kind, ms_plan = read_multi_stop(payload)
+        if trip is not None and self._paused_at_stop(trip):
+            if self._is_next_segment(trip, ms_kind, ms_plan):
+                self._start_next_segment(trip, t, payload, summary, ms_plan)
+                self._flush_pending_onboard(trip)
+                self._rule_itinerary_backwards(trip, t, summary)
+                self._rule_same_route_transfer(trip, t)
+                self._mark_dirty()
+                return
+            if trip.segment_stop_ms is not None:
+                # Stopped at a stop and then started something that is not
+                # the next segment: the multi-stop ride ended at that STOP.
+                self._end_trip(trip, trip.segment_stop_ms, "stop")
+                trip = None
         if trip is None:
             trip = Trip(session, t, summary)
+            if ms_kind == "plan":
+                trip.multi_stop = ms_plan
             # The rider asked for a ride under this id: whatever we decided
             # about the last one is history.
             self.ended_arrived.discard(session)
@@ -2694,6 +2786,12 @@ class RideWatch:
             self._clear_arrival(trip, t, "itinerary swap")
             if payload.get("roundTrip"):
                 trip.round_trip = True
+            # beginGoMode carries the live trip's plan into every re-plan of a
+            # segment and an explicit null clears it, as the reducer does.
+            if ms_kind == "plan":
+                trip.multi_stop = ms_plan
+            elif ms_kind == "none":
+                trip.multi_stop = None
             trip.swap_seq += 1
             trip.swap_times.append(t)
             if summary is not None:
@@ -3616,9 +3714,180 @@ class RideWatch:
         trip.arrived_never_ended_fired = False
         trip.arrived_silence = None
         self.log.info("arrived (%s): session=%s" % (source, trip.session))
-        self._thread_event(trip, t, "arrived at destination")
+        ms = trip.multi_stop
+        if ms and ms["index"] < ms["segments"] - 1:
+            self._begin_stop_pause(trip, t, ms["index"] + 1,
+                                   ms["segments"] - 1,
+                                   self._stop_name(ms, ms["index"]), source)
+        else:
+            self._thread_event(trip, t, "arrived at destination")
+        # Still asked at a stop: the segment's own last leg ends there, so the
+        # app's distanceToDestination is to the stop and a far latch is as
+        # wrong there as at the destination. Only the round trip is excused.
         self._rule_arrived_far_from_destination(trip, t, source)
         self._mark_dirty()
+
+    # -- multiple stops (43.1) ----------------------------------------------
+
+    @staticmethod
+    def _stop_name(ms, index):
+        names = (ms or {}).get("stopNames") or []
+        return names[index] if 0 <= index < len(names) else None
+
+    def _paused_at_stop(self, trip):
+        """Arrived at a stop of a multi-stop trip that is not the destination."""
+        return trip.stop_pause is not None and trip.arrived_ms is not None
+
+    def _begin_stop_pause(self, trip, t, stop, of, name, source):
+        if trip.stop_pause is not None:
+            if name and not trip.stop_pause.get("name"):
+                trip.stop_pause["name"] = name
+            return
+        trip.stop_pause = {"stop": stop, "of": of, "name": name,
+                           "tMs": t, "source": source}
+        self.log.info("paused at stop %d of %d (%s): session=%s"
+                      % (stop, of, name or "?", trip.session))
+        self._thread_event(
+            trip, t, "arrived at stop %d of %d%s — a pause, not the end;"
+            " the ride goes on when the rider continues"
+            % (stop, of, (" (%s)" % name) if name else ""))
+        self._mark_dirty()
+
+    def _on_multi_stop_console(self, trip, t, obj):
+        """The app's own multi-stop warns, read when the payload could not be.
+
+        Both come straight after the fact they describe: the arrival warn
+        follows SET_ARRIVED in the same tick, the segment warn follows the
+        next segment's START_GO_MODE. So they only ever fill in what a stubbed
+        START_GO_MODE payload left unknown.
+        """
+        if obj.get("level") != "warn":
+            return
+        args = obj.get("args") or []
+        msg = args[0] if args else None
+        if not isinstance(msg, str) or "[go-mode] multi-stop:" not in msg:
+            return
+        m = MULTI_STOP_ARRIVED_RE.search(msg)
+        if m:
+            stop, of, name = int(m.group(1)), int(m.group(2)), m.group(3)
+            if name == "?":
+                name = None
+            if trip.multi_stop is None:
+                trip.multi_stop = {"index": stop - 1, "segments": of + 1,
+                                   "stopNames": []}
+            if trip.arrived_ms is None:
+                self._note_arrival(trip, t, "multi-stop warn")
+            self._begin_stop_pause(trip, t, stop, of, name, "multi-stop warn")
+            return
+        m = MULTI_STOP_SEGMENT_RE.search(msg)
+        if m:
+            k, n = int(m.group(1)), int(m.group(2))
+            ms = trip.multi_stop or {"stopNames": []}
+            if ms.get("index") != k - 1 or ms.get("segments") != n:
+                self.log.info("multi-stop segment %d of %d (from the app's"
+                              " warn): session=%s" % (k, n, trip.session))
+            trip.multi_stop = dict(ms, index=k - 1, segments=n)
+
+    def _note_segment_stop(self, trip, t):
+        """STOP_GO_MODE while paused at a stop: hold it for the next START."""
+        trip.segment_stop_ms = t
+        self.log.info("STOP_GO_MODE at stop %d of %d held for the next"
+                      " segment: session=%s"
+                      % (trip.stop_pause["stop"], trip.stop_pause["of"],
+                         trip.session))
+        self._mark_dirty()
+
+    def _is_next_segment(self, trip, ms_kind, ms_plan):
+        """Is this START the next segment of the trip paused at a stop?
+
+        A whole payload answers for itself. A stubbed one is taken as the next
+        segment only behind the STOP that "Continue" dispatches first — the
+        one shape the app produces for it.
+        """
+        if ms_kind == "plan":
+            return ms_plan["index"] == trip.stop_pause["stop"]
+        if ms_kind == "unknown":
+            return trip.segment_stop_ms is not None
+        return False
+
+    # Ride-scoped: survive a segment change. Everything else on Trip is about
+    # the segment being guided — its legs, its bus, its arrival — and starts
+    # over the way the app's own state does (endGoMode wipes the goMode slice
+    # and the next segment enters through beginGoMode like any trip).
+    SEGMENT_KEEPS = frozenset((
+        "session", "sessions", "device", "bundle", "bundle_native",
+        "start_ms", "adopted", "swap_seq", "swap_times", "last_event_ms",
+        "findings", "pages_sent", "pending_pages", "pending_until_ms",
+        "thread", "thread_events", "thread_cursor", "thread_pushes",
+        "last_thread_push_ms", "notes", "report_path", "console_seen",
+        "searches", "last_rider_action_ms", "wake_lock_bursts",
+        "restart_aboard_count", "restart_in_trip_count", "teleport_paged",
+        "multi_stop", "segments_started",
+    ))
+
+    def _start_next_segment(self, trip, t, payload, summary, ms_plan):
+        """"Continue to <next>": the same ride, its next segment. (43.1)
+
+        Not an itinerary swap: nothing was re-planned under the rider, so
+        neither aboard-swap nor the re-plan counters see it. The segment just
+        finished gets the verdicts a trip end would have given it, then the
+        segment state starts over — what the next segment does is judged on
+        its own legs, as the app judges it.
+        """
+        prev = trip.multi_stop or {}
+        pause = trip.stop_pause or {}
+        if ms_plan is not None:
+            ms = ms_plan
+        else:
+            ms = dict(prev, index=prev.get("index", pause.get("stop", 1) - 1)
+                      + 1)
+        held_ms = trip.segment_stop_ms
+        paused_ms = t - (pause.get("tMs") or t)
+        # What _end_trip would have filed for the finished segment.
+        self._rule_vehicle_match_never(trip, t)
+        self._flush_wake_lock(trip, t, force=True)
+        fresh = Trip(trip.session, t, summary)
+        for attr, value in vars(fresh).items():
+            if attr not in self.SEGMENT_KEEPS:
+                setattr(trip, attr, value)
+        trip.itinerary = summary
+        trip.multi_stop = ms
+        trip.round_trip = bool(payload.get("roundTrip")) \
+            if isinstance(payload, dict) else False
+        # A new itinerary all the same: leg-indexed state keyed on swap_seq
+        # must not carry over from the last segment's leg 0.
+        trip.swap_seq += 1
+        trip.swap_times.append(t)
+        trip.segments_started.append((t, ms["index"]))
+        self.log.info(
+            "multi-stop segment %d of %s started: session=%s paused %ds%s -> %s"
+            % (ms["index"] + 1, ms.get("segments", "?"), trip.session,
+               paused_ms // 1000,
+               (" (STOP %dms before)" % (t - held_ms)) if held_ms else "",
+               itinerary_one_liner(summary)))
+        self._thread_event(
+            trip, t, "continued after %dm%02ds at stop %s: segment %d of %s ->"
+            " %s" % (paused_ms // 60000, (paused_ms // 1000) % 60,
+                     pause.get("name") or pause.get("stop", "?"),
+                     ms["index"] + 1, ms.get("segments", "?"),
+                     itinerary_one_liner(summary)))
+
+    def _check_stop_pause(self, trip, now):
+        """The timer half of a pause at a stop. True when it ended the ride."""
+        if (trip.segment_stop_ms is not None
+                and now - trip.segment_stop_ms > SEGMENT_HANDOFF_MS):
+            # The rider stopped the trip at the stop: no next segment came.
+            self._end_trip(trip, trip.segment_stop_ms, "stop")
+            return True
+        if now - trip.arrived_ms > MULTI_STOP_PAUSE_MAX_MS:
+            self._thread_event(
+                trip, now, "paused at stop %d of %d for over %dh — the app no"
+                " longer resumes it; ride closed"
+                % (trip.stop_pause["stop"], trip.stop_pause["of"],
+                   MULTI_STOP_PAUSE_MAX_MS // 3600000))
+            self._end_trip(trip, now, "timeout")
+            return True
+        return False
 
     def _rule_arrived_far_from_destination(self, trip, t, source):
         """"You have arrived" while the app's own tick says they have not. (21.2)
@@ -3724,6 +3993,11 @@ class RideWatch:
         """
         if trip.arrived_ms is None or trip.arrived_never_ended_fired:
             return
+        if trip.stop_pause is not None:
+            # Paused at a stop of a multi-stop trip (43.1): the app refuses
+            # its auto-end there on purpose, and the ride goes on when the
+            # rider continues. Not an arrival the app failed to close.
+            return
         if ending == "stop":
             return                      # STOP_GO_MODE: the client did close it
         open_ms = t - trip.arrived_ms
@@ -3796,6 +4070,8 @@ class RideWatch:
         trip.arrived_never_ended_fired = False
         trip.arrived_silence = None
         trip.arrived_far_fired = False
+        trip.stop_pause = None
+        trip.segment_stop_ms = None
         self._thread_event(trip, t, "ride resumed after arrival (%s)" % why)
         self._mark_dirty()
 
@@ -5268,6 +5544,15 @@ class RideWatch:
         """
         now = self.now_ms()
         for trip in self._active_trips():
+            if self._paused_at_stop(trip):
+                # Paused at a stop of a multi-stop trip (43.1): an errand of
+                # any length, phone pocketed or not. None of the silence,
+                # arrival or leg timers below has anything to say about it.
+                if self._check_stop_pause(trip, now):
+                    continue
+                self._flush_pages(trip, now)
+                self._flush_wake_lock(trip, now)
+                continue
             if now - trip.last_event_ms > SESSION_TIMEOUT_MS:
                 self._end_trip(trip, trip.last_event_ms, "timeout")
                 continue
@@ -9546,6 +9831,10 @@ class RideWatch:
         # window there is; an error that has not arrived by now never will.
         self._check_pending_notes(self.now_ms(), force=True)
         for trip in self._active_trips():
+            if self._paused_at_stop(trip) and trip.segment_stop_ms is not None:
+                # Stopped at a stop and nothing followed: the STOP ended it.
+                self._end_trip(trip, trip.segment_stop_ms, "stop")
+                continue
             self._end_trip(trip, trip.last_event_ms, "replay-eof")
         # Bursts that never had a trip to be closed by. EOF is the end of the
         # quiet window by definition; without this a replay of a rider who
