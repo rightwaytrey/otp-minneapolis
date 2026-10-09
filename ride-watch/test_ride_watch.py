@@ -10475,6 +10475,132 @@ class TestSessionRestartInTrip(RuleTestCase):
         self.assertEqual(self.find(watch, "session-restart-in-trip"), [])
 
 
+class TestRelaunchOtherInstall(RuleTestCase):
+    """44.1: the app came back as a fresh install mid-ride, with no trip.
+
+    2026-10-08, ride mv03zgn5-s6x6bb on dev-mucordp1-bm86i7ym: last record
+    UPDATE_PROGRESS 17:48:14 at the platform, then at 18:01:39 a `bundle`
+    boot record from never-seen device dev-mv04qybg-08n856s6 (native 0.0.36,
+    version `builtin`), no RESUME and no START after it. Nothing was filed and
+    the trip timed out at 18:03:17.
+    """
+
+    RIDE_DEVICE = "dev-mucordp1-bm86i7ym"
+
+    def ride(self, native="0.0.36", silent_ms=805000):
+        b = StreamBuilder(device=self.RIDE_DEVICE)
+        b.bundle(version="2026.1008.1", native=native)
+        b.advance(3000).start().advance(1000).progress(leg=1, stops=5)
+        b.advance(60000).progress(leg=1, stops=5, prog=100.0)
+        b.advance(silent_ms)
+        return b
+
+    def boot(self, b, device, native="0.0.36", version="builtin",
+             session="fresh-install"):
+        b.session, b.device = session, device
+        b._envelope(kind="session", event="record-mode")
+        b._envelope(kind="session", event="start")
+        b.bundle(version=version, native=native)
+        b.advance(2000)._envelope(kind="session", event="bundle_apply",
+                                  bundle=version, outcome="none-pending")
+        return b
+
+    def test_the_1008_fresh_install_warns(self):
+        """Fails on master: a boot on another device belonged to no ride."""
+        b = self.boot(self.ride(), "dev-mv04qybg-08n856s6")
+        # ...and a second fresh id 3 s later, as on 10-08 (mv0555x2-51mog9)
+        b.advance(3000)
+        self.boot(b, "dev-mv0555x2-19rku05o", version="2026.1008.1",
+                  session="second-boot")
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "relaunch-other-install")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        f = found[0]
+        self.assertEqual(f["severity"], "warn")
+        self.assertEqual(f["context"]["device"], "dev-mv04qybg-08n856s6")
+        self.assertEqual(f["context"]["app"], "dev app")
+        self.assertTrue(f["context"]["neverSeen"])
+        self.assertFalse(f["context"]["otherApp"])
+        self.assertEqual(f["context"]["silentMs"], 805000)
+        self.assertEqual(f["context"]["lastRecord"], "UPDATE_PROGRESS")
+        self.assertIn("dev app came back as a new install", f["summary"])
+        self.assertIn("805s", f["summary"])
+        trip = watch.trips[SESSION]
+        self.assertEqual(trip.relaunch_other_count, 2)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    def test_the_store_app_opening_names_it(self):
+        """The rider opens the App Store app (1.x) while the dev ride is quiet.
+        The store app's device id is known (it booted earlier), so only the
+        app switch can make this a finding."""
+        b = StreamBuilder(device="store-phone", session="earlier")
+        b.bundle(version="2026.0924.1", native="1.0.56")
+        b.advance(60000)
+        b.session, b.device = SESSION, self.RIDE_DEVICE
+        b.bundle(version="2026.1008.1", native="0.0.36")
+        b.advance(3000).start().advance(1000).progress(leg=1, stops=5)
+        b.advance(300000)
+        self.boot(b, "store-phone", native="1.0.56", version="2026.0924.1",
+                  session="store-boot")
+        watch = self.run_stream(b, finalize=False)
+        found = self.find(watch, "relaunch-other-install")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        f = found[0]
+        self.assertEqual(f["context"]["app"], "store app")
+        self.assertEqual(f["context"]["tripApp"], "dev app")
+        self.assertFalse(f["context"]["neverSeen"])
+        self.assertTrue(f["context"]["otherApp"])
+        self.assertIn("store app (native 1.0.56) opened instead of the dev"
+                      " app", f["summary"])
+
+    def test_same_install_relaunch_is_not_this_rule(self):
+        """Same device id: the session-restart rules own it."""
+        b = self.boot(self.ride(), self.RIDE_DEVICE, version="2026.1008.1")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "relaunch-other-install"), [])
+
+    def test_trip_still_talking_is_not_silent(self):
+        b = self.boot(self.ride(silent_ms=20000), "dev-brand-new")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "relaunch-other-install"), [])
+
+    def test_known_device_same_app_says_nothing(self):
+        """A second phone the daemon already knows, on the same app."""
+        b = StreamBuilder(device="other-dev-phone", session="earlier")
+        b.bundle(version="2026.1008.1", native="0.0.36")
+        b.advance(60000)
+        b.session, b.device = SESSION, self.RIDE_DEVICE
+        b.bundle(version="2026.1008.1", native="0.0.36")
+        b.advance(3000).start().advance(1000).progress(leg=1, stops=5)
+        b.advance(300000)
+        self.boot(b, "other-dev-phone", version="2026.1008.1",
+                  session="other-boot")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "relaunch-other-install"), [])
+
+    def test_nothing_after_arrival(self):
+        b = StreamBuilder(device=self.RIDE_DEVICE)
+        b.bundle(version="2026.1008.1", native="0.0.36")
+        b.advance(3000).start().advance(1000).progress(leg=1, stops=5)
+        b.advance(1000).action("SET_ARRIVED", {}).advance(120000)
+        self.boot(b, "dev-brand-new")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "relaunch-other-install"), [])
+
+    def test_no_trip_no_finding(self):
+        b = StreamBuilder(device=self.RIDE_DEVICE)
+        b.bundle(version="2026.1008.1", native="0.0.36").advance(300000)
+        self.boot(b, "dev-brand-new")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "relaunch-other-install"), [])
+
+    def test_app_of_native(self):
+        self.assertEqual(ride_watch.app_of_native("0.0.36"), "dev app")
+        self.assertEqual(ride_watch.app_of_native("1.0.56"), "store app")
+        self.assertIsNone(ride_watch.app_of_native("999.0.0"))
+        self.assertIsNone(ride_watch.app_of_native(None))
+
+
 class TestRerouteStormSaysWhatWasRefused(RuleTestCase):
     """37.2 (iii): 2026-09-30 17:35:46 read "4 reroutes within 5 min" when
     three re-plans had been refused (`arrives-later`) and one applied."""
