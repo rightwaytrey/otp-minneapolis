@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""The pipeline board's database, for the agents (2026-10-09; replaces the
+ArtifactData tool now that the board is self-hosted). Same shapes as before:
+documents at <collection>/<doc>, a version on every read, and a write pinned
+with --if-version is refused (exit 3, prints the current version) if the
+document changed since you read it.
+
+  pipeline-db get cycles/c15                    -> {"exists", "data", "version"}
+  pipeline-db list cycles                       -> {"docs": [{"id","data","version"}]}
+  pipeline-db update cycles/c15 --file f.json [--if-version N]   (merge; arrays replace;
+                                                 {"__delete__": true} removes a key)
+  pipeline-db set    cycles/c15 --file f.json [--if-version N]   (replace)
+  pipeline-db update cycles/c15 --data '{"steps":{"verify":{"status":"running"}}}'
+  pipeline-db press  "START verify — cycle 15 (last ride)" [--key verify:1791…]
+"""
+import argparse
+import json
+import sys
+import urllib.request
+import urllib.error
+
+BASE = "http://127.0.0.1:8098"
+
+
+def call(path, body=None):
+    req = urllib.request.Request(BASE + path, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json"}, method="POST" if body is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+
+p = argparse.ArgumentParser()
+sub = p.add_subparsers(dest="cmd", required=True)
+g = sub.add_parser("get"); g.add_argument("path")
+l = sub.add_parser("list"); l.add_argument("collection")
+for name in ("set", "update"):
+    w = sub.add_parser(name); w.add_argument("path"); w.add_argument("--file"); w.add_argument("--data"); w.add_argument("--if-version", type=int)
+pr = sub.add_parser("press"); pr.add_argument("text"); pr.add_argument("--key")
+a = p.parse_args()
+
+if a.cmd == "get":
+    code, j = call("/api/doc?path=" + a.path)
+elif a.cmd == "list":
+    code, j = call("/api/list?path=" + a.collection)
+elif a.cmd in ("set", "update"):
+    data = json.load(open(a.file)) if a.file else json.loads(a.data or "{}")
+    code, j = call("/api/write", {"path": a.path, "op": a.cmd, "data": data, "if_version": a.if_version})
+else:
+    code, j = call("/api/press", {"text": a.text, "key": a.key})
+
+print(json.dumps(j, ensure_ascii=False, indent=1))
+sys.exit(0 if code == 200 else 3 if code == 409 else 1)

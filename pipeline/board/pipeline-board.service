@@ -1,0 +1,15 @@
+[Unit]
+Description=TransitNav Pipeline board (self-hosted, 127.0.0.1:8098; tailnet https :9600)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u %h/pipeline-board/server.py
+WorkingDirectory=%h/pipeline-board
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=3
+# ttyds it spawns outlive a restart (the page's terminals stay connected)
+KillMode=process
+
+[Install]
+WantedBy=default.target

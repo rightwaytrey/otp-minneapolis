@@ -1,0 +1,2101 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>TransitNav Pipeline</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  #pv-classic {
+    --bg: #F2F4F1; --surface: #FFFFFF; --surface-2: #EEF1EE; --surface-3: #E4E9E5;
+    --ink: #1A2321; --ink-2: #4C5754; --ink-3: #7B8682;
+    --line: #D9DFDB; --line-2: #BFC8C3;
+    --accent: #0B6E6A; --accent-ink: #FFFFFF; --accent-soft: #DCEFEC; --accent-line: #7FBFB8;
+    --requested: #B4620A; --requested-soft: #FBEBD6;
+    --running: #2159C9; --running-soft: #DCE7FB;
+    --done: #1F7A3F; --done-soft: #DCF2E3;
+    --bad: #B4271F; --bad-soft: #F9E0DD;
+    --hold: #7A5A00; --hold-soft: #F6ECC8;
+    --sb: #1A2321; --sb-ink: #C9D3CE; --sb-ink-2: #7E8B86; --sb-on: #E8EEEA; --sb-hi: rgba(255,255,255,.08);
+    --shadow: 0 1px 2px rgba(26,35,33,.06), 0 8px 24px rgba(26,35,33,.08);
+    --drawer-shadow: -8px 0 32px rgba(26,35,33,.18);
+    --font: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+    --mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) #pv-classic {
+      --bg: #121817; --surface: #1A2220; --surface-2: #202A28; --surface-3: #283330;
+      --ink: #E8EEEA; --ink-2: #B0BCB6; --ink-3: #7E8B86;
+      --line: #2A3532; --line-2: #3D4A46;
+      --accent: #4FC3B5; --accent-ink: #0E1A18; --accent-soft: #183431; --accent-line: #2E6D66;
+      --requested: #F0A050; --requested-soft: #3A2A14;
+      --running: #7BA7F5; --running-soft: #1B2A47;
+      --done: #6CCB8A; --done-soft: #16301F;
+      --bad: #F08A82; --bad-soft: #40201D;
+      --hold: #E4C25A; --hold-soft: #3A3014;
+      --sb: #0D1211; --sb-ink: #B0BCB6; --sb-ink-2: #6E7B76; --sb-on: #F2F6F3; --sb-hi: rgba(255,255,255,.07);
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+      --drawer-shadow: -8px 0 32px rgba(0,0,0,.5);
+    }
+  }
+  :root[data-theme="dark"] #pv-classic {
+    --bg: #121817; --surface: #1A2220; --surface-2: #202A28; --surface-3: #283330;
+    --ink: #E8EEEA; --ink-2: #B0BCB6; --ink-3: #7E8B86;
+    --line: #2A3532; --line-2: #3D4A46;
+    --accent: #4FC3B5; --accent-ink: #0E1A18; --accent-soft: #183431; --accent-line: #2E6D66;
+    --requested: #F0A050; --requested-soft: #3A2A14;
+    --running: #7BA7F5; --running-soft: #1B2A47;
+    --done: #6CCB8A; --done-soft: #16301F;
+    --bad: #F08A82; --bad-soft: #40201D;
+    --hold: #E4C25A; --hold-soft: #3A3014;
+    --sb: #0D1211; --sb-ink: #B0BCB6; --sb-ink-2: #6E7B76; --sb-on: #F2F6F3; --sb-hi: rgba(255,255,255,.07);
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+    --drawer-shadow: -8px 0 32px rgba(0,0,0,.5);
+  }
+
+  #pv-classic * { box-sizing: border-box; }
+  #pv-classic { height: 100%; }
+  #pv-classic { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--font); -webkit-font-smoothing: antialiased; }
+  #pv-classic button { font: 500 14px var(--font); color: var(--ink); background: transparent; border: 1px solid transparent; border-radius: 6px; cursor: pointer; padding: 0; }
+  #pv-classic button:disabled { cursor: default; }
+  #pv-classic textarea { font: 14px/1.4 var(--font); color: var(--ink); background: var(--surface); border: 1px solid var(--line-2); border-radius: 6px; padding: 9px 11px; resize: vertical; width: 100%; min-height: 44px; display: block; }
+  #pv-classic textarea::placeholder { color: var(--ink-3); }
+  #pv-classic textarea:focus, #pv-classic button:focus-visible, #pv-classic .item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  #pv-classic h1, #pv-classic h2, #pv-classic h3, #pv-classic h4, #pv-classic h5 { margin: 0; text-wrap: balance; }
+  #pv-classic p { margin: 0; }
+  :is(#pv-classic, #pv-chat .tri) .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  /* ---- layout: sidebar on wide screens, header + bottom bar on phones ---- */
+  #pv-classic .app { display: grid; grid-template-columns: 236px minmax(0, 1fr); min-height: 100%; }
+  #pv-classic .sb { position: sticky; top: env(safe-area-inset-top, 0px); height: calc(100vh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); overflow-y: auto; background: var(--sb); color: var(--sb-ink); display: flex; flex-direction: column; padding: 18px 12px 14px; gap: 2px; }
+  #pv-classic .sb .brand { color: var(--sb-on); font-weight: 600; font-size: 15px; padding: 0 10px 4px; }
+  #pv-classic .sb .live { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--sb-ink-2); padding: 0 10px 14px; min-width: 0; }
+  #pv-classic .sb .live span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pv-classic .sb .grp { font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--sb-ink-2); padding: 12px 10px 4px; }
+  #pv-classic .sb .it { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; color: var(--sb-ink); font-size: 14px; text-align: left; width: 100%; min-width: 0; }
+  #pv-classic .sb .it:hover { background: var(--sb-hi); }
+  #pv-classic .sb .it[aria-current="true"] { background: var(--sb-hi); color: var(--sb-on); box-shadow: inset 3px 0 0 var(--accent); }
+  #pv-classic .sb .it .badge { margin-left: auto; }
+  #pv-classic .sb .it.sub { padding-left: 22px; font-size: 13.5px; }
+  #pv-classic .sb .it.sub .hint { margin-left: auto; font: 11px var(--mono); color: var(--sb-ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; }
+  #pv-classic .sb .it.sub[aria-current="true"] .hint { color: var(--sb-ink); }
+  #pv-classic .sb .it.new { color: var(--accent); }
+  #pv-classic .sb .foot { margin-top: auto; padding: 14px 10px 0; border-top: 1px solid var(--sb-hi); }
+  #pv-classic .sys { font: 12px var(--mono); color: var(--ink-3); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  #pv-classic .sys span { display: flex; gap: 6px; min-width: 0; }
+  #pv-classic .sys span b { font-weight: 500; font-family: var(--font); color: var(--ink-3); flex: none; }
+  #pv-classic .sys span i { font-style: normal; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pv-classic .sys.stack { display: grid; gap: 5px; }
+  #pv-classic .sb .foot .sys span b { color: var(--sb-ink-2); }
+  #pv-classic .sb .foot .sys span i { color: var(--sb-ink); }
+  #pv-classic .col { min-width: 0; }
+  #pv-classic main { max-width: 960px; padding: 26px 28px 80px; min-width: 0; }
+  #pv-classic .ph-head, #pv-classic .bt-bar, #pv-classic .only-phone { display: none; }
+
+  #pv-classic .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line-2); flex: none; display: inline-block; }
+  #pv-classic .dot[data-s="you"] { background: var(--requested); }
+  #pv-classic .dot[data-s="run"] { background: var(--running); animation: pk-pulse 1.6s ease-out infinite; }
+  #pv-classic .dot[data-s="done"] { background: var(--done); }
+  #pv-classic .dot[data-s="ready"] { background: var(--accent); }
+  #pv-classic .dot[data-s="live"] { background: var(--done); }
+  #pv-classic .dot[data-s="off"] { background: var(--bad); }
+  @keyframes pk-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(33,89,201,.4);} 60% { box-shadow: 0 0 0 6px rgba(33,89,201,0);} }
+  @media (prefers-reduced-motion: reduce) { #pv-classic .dot { animation: none !important; } }
+  #pv-classic .badge { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; font: 500 11px/18px var(--mono); text-align: center; background: var(--surface-3); color: var(--ink-2); display: inline-block; flex: none; }
+  #pv-classic .badge[data-t="you"] { background: var(--requested); color: #fff; }
+  #pv-classic .badge[data-t="run"] { background: var(--running); color: #fff; }
+
+  @media (max-width: 640px) {
+    #pv-classic .app { grid-template-columns: 1fr; }
+    #pv-classic .sb, #pv-classic .only-desk { display: none; }
+    #pv-classic .only-phone { display: block; }
+    #pv-classic .ph-head { display: block; position: sticky; top: env(safe-area-inset-top, 0px); z-index: 4; background: var(--surface); border-bottom: 1px solid var(--line); padding: 12px 16px 10px; }
+    #pv-classic .ph-head .eyebrow { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); display: flex; align-items: center; gap: 7px; min-width: 0; }
+    #pv-classic .ph-head .eyebrow span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #pv-classic .ph-head h2 { font-size: 21px; font-weight: 600; letter-spacing: -.01em; margin-top: 2px; line-height: 1.25; }
+    #pv-classic .ph-head .cyc-row { display: flex; gap: 6px; margin-top: 10px; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+    #pv-classic .ph-head .cyc-row::-webkit-scrollbar { display: none; }
+    #pv-classic .bt-bar { display: grid; grid-template-columns: repeat(4, 1fr); position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; background: var(--surface); border-top: 1px solid var(--line); padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px)); }
+    #pv-classic main { padding: 14px 16px calc(96px + env(safe-area-inset-bottom, 0px)); }
+    #pv-classic .head h3 { display: none; }
+    #pv-classic .toast { bottom: calc(84px + env(safe-area-inset-bottom, 0px)) !important; }
+  }
+  #pv-classic .bt-bar .it { display: grid; justify-items: center; gap: 2px; padding: 6px 4px; color: var(--ink-3); font-size: 11px; font-weight: 500; position: relative; border-radius: 8px; }
+  #pv-classic .bt-bar .it svg { width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  #pv-classic .bt-bar .it[aria-current="true"] { color: var(--accent); }
+  #pv-classic .bt-bar .it .badge { position: absolute; top: 2px; right: 18%; }
+  #pv-classic .cp { flex: none; display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--surface); color: var(--ink-2); font-size: 13.5px; }
+  #pv-classic .cp b { font-weight: 600; color: var(--ink); }
+  #pv-classic .cp[aria-current="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  #pv-classic .cp[aria-current="true"] b { color: var(--bg); }
+  #pv-classic .cp .h { font: 12px var(--mono); opacity: .8; }
+  #pv-classic .cp.dim { opacity: .6; }
+  #pv-classic .cp.new { border-style: dashed; color: var(--accent); }
+
+  /* ---- page head ---- */
+  #pv-classic .head { margin-bottom: 16px; }
+  #pv-classic .head h3 { font-size: 21px; font-weight: 600; letter-spacing: -.01em; line-height: 1.25; }
+  #pv-classic .head .meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font-size: 13px; color: var(--ink-3); align-items: center; }
+  #pv-classic .head .meta .mono { color: var(--ink-2); }
+  #pv-classic .head p.lead { color: var(--ink-2); max-width: 68ch; margin-top: 4px; font-size: 14px; }
+  :is(#pv-classic, #pv-chat .tri) .sub { color: var(--ink-2); font-size: 14px; }
+  :is(#pv-classic, #pv-chat .tri) .muted { color: var(--ink-3); }
+  :is(#pv-classic, #pv-chat .tri) .empty { color: var(--ink-2); padding: 18px 0; }
+  :is(#pv-classic, #pv-chat .tri) .link { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; font-weight: 500; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+
+  #pv-classic .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 500; letter-spacing: .01em; padding: 2px 9px; border-radius: 999px; background: var(--surface-3); color: var(--ink-2); white-space: nowrap; line-height: 18px; }
+  #pv-classic .pill[data-s="requested"], #pv-classic .pill[data-s="you"] { background: var(--requested-soft); color: var(--requested); }
+  #pv-classic .pill[data-s="running"], #pv-classic .pill[data-s="run"] { background: var(--running-soft); color: var(--running); }
+  #pv-classic .pill[data-s="done"] { background: var(--done-soft); color: var(--done); }
+  #pv-classic .pill[data-s="blocked"] { background: var(--bad-soft); color: var(--bad); }
+  #pv-classic .pill[data-s="hold"] { background: var(--hold-soft); color: var(--hold); }
+  #pv-classic .pill[data-s="accent"], #pv-classic .pill[data-s="ready"] { background: var(--accent-soft); color: var(--accent); }
+
+  /* ---- stepper (wide) and step pills (phone) ---- */
+  #pv-classic .stepper-wrap { overflow-x: auto; margin: 0 0 16px; scrollbar-width: none; }
+  #pv-classic .stepper { display: grid; grid-template-columns: repeat(5, minmax(96px, 1fr)); position: relative; min-width: 500px; }
+  #pv-classic .stepper::before { content: ""; position: absolute; left: calc(100% / 10); right: calc(100% / 10); top: 11px; height: 3px; background: var(--line-2); border-radius: 2px; }
+  #pv-classic .step { position: relative; text-align: center; padding: 30px 6px 8px; color: var(--ink-3); border-radius: 8px; }
+  #pv-classic .step::before { content: ""; position: absolute; left: 50%; top: 4px; width: 16px; height: 16px; border-radius: 50%; transform: translateX(-50%); background: var(--surface); border: 3px solid var(--line-2); }
+  #pv-classic .step[data-s="done"]::before { background: var(--accent); border-color: var(--accent); }
+  #pv-classic .step[data-s="run"]::before { background: var(--running); border-color: var(--running); }
+  #pv-classic .step[data-s="you"]::before { border-color: var(--requested); }
+  #pv-classic .step[data-s="ready"]::before { border-color: var(--accent); }
+  #pv-classic .step .l { font-weight: 500; font-size: 13px; color: var(--ink-2); display: block; }
+  #pv-classic .step .st { font: 11px var(--mono); color: var(--ink-3); display: block; }
+  #pv-classic .step[data-s="run"] .st { color: var(--running); }
+  #pv-classic .step[data-s="you"] .st { color: var(--requested); }
+  #pv-classic .step[data-s="done"] .st { color: var(--done); }
+  #pv-classic .step[data-s="ready"] .st { color: var(--accent); }
+  #pv-classic .step[aria-current="true"] { background: var(--surface); box-shadow: inset 0 -2px 0 var(--accent); }
+  #pv-classic .step[aria-current="true"] .l { color: var(--ink); }
+  #pv-classic .step:hover .l { color: var(--ink); }
+  #pv-classic .steps-row { display: none; gap: 6px; overflow-x: auto; scrollbar-width: none; margin-bottom: 14px; padding-bottom: 2px; -webkit-overflow-scrolling: touch; }
+  #pv-classic .steps-row::-webkit-scrollbar { display: none; }
+  #pv-classic .steps-row .sp { flex: none; display: inline-flex; align-items: center; gap: 7px; padding: 7px 12px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--surface); color: var(--ink-2); font-size: 13px; }
+  #pv-classic .steps-row .sp[aria-current="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  @media (max-width: 640px) { #pv-classic .stepper-wrap { display: none; } #pv-classic .steps-row { display: flex; } }
+
+  /* ---- cards ---- */
+  #pv-classic .stack { display: grid; gap: 14px; }
+  #pv-classic .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; min-width: 0; }
+  #pv-classic .card.live { box-shadow: var(--shadow); }
+  #pv-classic .card.dim { opacity: .7; }
+  #pv-classic .card > h4 { font-size: 16px; font-weight: 600; }
+  #pv-classic .card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+  #pv-classic .card-head h4 { font-size: 16px; font-weight: 600; }
+  #pv-classic .card .now { font-size: 13px; color: var(--ink-3); margin-top: 4px; }
+  #pv-classic .card .now .mono { color: var(--ink-2); }
+
+  /* ---- needs-you ---- */
+  #pv-classic .attn { border: 1px solid var(--requested); border-left-width: 4px; border-radius: 8px; background: var(--surface); padding: 12px 16px; margin-bottom: 18px; }
+  #pv-classic .attn h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--requested); font-weight: 600; margin-bottom: 6px; }
+  #pv-classic .attn ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+  #pv-classic .attn li { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-size: 14px; }
+  #pv-classic .attn li .go { font-size: 13px; }
+  #pv-classic .attn.calm { border-color: var(--line); border-left-color: var(--done); }
+  #pv-classic .attn.calm h3 { color: var(--done); }
+
+  /* ---- transit line (stations) ---- */
+  #pv-classic .line-wrap { overflow-x: auto; padding: 4px 0 2px; margin-bottom: 18px; }
+  #pv-classic .line { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)); min-width: 720px; position: relative; }
+  #pv-classic .line::before { content: ""; position: absolute; left: calc(100% / 12); right: calc(100% / 12); top: 15px; height: 4px; background: var(--accent-line); border-radius: 2px; }
+  #pv-classic .stn { position: relative; text-align: center; padding-top: 38px; cursor: pointer; border: 0; background: none; font: inherit; color: inherit; }
+  #pv-classic .stn::before { content: ""; position: absolute; left: 50%; top: 8px; width: 18px; height: 18px; border-radius: 50%; transform: translateX(-50%); background: var(--surface); border: 4px solid var(--accent); }
+  #pv-classic .stn .n { display: block; font: 500 20px var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); line-height: 1.1; }
+  #pv-classic .stn .l { display: block; font-size: 12px; color: var(--ink-2); margin-top: 2px; }
+  #pv-classic .stn[data-zero="true"]::before { border-color: var(--line-2); }
+  #pv-classic .stn[data-zero="true"] .n { color: var(--ink-3); }
+  #pv-classic .stn:hover .l { color: var(--ink); }
+
+  /* ---- items ---- */
+  :is(#pv-classic, #pv-chat .tri) .filters { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+  :is(#pv-classic, #pv-chat .tri) .chip { font-size: 13px; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--ink-2); background: var(--surface); }
+  :is(#pv-classic, #pv-chat .tri) .chip[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  #pv-classic .items { display: grid; gap: 8px; }
+  #pv-classic .item { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 4px 12px; align-items: start; text-align: left; width: 100%; padding: 10px 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; font-weight: 400; }
+  #pv-classic .item:hover { border-color: var(--line-2); box-shadow: var(--shadow); }
+  #pv-classic .item .num { font: 500 14px var(--mono); color: var(--ink); padding-top: 1px; }
+  #pv-classic .item .ttl { font-size: 14px; line-height: 1.4; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  #pv-classic .item .st { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 13px; color: var(--ink-2); }
+  #pv-classic .item .cyc { font: 12px var(--mono); color: var(--ink-3); }
+  @media (min-width: 900px) {
+    #pv-classic .item { grid-template-columns: 52px minmax(0, 1fr) 260px; }
+    #pv-classic .item .st { grid-column: 3; grid-row: 1; justify-self: end; justify-content: flex-end; }
+  }
+  :is(#pv-classic, #pv-chat .tri) .track { display: inline-flex; align-items: center; flex: none; }
+  :is(#pv-classic, #pv-chat .tri) .track i { display: block; width: 8px; height: 8px; border-radius: 50%; background: var(--line-2); position: relative; }
+  :is(#pv-classic, #pv-chat .tri) .track i + i { margin-left: 10px; }
+  :is(#pv-classic, #pv-chat .tri) .track i + i::before { content: ""; position: absolute; right: 100%; top: 50%; width: 10px; height: 2px; background: var(--line-2); transform: translateY(-50%); }
+  :is(#pv-classic, #pv-chat .tri) .track i.on { background: var(--accent); }
+  :is(#pv-classic, #pv-chat .tri) .track i.on + i.on::before { background: var(--accent); }
+  :is(#pv-classic, #pv-chat .tri) .track i.cur { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--accent); }
+  :is(#pv-classic, #pv-chat .tri) .track[data-tone="bad"] i.cur { background: var(--bad); box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--bad); }
+  :is(#pv-classic, #pv-chat .tri) .track[data-tone="warn"] i.cur { background: var(--requested); box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--requested); }
+  :is(#pv-classic, #pv-chat .tri) .track[data-tone="hold"] i.cur { background: var(--hold); box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--hold); }
+  :is(#pv-classic, #pv-chat .tri) .track[data-tone="done"] i.cur { background: var(--done); box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--done); }
+  :is(#pv-classic, #pv-chat .tri) .track[data-tone="neutral"] i.cur { background: var(--ink-3); box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--ink-3); }
+  :is(#pv-classic, #pv-chat .tri) .track.big i { width: 12px; height: 12px; }
+  :is(#pv-classic, #pv-chat .tri) .track.big i + i { margin-left: 22px; }
+  :is(#pv-classic, #pv-chat .tri) .track.big i + i::before { width: 22px; }
+  :is(#pv-classic, #pv-chat .tri) .stage-lbl { font-weight: 500; color: var(--ink); }
+  :is(#pv-classic, #pv-chat .tri) .stage-lbl[data-tone="bad"] { color: var(--bad); }
+  :is(#pv-classic, #pv-chat .tri) .stage-lbl[data-tone="warn"] { color: var(--requested); }
+  :is(#pv-classic, #pv-chat .tri) .stage-lbl[data-tone="hold"] { color: var(--hold); }
+  :is(#pv-classic, #pv-chat .tri) .stage-lbl[data-tone="done"] { color: var(--done); }
+  :is(#pv-classic, #pv-chat .tri) .stage-lbl[data-tone="info"] { color: var(--running); }
+
+  /* ---- action area: note field full width, button + reason on one row ---- */
+  #pv-classic .action { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 14px; }
+  #pv-classic .action .what { color: var(--ink-2); font-size: 14px; max-width: 65ch; margin-bottom: 10px; }
+  #pv-classic .field label { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); margin-bottom: 5px; }
+  #pv-classic .opt-row { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; font-size: 14px; color: var(--ink-2); text-transform: none; letter-spacing: 0; }
+  #pv-classic .opt-row input { margin: 4px 0 0; accent-color: var(--accent); }
+  #pv-classic .go-row { display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  #pv-classic .go-row .why { font-size: 13px; color: var(--ink-3); flex: 1 1 200px; }
+  #pv-classic .go-row .why.warn { color: var(--requested); }
+  #pv-classic p.auto { font-size: 14px; color: var(--ink); display: flex; align-items: center; gap: 8px; }
+  #pv-classic p.auto::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--running); flex: none; }
+  #pv-classic .action p.auto { margin-top: 12px; }
+  #pv-classic .action .go-row button.quiet { min-height: 44px; }
+  #pv-classic dd .link { display: inline-flex; align-items: center; min-height: 44px; }
+  #pv-classic button.go { background: var(--accent); color: var(--accent-ink); padding: 10px 18px; font-weight: 600; white-space: nowrap; }
+  #pv-classic button.go:hover:not(:disabled) { filter: brightness(1.08); }
+  #pv-classic button.go:disabled { background: var(--surface-3); color: var(--ink-3); }
+  #pv-classic button.quiet { color: var(--ink-2); border-color: var(--line-2); padding: 9px 14px; }
+  #pv-classic button.quiet:hover { background: var(--surface-2); }
+  #pv-classic .status { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; align-items: baseline; padding: 12px 14px; border-radius: 8px; background: var(--surface-2); border-left: 4px solid var(--line-2); }
+  #pv-classic .status[data-s="requested"] { border-left-color: var(--requested); }
+  #pv-classic .status[data-s="running"] { border-left-color: var(--running); background: var(--running-soft); }
+  #pv-classic .status[data-s="done"] { border-left-color: var(--done); }
+  #pv-classic .status[data-s="blocked"] { border-left-color: var(--bad); background: var(--bad-soft); }
+  #pv-classic .status .k { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); padding-top: 3px; }
+  #pv-classic .status .v { font-size: 14px; color: var(--ink); min-width: 0; overflow-wrap: anywhere; }
+  #pv-classic .status .v.warn { color: var(--requested); }
+  #pv-classic .status .v.bad { color: var(--bad); }
+  #pv-classic .status .v .mono { font-size: 13px; color: var(--ink-2); }
+  #pv-classic .status .actions { grid-column: 1 / -1; display: flex; gap: 8px; margin-top: 4px; }
+  @media (max-width: 480px) { #pv-classic .status { grid-template-columns: 1fr; gap: 2px; } #pv-classic .status .k { padding-top: 8px; } }
+
+  #pv-classic .report { margin-top: 12px; padding: 10px 14px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 0 8px 8px 0; font-size: 14px; }
+  #pv-classic .report[data-s="blocked"] { border-color: var(--bad); background: var(--bad-soft); }
+  #pv-classic .report .rl { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); margin-bottom: 4px; }
+  #pv-classic .report .rs { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #pv-classic .report .rd { margin-top: 8px; font: 12px/1.5 var(--mono); color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+  #pv-classic details { margin-top: 8px; }
+  #pv-classic details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+  #pv-classic details summary:hover { color: var(--ink); }
+  #pv-classic .sec { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); margin: 18px 0 8px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  #pv-classic .sec .cnt { font: 12px var(--mono); color: var(--ink-2); text-transform: none; letter-spacing: 0; }
+
+  /* ---- branches ---- */
+  #pv-classic .branches { display: grid; gap: 8px; }
+  #pv-classic .branch { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--surface); display: grid; gap: 6px; border-left-width: 4px; }
+  #pv-classic .branch[data-d="approve"] { border-left-color: var(--done); }
+  #pv-classic .branch[data-d="hold"] { border-left-color: var(--hold); }
+  #pv-classic .branch[data-d="none"] { border-left-color: var(--requested); }
+  #pv-classic .branch[data-d="na"] { border-left-color: var(--line-2); }
+  #pv-classic .bh { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+  #pv-classic .bh h5 { font-size: 15px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pv-classic .bh .rows { font: 12px var(--mono); color: var(--accent); flex: none; }
+  #pv-classic .bh .pill { flex: none; }
+  #pv-classic .branch .sum { font-size: 14px; white-space: pre-wrap; }
+  #pv-classic .branch .sha { font: 12px var(--mono); color: var(--ink-3); overflow-wrap: anywhere; }
+  #pv-classic dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 6px 0 0; font-size: 14px; }
+  #pv-classic dl.kv dt { color: var(--ink-3); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding-top: 3px; }
+  #pv-classic dl.kv dd { margin: 0; white-space: pre-wrap; min-width: 0; overflow-wrap: anywhere; }
+  #pv-classic dl.kv dd.mono { font: 12px/1.5 var(--mono); color: var(--ink-2); }
+  @media (max-width: 480px) { #pv-classic dl.kv { grid-template-columns: 1fr; gap: 2px 0; } #pv-classic dl.kv dt { padding-top: 8px; } }
+  #pv-classic .decide { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-top: 4px; }
+  #pv-classic .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 6px; overflow: hidden; }
+  #pv-classic .seg button { border-radius: 0; padding: 8px 14px; border: 0; color: var(--ink-2); }
+  #pv-classic .seg button + button { border-left: 1px solid var(--line-2); }
+  #pv-classic .seg button[aria-pressed="true"][data-decide="approve"] { background: var(--done); color: #fff; }
+  #pv-classic .seg button[aria-pressed="true"][data-decide="hold"] { background: var(--hold); color: #fff; }
+  #pv-classic .seg button:disabled { color: var(--ink-3); }
+  #pv-classic .seg.sm button { padding: 4px 9px; font-size: 12px; }
+  #pv-classic .seg button[aria-pressed="true"][data-keep="1"] { background: var(--done); color: #fff; }
+  #pv-classic .seg button[aria-pressed="true"][data-keep="0"] { background: var(--ink-3); color: #fff; }
+  #pv-classic tr.dropped td:not(.kp) { opacity: .55; }
+  #pv-classic .decide .state { font-size: 13px; color: var(--ink-2); }
+  #pv-classic .decide .state.warn { color: var(--requested); }
+
+  /* ---- questions ---- */
+  #pv-classic .qs { display: grid; gap: 10px; }
+  #pv-classic .q { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: var(--surface-2); display: grid; gap: 6px; }
+  #pv-classic .q[data-open="true"] { border-color: var(--requested); }
+  #pv-classic .q .qt { font-size: 14px; }
+  #pv-classic .q .qt b { font-weight: 600; font-family: var(--mono); font-size: 13px; }
+  #pv-classic .q .qm { font: 12px var(--mono); color: var(--ink-3); }
+  #pv-classic .q textarea { min-height: 40px; }
+  #pv-classic .q .ans { font-size: 14px; }
+  #pv-classic .q .ans b { font-weight: 500; color: var(--ink-3); }
+
+  /* ---- rows table ---- */
+  :is(#pv-classic, #pv-chat .tri) .tbl { overflow-x: auto; }
+  :is(#pv-classic, #pv-chat .tri) table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  :is(#pv-classic, #pv-chat .tri) th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); font-weight: 500; padding: 4px 10px 6px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  :is(#pv-classic, #pv-chat .tri) td { padding: 7px 10px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  :is(#pv-classic, #pv-chat .tri) td.num { font: 500 13px var(--mono); white-space: nowrap; }
+  :is(#pv-classic, #pv-chat .tri) td.num button { font: inherit; color: var(--accent); padding: 0; text-decoration: underline; text-underline-offset: 3px; }
+  :is(#pv-classic, #pv-chat .tri) td.br { font: 12px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
+  #pv-classic ul.plain { margin: 0; padding-left: 18px; }
+
+  /* ---- log ---- */
+  #pv-classic .log { list-style: none; margin: 0; padding: 0; }
+  #pv-classic .log li { display: grid; grid-template-columns: 120px 100px 1fr; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+  #pv-classic .log .t { font: 12px var(--mono); color: var(--ink-3); font-variant-numeric: tabular-nums; padding-top: 2px; }
+  #pv-classic .log .s { color: var(--ink-2); }
+  #pv-classic .log .x { overflow-wrap: anywhere; }
+  @media (max-width: 560px) { #pv-classic .log li { grid-template-columns: 1fr; gap: 1px; } }
+
+  /* ---- drawer ---- */
+  #pv-classic .scrim { position: fixed; inset: 0; background: rgba(10,16,15,.45); z-index: 8; }
+  #pv-classic .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100vw); background: var(--surface); z-index: 9; box-shadow: var(--drawer-shadow); overflow-y: auto; padding: calc(16px + env(safe-area-inset-top, 0px)) 22px calc(28px + env(safe-area-inset-bottom, 0px)); }
+  #pv-classic .drawer .dh { display: flex; align-items: flex-start; gap: 12px; }
+  #pv-classic .drawer .dh .num { font: 500 22px var(--mono); color: var(--accent); }
+  #pv-classic .drawer .dh h2 { font-size: 17px; font-weight: 600; line-height: 1.35; flex: 1; }
+  #pv-classic .drawer .close { flex: none; width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--line-2); font-size: 18px; line-height: 1; color: var(--ink-2); }
+  #pv-classic .drawer .dmeta { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 13px; color: var(--ink-2); }
+  #pv-classic .drawer h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); font-weight: 600; margin: 22px 0 8px; }
+  #pv-classic .journey { list-style: none; margin: 0; padding: 0; border-left: 2px solid var(--line-2); margin-left: 6px; }
+  #pv-classic .journey li { position: relative; padding: 0 0 12px 18px; font-size: 14px; }
+  #pv-classic .journey li::before { content: ""; position: absolute; left: -7px; top: 5px; width: 12px; height: 12px; border-radius: 50%; background: var(--surface); border: 3px solid var(--line-2); }
+  #pv-classic .journey li[data-t="done"]::before { border-color: var(--accent); background: var(--accent); }
+  #pv-classic .journey li[data-t="cur"]::before { border-color: var(--accent); }
+  #pv-classic .journey li[data-t="bad"]::before { border-color: var(--bad); background: var(--bad); }
+  #pv-classic .journey li[data-t="warn"]::before { border-color: var(--requested); }
+  #pv-classic .journey li .jt { font: 12px var(--mono); color: var(--ink-3); display: block; }
+  #pv-classic .journey li .jx { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #pv-classic .journey li[data-t="todo"] { color: var(--ink-3); }
+  #pv-classic .trackrow { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-top: 12px; }
+  #pv-classic .stn-names { display: grid; grid-template-columns: repeat(6, 1fr); gap: 0; font-size: 10px; color: var(--ink-3); text-transform: uppercase; letter-spacing: .06em; width: 100%; max-width: 240px; }
+
+  /* ---- triage ledger ---- */
+  :is(#pv-classic, #pv-chat .tri) .tchips { margin: 16px 0 8px; }
+  :is(#pv-classic, #pv-chat .tri) .chip .n { font: 12px var(--mono); opacity: .75; margin-left: 4px; }
+  :is(#pv-classic, #pv-chat .tri) .chip[data-t="you"] { border-color: var(--requested); color: var(--requested); }
+  :is(#pv-classic, #pv-chat .tri) .chip[data-t="you"][aria-pressed="true"] { background: var(--requested); border-color: var(--requested); color: #fff; }
+  :is(#pv-classic, #pv-chat .tri) .ledger td.when { font: 12.5px var(--mono); color: var(--ink-3); white-space: nowrap; }
+  #pv-classic .card .meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; font-size: 13px; color: var(--ink-3); }
+  #pv-classic .card .meta .mono { color: var(--ink-2); }
+  :is(#pv-classic, #pv-chat .tri) .ledger td.in { min-width: 220px; max-width: 360px; }
+  :is(#pv-classic, #pv-chat .tri) .ledger .inwrap { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; align-items: start; }
+  :is(#pv-classic, #pv-chat .tri) .ledger .inwrap > span:last-child { overflow-wrap: anywhere; }
+  :is(#pv-classic, #pv-chat .tri) .ledger td.became { white-space: nowrap; }
+  :is(#pv-classic, #pv-chat .tri) .ledger td.became .sub, :is(#pv-classic, #pv-chat .tri) .ledger td.where .sub { display: block; font-size: 12px; color: var(--ink-3); white-space: normal; max-width: 260px; }
+  :is(#pv-classic, #pv-chat .tri) .ledger td.where { min-width: 260px; }
+  :is(#pv-classic, #pv-chat .tri) .ledger .wn { display: grid; gap: 4px; }
+  :is(#pv-classic, #pv-chat .tri) .ledger .wn > span { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  :is(#pv-classic, #pv-chat .tri) .ledger .wn .stage-lbl { font-size: 13px; }
+  :is(#pv-classic, #pv-chat .tri) .ledger .wn .link { font: 500 13px var(--mono); }
+  :is(#pv-classic, #pv-chat .tri) .ledger .cyc { font: 12px var(--mono); color: var(--ink-3); }
+  :is(#pv-classic, #pv-chat .tri) .ledger tr[data-new="true"] td { background: var(--requested-soft); }
+  :is(#pv-classic, #pv-chat .tri) .ledger tr[data-new="true"] td:first-child { box-shadow: inset 3px 0 0 var(--requested); }
+  :is(#pv-classic, #pv-chat .tri) .ledger tr.day td { padding: 12px 0 4px; border-bottom: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); background: none !important; box-shadow: none !important; }
+  :is(#pv-classic, #pv-chat .tri) .kind { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; font: 500 10.5px var(--mono); flex: none; }
+  :is(#pv-classic, #pv-chat .tri) .kind[data-k="comment"] { background: var(--accent-soft); color: var(--accent); }
+  :is(#pv-classic, #pv-chat .tri) .kind[data-k="report"] { background: var(--running-soft); color: var(--running); }
+  :is(#pv-classic, #pv-chat .tri) .kind[data-k="nightly"] { background: var(--surface-3); color: var(--ink-2); }
+  :is(#pv-classic, #pv-chat .tri) .img { font: 11px var(--mono); color: var(--ink-3); border: 1px solid var(--line-2); border-radius: 4px; padding: 0 5px; margin-left: 6px; white-space: nowrap; }
+  #pv-classic .lastrun summary { font-size: 13px; }
+  #pv-classic .lastrun .report { margin-top: 8px; }
+
+  #pv-classic .toast { position: fixed; left: 50%; bottom: calc(20px + env(safe-area-inset-bottom, 0px)); transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 10px 16px; border-radius: 8px; font-size: 14px; max-width: min(92vw, 560px); box-shadow: var(--shadow); opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 12; }
+  #pv-classic .toast.show { opacity: 1; }
+  #pv-classic .offline { margin: 0 0 18px; padding: 10px 14px; border-radius: 8px; background: var(--requested-soft); color: var(--requested); font-size: 14px; }
+  @media (max-width: 640px) {
+    :is(#pv-classic, #pv-chat .tri) .tbl.ledger { overflow-x: visible; }
+    :is(#pv-classic, #pv-chat .tri) .ledger table, :is(#pv-classic, #pv-chat .tri) .ledger tbody { display: block; width: 100%; }
+    :is(#pv-classic, #pv-chat .tri) .ledger thead { display: none; }
+    :is(#pv-classic, #pv-chat .tri) .ledger tr { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 10px; row-gap: 6px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+    :is(#pv-classic, #pv-chat .tri) .ledger tr.day { display: block; padding: 12px 0 4px; border-bottom: 0; }
+    :is(#pv-classic, #pv-chat .tri) .ledger td { display: block; padding: 0; border: 0; min-width: 0; max-width: none; }
+    :is(#pv-classic, #pv-chat .tri) .ledger td.became, :is(#pv-classic, #pv-chat .tri) .ledger td.where { grid-column: 1 / -1; white-space: normal; min-width: 0; }
+    :is(#pv-classic, #pv-chat .tri) .ledger td.in { min-width: 0; max-width: none; }
+    :is(#pv-classic, #pv-chat .tri) .ledger td.became .sub, :is(#pv-classic, #pv-chat .tri) .ledger td.where .sub { max-width: none; }
+    :is(#pv-classic, #pv-chat .tri) .ledger tr[data-new="true"] { background: var(--requested-soft); box-shadow: inset 3px 0 0 var(--requested); padding-left: 8px; }
+    :is(#pv-classic, #pv-chat .tri) .ledger tr[data-new="true"] td { background: none; box-shadow: none; }
+  }
+  @media (min-width: 641px) {
+    :is(#pv-classic, #pv-chat .tri) .ledger td.became { white-space: normal; min-width: 150px; }
+    :is(#pv-classic, #pv-chat .tri) .ledger td.where { min-width: 200px; }
+  }
+  :is(#pv-classic, #pv-chat .tri) .ledger .wn > span { column-gap: 8px; row-gap: 2px; }
+  :is(#pv-classic, #pv-chat .tri) .ledger .wn .stage-lbl { white-space: normal; overflow-wrap: anywhere; }
+</style>
+<style>
+  #pv-chat {
+    --bg: #F2F4F1; --surface: #FFFFFF; --surface-2: #E9EEEA; --line: #D9DFDB; --line-2: #BFC8C3;
+    --ink: #1A2321; --ink-2: #4C5754; --ink-3: #6E7975;
+    --accent: #0B6E6A; --accent-ink: #FFFFFF; --accent-soft: #DCEFEC;
+    --me: #0B6E6A; --me-ink: #FFFFFF;
+    --you: #B4620A; --you-soft: #FBEBD6;
+    --run: #2159C9; --run-soft: #DCE7FB;
+    --done: #1F7A3F; --done-soft: #DCF2E3;
+    --hold: #7A5A00; --hold-soft: #F6ECC8;
+    --bad: #B4271F;
+    --font: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+    --mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) #pv-chat {
+      color-scheme: dark;
+      --bg: #121817; --surface: #1A2220; --surface-2: #232D2A; --line: #2A3532; --line-2: #3D4A46;
+      --ink: #E8EEEA; --ink-2: #B0BCB6; --ink-3: #8A9791;
+      --accent: #4FC3B5; --accent-ink: #0E1A18; --accent-soft: #183431;
+      --me: #1E5F59; --me-ink: #F2F6F3;
+      --you: #F0A050; --you-soft: #3A2A14;
+      --run: #7BA7F5; --run-soft: #1B2A47;
+      --done: #6CCB8A; --done-soft: #16301F;
+      --hold: #E4C25A; --hold-soft: #3A3014;
+      --bad: #F08A82;
+    }
+  }
+  :root[data-theme="dark"] #pv-chat {
+    color-scheme: dark;
+    --bg: #121817; --surface: #1A2220; --surface-2: #232D2A; --line: #2A3532; --line-2: #3D4A46;
+    --ink: #E8EEEA; --ink-2: #B0BCB6; --ink-3: #8A9791;
+    --accent: #4FC3B5; --accent-ink: #0E1A18; --accent-soft: #183431;
+    --me: #1E5F59; --me-ink: #F2F6F3;
+    --you: #F0A050; --you-soft: #3A2A14;
+    --run: #7BA7F5; --run-soft: #1B2A47;
+    --done: #6CCB8A; --done-soft: #16301F;
+    --hold: #E4C25A; --hold-soft: #3A3014;
+    --bad: #F08A82;
+  }
+
+  #pv-chat * { box-sizing: border-box; }
+  #pv-chat { height: 100%; }
+  #pv-chat { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 var(--font); -webkit-font-smoothing: antialiased; overflow: hidden; }
+  #pv-chat button { font: 500 14px var(--font); color: var(--ink); background: none; border: 0; padding: 0; cursor: pointer; }
+  #pv-chat button:disabled { cursor: default; opacity: .5; }
+  #pv-chat button:focus-visible, #pv-chat textarea:focus-visible, #pv-chat a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #pv-chat .mono { font-family: var(--mono); }
+
+  #pv-chat .app { height: 100%; display: flex; flex-direction: column; max-width: 780px; margin: 0 auto; background: var(--bg); }
+
+  /* header: cycle chips + terminal on one row, the phase line under it */
+  #pv-chat .top { flex: none; background: var(--surface); border-bottom: 1px solid var(--line); padding: 6px 16px 8px; display: grid; gap: 6px; }
+  #pv-chat .row1 { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  #pv-chat .chips { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; -webkit-overflow-scrolling: touch; }
+  #pv-chat .chips::-webkit-scrollbar { display: none; }
+  #pv-chat .chip { flex: none; min-height: 44px; min-width: 44px; padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border-radius: 10px; border: 1px solid var(--line-2); background: var(--surface); color: var(--ink-2); font-size: 15px; }
+  #pv-chat .chip b { font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+  #pv-chat .chip[aria-current="true"] { background: var(--ink); border-color: var(--ink); color: var(--bg); }
+  #pv-chat .chip[aria-current="true"] b { color: var(--bg); }
+  #pv-chat .termbtn { display: inline-flex; align-items: center; text-decoration: none; flex: none; min-height: 44px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line-2); color: var(--ink-2); font-size: 14px; }
+  #pv-chat .termbtn[aria-expanded="true"] { background: var(--surface-2); color: var(--ink); }
+  #pv-chat .tag { flex: none; font: 500 11.5px/1.4 var(--font); color: var(--hold); background: var(--hold-soft); padding: 2px 16px; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  #pv-chat .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line-2); flex: none; display: inline-block; }
+  #pv-chat .dot[data-s="you"] { background: var(--you); }
+  #pv-chat .dot[data-s="run"] { background: var(--run); animation: pc-pulse 1.6s ease-out infinite; }
+  #pv-chat .dot[data-s="ride"] { background: var(--ink-3); }
+  #pv-chat .dot[data-s="ready"] { background: var(--accent); }
+  #pv-chat .dot[data-s="done"] { background: var(--done); }
+  @keyframes pc-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(33,89,201,.45); } 60% { box-shadow: 0 0 0 6px rgba(33,89,201,0); } }
+  @media (prefers-reduced-motion: reduce) { #pv-chat .dot { animation: none !important; } }
+
+  #pv-chat .phase { display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--ink-3); white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
+  #pv-chat .phase::-webkit-scrollbar { display: none; }
+  #pv-chat .phase .p { padding: 2px 7px; border-radius: 6px; }
+  #pv-chat .phase .p[data-done="true"] { color: var(--ink-2); }
+  #pv-chat .phase .p[data-cur="true"] { font-weight: 600; color: var(--ink); background: var(--surface-2); }
+  #pv-chat .phase .p[data-cur="true"][data-s="you"] { background: var(--you-soft); color: var(--you); }
+  #pv-chat .phase .p[data-cur="true"][data-s="run"] { background: var(--run-soft); color: var(--run); }
+  #pv-chat .phase .p[data-cur="true"][data-s="ready"] { background: var(--accent-soft); color: var(--accent); }
+  #pv-chat .phase .sep { color: var(--line-2); }
+
+  #pv-chat .term { background: var(--surface); border-bottom: 1px solid var(--line); padding: 10px 16px 12px; display: grid; gap: 8px; font-size: 14px; color: var(--ink-2); }
+  #pv-chat .term a.open { display: inline-flex; align-items: center; min-height: 44px; padding: 0 16px; border-radius: 10px; background: var(--ink); color: var(--bg); font-weight: 600; text-decoration: none; justify-self: start; }
+  #pv-chat .term .cmd { display: flex; gap: 8px; align-items: center; min-width: 0; }
+  #pv-chat .term code { font: 13px var(--mono); background: var(--surface-2); padding: 8px 10px; border-radius: 8px; flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; color: var(--ink); user-select: all; }
+  #pv-chat .term .copy { min-height: 44px; padding: 0 12px; border: 1px solid var(--line-2); border-radius: 10px; }
+  /* the agent's literal terminal, embedded (2026-10-09): tmux pane text the cycle thread writes to its doc */
+  /* no gutters: the pane is 52 columns and must fit a phone unwrapped; the font is sized to the width in renderChat */
+  #pv-chat .chat.tty-full { gap: 0; padding: 0; overflow: hidden; background: #0d1211; }
+  #pv-chat .chat.tty-full iframe.tty { flex: 1; min-height: 0; width: 100%; border: 0; background: #0d1211; }
+  /* with the agent's terminal on screen you type to it directly: no message box (rider, 2026-10-09) */
+  #pv-chat .chat.tty-full ~ .dock .compose, #pv-chat .chat.tty-full ~ .dock .target { display: none; }
+  #pv-chat .tri { --requested: var(--you); --requested-soft: var(--you-soft); --running: var(--run); --running-soft: var(--run-soft); --surface-3: var(--surface-2); }
+  #pv-chat .tri .tchips { margin: 0 0 8px; }
+  #pv-chat .phase .tri-sub { margin-left: auto; }
+  #pv-chat .next .st .ride { display: block; font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+  #pv-classic .ride-line { margin-bottom: 8px; font-weight: 500; }
+  #pv-chat .chat.tty-cyc ~ .dock { display: none; }
+  #pv-chat .phase { flex-wrap: wrap; row-gap: 6px; }
+  #pv-chat .chat.tty-full a.ttyl { flex: 1; min-height: 0; min-width: 0; display: flex; color: inherit; text-decoration: none; -webkit-user-drag: none; }
+  #pv-chat .chat.tty-full pre.tty { flex: 1; min-height: 0; min-width: 0; margin: 0; overflow-y: auto; overflow-x: auto; padding: 4px 3px 6px; background: #0d1211; color: #d6e0dc; font: 12px/1.4 var(--mono); white-space: pre; -webkit-overflow-scrolling: touch; }
+
+  /* the conversation */
+  #pv-chat .chat { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 16px 10px; display: flex; flex-direction: column; gap: 10px; -webkit-overflow-scrolling: touch; }
+  #pv-chat .msg { max-width: 86%; display: grid; gap: 3px; }
+  #pv-chat .msg .who { font-size: 12px; color: var(--ink-3); }
+  #pv-chat .msg .b { padding: 9px 13px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; }
+  #pv-chat .msg.me { align-self: flex-end; }
+  #pv-chat .msg.me .who { text-align: right; }
+  #pv-chat .msg.me .b { background: var(--me); color: var(--me-ink); border-color: var(--me); border-bottom-right-radius: 4px; }
+  #pv-chat .msg.cl .b { border-bottom-left-radius: 4px; }
+  #pv-chat .msg.q .b { border-color: var(--you); background: var(--you-soft); }
+  #pv-chat .msg.q .who { color: var(--you); font-weight: 500; }
+  #pv-chat .msg .b.clamp { max-height: 12.5em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
+  #pv-chat .msg .more { justify-self: start; font-size: 13px; color: var(--accent); min-height: 32px; }
+  #pv-chat .sys { align-self: center; font-size: 12.5px; color: var(--ink-3); text-align: center; max-width: 90%; }
+  #pv-chat .empty { margin: auto; color: var(--ink-3); text-align: center; max-width: 30ch; }
+
+  /* the dock: branch decisions, the one next step, the text box */
+  #pv-chat .dock { flex: none; background: var(--surface); border-top: 1px solid var(--line); padding: 8px 16px calc(10px + env(safe-area-inset-bottom, 0px)); display: grid; gap: 8px; }
+  #pv-chat .brs { display: grid; gap: 6px; }
+  #pv-chat .br { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  #pv-chat .br .l { flex: 1; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pv-chat .br .l .mono { font-size: 12px; color: var(--ink-3); margin-left: 4px; }
+  #pv-chat .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 10px; overflow: hidden; flex: none; }
+  #pv-chat .seg button { min-height: 44px; padding: 0 14px; color: var(--ink-2); }
+  #pv-chat .seg button + button { border-left: 1px solid var(--line-2); }
+  #pv-chat .seg button[aria-pressed="true"][data-decide="approve"] { background: var(--done); color: #fff; }
+  #pv-chat .seg button[aria-pressed="true"][data-decide="hold"] { background: var(--hold); color: #fff; }
+  #pv-chat .next { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  #pv-chat .next .st { flex: 1; min-width: 0; font-size: 13.5px; color: var(--ink-2); display: flex; align-items: center; gap: 7px; }
+  #pv-chat .next .st span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #pv-chat .go { flex: none; min-height: 44px; padding: 0 18px; border-radius: 10px; background: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 15px; }
+  #pv-chat .quiet { flex: none; min-height: 44px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line-2); color: var(--ink-2); }
+  #pv-chat .target { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--you); }
+  #pv-chat .target button { min-height: 32px; min-width: 32px; color: var(--ink-3); font-size: 18px; line-height: 1; }
+  #pv-chat .compose { display: flex; gap: 8px; align-items: flex-end; }
+  #pv-chat .compose textarea { flex: 1; min-width: 0; font: 16px/1.35 var(--font); color: var(--ink); background: var(--bg); border: 1px solid var(--line-2); border-radius: 12px; padding: 11px 12px; resize: none; min-height: 44px; max-height: 140px; display: block; }
+  #pv-chat .compose textarea::placeholder { color: var(--ink-3); }
+  #pv-chat .send { flex: none; min-height: 44px; min-width: 64px; padding: 0 14px; border-radius: 12px; background: var(--ink); color: var(--bg); font-weight: 600; font-size: 15px; }
+
+  #pv-chat .toast { position: fixed; left: 50%; top: calc(64px + env(safe-area-inset-top, 0px)); transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 9px 14px; border-radius: 10px; font-size: 14px; max-width: min(92vw, 520px); opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 10; }
+  #pv-chat .toast.show { opacity: 1; }
+</style>
+<style>
+  /* ---- one page, two views: the ground and the Chat · Classic switch ---- */
+  :root { --pv-bg: #F2F4F1; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --pv-bg: #121817; } }
+  :root[data-theme="dark"] { --pv-bg: #121817; }
+  html, body { height: 100%; }
+  body { background: var(--pv-bg); }
+  body[data-pv="chat"] { overflow: hidden; }
+  #pv-classic { height: auto; min-height: 100%; }
+  .pv-switch { display: inline-flex; flex: none; border: 1px solid var(--line-2); border-radius: 10px; overflow: hidden; background: var(--surface); }
+  :is(#pv-chat, #pv-classic) .pv-switch button { min-height: 44px; padding: 0 11px; font: 500 13.5px var(--font); color: var(--ink-2); background: none; border: 0; border-radius: 0; cursor: pointer; }
+  :is(#pv-chat, #pv-classic) .pv-switch button + button { border-left: 1px solid var(--line-2); }
+  :is(#pv-chat, #pv-classic) .pv-switch button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+  #pv-classic .pv-switch.pv-sb { display: flex; margin: 0 10px 12px; background: transparent; border-color: rgba(255,255,255,.16); }
+  #pv-classic .pv-switch.pv-sb button { flex: 1; color: var(--sb-ink); }
+  #pv-classic .pv-switch.pv-sb button + button { border-left-color: rgba(255,255,255,.16); }
+  #pv-classic .pv-switch.pv-sb button[aria-pressed="true"] { background: var(--sb-on); color: var(--sb); }
+  #pv-classic .pv-switch.pv-ph { position: absolute; top: 10px; right: 16px; }
+  #pv-classic .ph-head .eyebrow, #pv-classic .ph-head h2 { padding-right: 132px; }
+</style>
+<style>
+  /* ---- phone: one slim top bar owns the view switch and Terminal; each view's header sits under it ---- */
+  #pv-bar { --b-surface: #FFFFFF; --b-ink: #1A2321; --b-ink-2: #4C5754; --b-line: #D9DFDB; --b-line-2: #BFC8C3; display: none; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) #pv-bar { --b-surface: #1A2220; --b-ink: #E8EEEA; --b-ink-2: #B0BCB6; --b-line: #2A3532; --b-line-2: #3D4A46; } }
+  :root[data-theme="dark"] #pv-bar { --b-surface: #1A2220; --b-ink: #E8EEEA; --b-ink-2: #B0BCB6; --b-line: #2A3532; --b-line-2: #3D4A46; }
+  @media (max-width: 640px) {
+    #pv-bar { display: flex; align-items: center; gap: 8px; height: 60px; padding: 0 12px 0 16px; position: sticky; top: 0; z-index: 7; background: var(--b-surface); border-bottom: 1px solid var(--b-line); font-family: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif; }
+    #pv-bar .pv-title { flex: 1; min-width: 0; font-size: 17px; font-weight: 600; color: var(--b-ink); letter-spacing: -.01em; }
+    #pv-bar .pv-switch { border: 1px solid var(--b-line-2); background: var(--b-surface); }
+    #pv-bar .pv-switch button, #pv-bar #pv-term { min-height: 44px; padding: 0 14px; font: 500 14px inherit; font-family: inherit; color: var(--b-ink-2); background: none; border: 0; cursor: pointer; }
+    #pv-bar .pv-switch button + button { border-left: 1px solid var(--b-line-2); }
+    #pv-bar .pv-switch button[aria-pressed="true"] { background: var(--b-ink); color: var(--b-surface); }
+    #pv-bar #pv-term { text-decoration: none; box-sizing: border-box; height: 44px; display: inline-flex; align-items: center; justify-content: center; width: 44px; padding: 0; border: 1px solid var(--b-line-2); border-radius: 10px; }
+    #pv-bar #pv-term[aria-expanded="true"] { background: var(--b-line); color: var(--b-ink); }
+    #pv-bar #pv-term svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    body[data-pv="classic"] #pv-bar #pv-term { display: none; }
+    body[data-pv="chat"] #pv-chat { height: calc(100% - 60px); }
+    #pv-chat .row1 .pv-switch, #pv-chat #termbtn { display: none; }
+    #pv-classic .pv-switch.pv-ph { display: none; }
+    #pv-classic .ph-head .eyebrow, #pv-classic .ph-head h2 { padding-right: 0; }
+    #pv-classic .ph-head { top: 60px; }
+    /* Classic touch targets and layout on the phone */
+    #pv-classic .attn li { flex-wrap: nowrap; align-items: center; justify-content: space-between; gap: 12px; }
+    #pv-classic .attn li .go { flex: none; min-height: 40px; padding: 0 14px; text-decoration: none; }
+    #pv-classic .line { min-width: 0; grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    #pv-classic .stn .n { font-size: 18px; }
+    #pv-classic .stn .l { font-size: 11px; }
+    #pv-classic .chip, #pv-classic .cp, #pv-classic .steps-row .sp { min-height: 40px; }
+    #pv-classic .opt-row { display: block; }
+    #pv-classic .drawer .close { width: 44px; height: 44px; }
+    #pv-classic .seg button { min-height: 40px; }
+    #pv-classic .drawer .dmeta .link { display: inline-flex; align-items: center; min-height: 40px; }
+    #pv-classic .opt-row input { width: 20px; height: 20px; margin: 0 8px 0 0; vertical-align: -4px; }
+  }
+  #pv-classic .attn li .go { text-decoration: none; }
+  #pv-classic .stn-names { display: none; }
+  /* Chat: let the status wrap instead of cutting it off; full-size taps on Show all and × */
+  #pv-chat .next .st span:last-child { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  #pv-chat .msg .more { min-height: 44px; padding-right: 12px; }
+  #pv-chat .target button { min-height: 44px; min-width: 44px; }
+</style>
+
+<header id="pv-bar"><span class="pv-title">Pipeline</span><span class="pv-switch" role="group" aria-label="View"><button type="button" data-pv="chat" aria-pressed="true">Chat</button><button type="button" data-pv="classic" aria-pressed="false">Classic</button></span><a id="pv-term" href="#" target="_blank" rel="noopener" aria-label="Open this agent in Termius"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4z"/><path d="M7 9l3 3-3 3M12 15h5"/></svg></a></header>
+
+<div id="pv-classic" hidden>
+<div class="app">
+  <aside class="sb" id="sb" aria-label="Sections"></aside>
+  <div class="col">
+    <header class="ph-head" id="phead"></header>
+    <main id="main"></main>
+  </div>
+</div>
+<nav class="bt-bar" id="bbar" aria-label="Sections"></nav>
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden></aside>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+</div>
+
+<div id="pv-chat" hidden>
+<div class="app">
+  <div class="tag" id="tag" hidden>Review copy · presses write only to this copy, nothing is sent to Claude</div>
+  <header class="top">
+    <div class="row1">
+      <nav class="chips" id="chips" aria-label="Cycles"></nav>
+      <span class="pv-switch" role="group" aria-label="View"><button type="button" data-pv="chat" aria-pressed="true">Chat</button><button type="button" data-pv="classic" aria-pressed="false">Classic</button></span>
+      <a class="termbtn" id="termbtn" href="#" target="_blank" rel="noopener">Terminal</a>
+    </div>
+    <div class="phase" id="phase" aria-label="Phase"></div>
+  </header>
+  <div class="term" id="term" hidden></div>
+  <main class="chat" id="chat" aria-live="polite"></main>
+  <footer class="dock">
+    <div class="brs" id="brs" hidden></div>
+    <div class="next" id="next"></div>
+    <div class="target" id="target" hidden></div>
+    <form class="compose" id="compose">
+      <label for="box" style="position:absolute;left:-9999px">Message</label>
+      <textarea id="box" rows="1" placeholder="Message"></textarea>
+      <button class="send" id="send" type="submit">Send</button>
+    </form>
+  </footer>
+</div>
+<div class="toast" id="chat-toast" role="status" aria-live="polite"></div>
+</div>
+
+<script src="/shim.js"></script>
+<script>
+window.pvRideLine = function (c) {
+  const st = (c && c.steps) || {}, sd = st["ship-dev"] || {}, lr = (st.verify || {}).lastRide;
+  if (!c || c.retiredAt || sd.status !== "done") return "";
+  const when = (ms) => new Date(ms).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).replace(",", "");
+  const clock = (ms) => new Date(ms).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  if (!lr || !lr.endedAt || (sd.finishedAt && lr.endedAt < sd.finishedAt)) return "No ride on the dev app since this shipped" + (sd.finishedAt ? " (" + when(sd.finishedAt) + ")" : "");
+  const head = "Last ride " + when(lr.endedAt);
+  if (lr.applies === "prod-app" || lr.app === "prod") return head + " · App Store app · doesn't count for dev rows";
+  const b = lr.bundle ? "dev " + lr.bundle : "dev app";
+  if (lr.applies === "older-bundle") return head + " · " + b + " · ran older code than this cycle";
+  if (lr.applies === "no-rows") return head + " · " + b + " · nothing left to score";
+  if (!lr.scoredAt) return head + " · " + b + " · scoring now";
+  const n = lr.counts || {}, parts = [];
+  if (n.pass != null) parts.push(n.pass + " pass");
+  if (n.fail) parts.push(n.fail + " fail");
+  if (n.notExercised != null) parts.push(n.notExercised + " not exercised");
+  return head + " · " + b + " · scored " + clock(lr.scoredAt) + (parts.length ? " — " + parts.join(" · ") : "");
+};
+</script>
+<script>
+// One page, two views. Remembers the view per device; shares one claude.use() per capability and one
+// db subscription per feed between the views; a hidden view renders nothing and receives no clicks.
+window.PV = (function () {
+  "use strict";
+  const KEY = "pipeline-view";
+  let active = "chat";
+  try { const v = localStorage.getItem(KEY); if (v === "chat" || v === "classic") active = v; } catch (_) {}
+  const views = {}, feeds = {};
+  let capsP = null;
+  const roots = { chat: document.getElementById("pv-chat"), classic: document.getElementById("pv-classic") };
+  function apply() {
+    for (const k in roots) roots[k].hidden = k !== active;
+    document.body.dataset.pv = active;
+    document.querySelectorAll("[data-pv]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.pv === active)));
+  }
+  function show(v) {
+    if (v !== "chat" && v !== "classic") return;
+    active = v;
+    try { localStorage.setItem(KEY, v); } catch (_) {}
+    apply(); window.scrollTo(0, 0);
+    if (views[v]) views[v]();
+  }
+  document.addEventListener("click", (e) => { const b = e.target.closest("[data-pv]"); if (b) show(b.dataset.pv); });
+    apply();
+  return {
+    shown: (v) => v === active,
+    register: (v, fn) => { views[v] = fn; },
+    switchHtml: (cls) => `<span class="pv-switch ${cls}" role="group" aria-label="View"><button type="button" data-pv="chat" aria-pressed="${active === "chat"}">Chat</button><button type="button" data-pv="classic" aria-pressed="${active === "classic"}">Classic</button></span>`,
+    caps: () => capsP || (capsP = Promise.all([claude.use("db"), claude.use("comments"), claude.use("user")])),
+    // First caller opens the subscription; later callers share it and get the latest snapshot at once.
+    watch(key, start, onData, onErr) {
+      let f = feeds[key];
+      const fresh = !f;
+      if (fresh) f = feeds[key] = { subs: [], last: null, err: null };
+      f.subs.push([onData, onErr]);
+      if (fresh) start((s) => { f.last = s; f.err = null; f.subs.slice().forEach((x) => x[0](s)); }, (e) => { f.err = e; f.subs.slice().forEach((x) => x[1] && x[1](e)); });
+      else if (f.err) { if (onErr) onErr(f.err); }
+      else if (f.last) onData(f.last);
+    },
+  };
+})();
+</script>
+
+<script>
+(function () {
+  "use strict";
+  const BOARD = "pipeline/board";
+  const STEP = {
+    plan:        { label: "Plan",      verb: (n) => `Plan cycle ${n}`,            what: "Draft this cycle's rows from the backlog, re-check each mechanism against current source, and write the sequencing. You review the draft, drop rows, send notes; it is revised until you approve it — and approving starts the build." },
+    build:       { label: "Build",     verb: (n) => `Build cycle ${n}`,           what: "Builds on its own after you approve the plan: one agent per branch in its own worktree, targeted jest, typecheck, i18n, every claim checked in the diff. Rows whose question is unanswered are skipped, and build on their own once you answer." },
+    "ship-dev":  { label: "Ship dev",  verb: (n, a) => a ? `Ship ${a} approved to dev` : "Ship to dev", what: "Ships to dev on its own as soon as Build finishes: every branch that passed its gates, except the ones you hold. A daemon branch restarts the watcher instead." },
+    verify:      { label: "Verify",    verb: (n) => `Verify cycle ${n} on the last ride`, what: "Verifies on its own after each ride on the dev app that ran this cycle's code: pass, fail, or not exercised. A ride on the prod app does not count. Passes leave the backlog; fails go back for a later cycle." },
+    "ship-prod": { label: "Ship prod", verb: (n, a, sha) => sha ? `Promote ${sha} to production` : "Promote to production", what: "Promote the same web sha the ride verified to the production store, with one line of rider-visible changes." },
+  };
+  const ORDER = ["plan", "build", "ship-dev", "verify", "ship-prod"];
+  const PRED = { build: "plan", "ship-dev": "build", verify: "ship-dev", "ship-prod": "verify" };
+  const SECS = [["flow", "Flow"], ["triage", "Triage"], ["cycles", "Cycles"], ["log", "Log"]];
+  const ICONS = {
+    flow: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h10M4 17h13"/></svg>',
+    triage: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16l-6 7v5l-4 2v-7z"/></svg>',
+    cycles: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-3-6.2M20 4v5h-5"/></svg>',
+    log: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v16H6zM9 9h6M9 13h6"/></svg>',
+  };
+  const STATIONS = ["Planned", "Building", "Built", "On dev", "Verified", "Prod"];
+  const STATUS_LABEL = { idle: "Not started", requested: "Requested", running: "Running", done: "Done", blocked: "Needs you", draft: "Your review" };
+  const NOTE_PH = { plan: "Rows to include, e.g. 23.3, 23.1 — or leave blank to propose", build: "Constraints for the agents (optional)", "ship-dev": "Release note for the dev bundle (optional)", verify: "Which ride, anything you noticed (optional)", "ship-prod": "The one-line prod note (optional)" };
+
+  const $ = (id) => document.getElementById(id);
+  const ROOT = $("pv-classic");
+  const fmt = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const fmtT = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+  const when = (ms) => (ms ? fmt.format(new Date(ms)) : "");
+  const clock = (ms) => (ms ? fmtT.format(new Date(ms)) : "");
+  const ago = (ms) => { if (!ms) return ""; const m = Math.round((Date.now() - ms) / 60000); return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  let db = null, comments = null, user = null, uid = null, canEdit = null, connected = false;
+  let board = null, cycles = [];
+  const drafts = {};
+  const ui = { sec: "flow", cycle: null, stage: null, filter: "all", tfilter: "all", item: null, thenPlan: true };
+  try { Object.assign(ui, JSON.parse(localStorage.getItem("pipeline-ui-v3") || "{}")); } catch (_) {}
+  function saveUi() { try { localStorage.setItem("pipeline-ui-v3", JSON.stringify(ui)); } catch (_) {} }
+
+  // ---- derived ----------------------------------------------------------
+  const stepOf = (c, k) => (c.steps && c.steps[k]) || { status: "idle" };
+  const stat = (c, k) => { const s = stepOf(c, k).status; return STATUS_LABEL[s] ? s : "idle"; };
+  const branches = (c) => (c.branches || []).filter((b) => b && typeof b === "object");
+  // A branch tab is decidable only once Build produced it: it has a sha, or the cycle's Build is done.
+  // Tabs the plan wrote as proposals (no sha, Build not done) get no Approve/Hold — that was the 09-23 confusion.
+  const isBuilt = (c, b) => !!(b && (b.sha || stat(c, "build") === "done"));
+  const builtBranches = (c) => branches(c).filter((b) => isBuilt(c, b));
+  const approved = (c) => builtBranches(c).filter((b) => b.decision === "approve");
+  const undecided = (c) => builtBranches(c).filter((b) => b.shippable !== false && !b.decision);
+  const held = (c) => builtBranches(c).filter((b) => b.decision === "hold");
+  // Since 2026-10-08 ship-dev runs on its own: a built branch ships unless it is held (null = ships).
+  const ships = (c) => builtBranches(c).filter((b) => b.shippable !== false && b.decision !== "hold");
+  const OUT = ["on-dev", "not-exercised", "pass", "fail", "closed", "in-prod"];
+  // A branch is out (merged to dev) once its rows are on dev or later.
+  const isOut = (c, b) => { const rs = (c.rows || []).filter((r) => (b.rows || []).includes(r.num)); if (rs.length) return rs.some((r) => OUT.includes(r.status)); const sd = stepOf(c, "ship-dev"); return sd.status === "done" && b.decision !== "hold" && !(b.decidedAt > (sd.finishedAt || 0)); };
+  const AUTO = { build: true, "ship-dev": true };
+  const unanswered = (c) => (c.questions || []).filter((q) => !q.answer);
+  const live = (c) => !c.retiredAt;
+  const onDev = (c) => live(c) && stat(c, "ship-dev") === "done";
+  const nextStep = (c) => { if (c.retiredAt) return null; for (const k of ORDER) if (stat(c, k) !== "done") return k; return null; };
+  const sortedCycles = () => cycles.slice().sort((a, z) => (z.number || 0) - (a.number || 0));
+  const liveCycles = () => sortedCycles().filter(live);
+  const retiredCycles = () => sortedCycles().filter((c) => c.retiredAt);
+  const cyc = (id) => cycles.find((c) => c.id === id);
+  const busy = (s) => s === "requested" || s === "running";
+  const nextNumber = () => cycles.reduce((m, c) => Math.max(m, c.number || 0), 0) + 1;
+  // Plan review: a revision is posted ("draft"), the rider sends notes (requested/running, mode "revise") or approves ("done").
+  const planRev = (c) => (c.plan && c.plan.revision) || 0;
+  const revising = (c) => busy(stat(c, "plan")) && stepOf(c, "plan").mode === "revise";
+  const planOpen = (c) => stat(c, "plan") === "draft" || revising(c);
+  const keptRows = (c) => (c.rows || []).filter((r) => r.keep !== false);
+  const droppedRows = (c) => (c.rows || []).filter((r) => r.keep === false);
+
+  function gate(c, key) {
+    const p = PRED[key];
+    if (p && stat(c, p) !== "done") return { ok: false, why: `Waiting for ${STEP[p].label} to finish first.` };
+    return { ok: true, why: "" };
+  }
+
+  // One-line state of a cycle, for the sidebar, chips and the page head.
+  function cycleHint(c) {
+    if (c.retiredAt) return { text: "retired", tone: "", stage: "ship-prod" };
+    if (stat(c, "plan") === "draft") return { text: `plan rev ${planRev(c)} — your review`, tone: "you", stage: "plan" };
+    const qn = unanswered(c).length;
+    if (qn) return { text: `${qn} question${qn === 1 ? "" : "s"} for you`, tone: "you", stage: "plan" };
+    for (const k of ORDER) if (stat(c, k) === "blocked") return { text: `${STEP[k].label} needs you`, tone: "you", stage: k };
+    const nx = nextStep(c);
+    if (!nx) return { text: "all steps done", tone: "done", stage: "ship-prod" };
+    const s = stat(c, nx);
+    if (s === "running") return { text: `${STEP[nx].label} running`, tone: "run", stage: nx };
+    if (s === "requested") return { text: `${STEP[nx].label} requested`, tone: "run", stage: nx };
+    if (nx === "verify") return { text: "on dev · verifies on the next ride", tone: "ready", stage: nx };
+    if (AUTO[nx] && gate(c, nx).ok) return { text: nx === "build" ? "builds on its own" : "ships to dev on its own", tone: "run", stage: nx };
+    if (gate(c, nx).ok) return { text: `${STEP[nx].label} ready`, tone: "ready", stage: nx };
+    return { text: `${STEP[nx].label} waiting`, tone: "", stage: nx };
+  }
+  // State of one step, for the stepper.
+  function stepState(c, k) {
+    const s = stat(c, k);
+    if (k === "plan" && s === "draft") return { s: "you", t: `rev ${planRev(c)} · review` };
+    if (k === "plan" && revising(c)) return { s: "run", t: "revising" };
+    if (s === "done") return { s: "done", t: "done" };
+    if (s === "running") return { s: "run", t: "running" };
+    if (s === "requested") return { s: "run", t: "requested" };
+    if (s === "blocked") return { s: "you", t: "needs you" };
+    if (k === "plan" && unanswered(c).length) return { s: "you", t: `${unanswered(c).length} open` };
+    if (k === "build" && stat(c, "build") === "done") return { s: "done", t: "done" };
+    if (c.retiredAt) return { s: "", t: "—" };
+    if (gate(c, k).ok) return AUTO[k] ? { s: "", t: "on its own" } : { s: "ready", t: k === "verify" ? "next ride" : "ready" };
+    return { s: "", t: "waiting" };
+  }
+
+  function itemStage(c, r, b) {
+    const s = r.status || r.kind || "build";
+    const bd = stat(c, "build"), sd = stat(c, "ship-dev");
+    const bundle = c.bundle && c.bundle.dev ? c.bundle.dev : "";
+    if (r.keep === false) return { i: 0, label: "Dropped from this cycle", tone: "neutral" };
+    if (planOpen(c) && !r.branch) return { i: 0, label: "Planned — draft", tone: "neutral" };
+    if (s === "closed") return { i: 5, label: c.bundle && c.bundle.prod ? `In production ${c.bundle.prod}` : "Closed to the record", tone: "done" };
+    if (s === "pass") return c.bundle && c.bundle.prod ? { i: 5, label: `In production ${c.bundle.prod}`, tone: "done" } : { i: 4, label: "Verified on a ride", tone: "done" };
+    if (s === "fail") return { i: 4, label: "Failed on the ride — back to the backlog", tone: "bad" };
+    if (s === "in-prod") return { i: 5, label: `In production${c.bundle && c.bundle.prod ? " " + c.bundle.prod : ""} — closes on a ride`, tone: "warn" };
+    if (s === "not-exercised") return { i: 3, label: `On dev ${bundle} — not exercised yet`, tone: "warn" };
+    if (s === "on-dev") return { i: 3, label: `On dev ${bundle}`.trim() + (stat(c, "verify") === "requested" || stat(c, "verify") === "running" ? " — verifying" : " — waiting for a ride"), tone: "info" };
+    if (s === "measured") return { i: 2, label: "Measured — nothing to ship", tone: "neutral" };
+    if (s === "blocked") return { i: 0, label: "Needs your answer", tone: "bad" };
+    if (s === "next cycle") return { i: 0, label: "Deferred to the next cycle", tone: "neutral" };
+    if (b && isBuilt(c, b)) {
+      if (sd === "done" && b.decision === "approve") return { i: 3, label: `On dev ${bundle}`, tone: "info" };
+      if (b.shippable === false) return { i: 2, label: "Measured — nothing to ship", tone: "neutral" };
+      if (b.decision === "hold") return { i: 2, label: "Built — held back", tone: "hold" };
+      return { i: 2, label: busy(sd) ? "Built — shipping to dev" : "Built — ships to dev on its own", tone: "done" };
+    }
+    if (s === "built" || s === "daemon-built") return { i: 2, label: "Built", tone: "done" };
+    if (busy(bd)) return { i: 1, label: bd === "running" ? "Building" : "Build requested", tone: "info" };
+    return { i: 0, label: "Planned", tone: "neutral" };
+  }
+
+  function items() {
+    const out = [];
+    for (const c of sortedCycles()) for (const r of (c.rows || [])) {
+      const b = branches(c).find((x) => x.name === r.branch) || branches(c).find((x) => (x.rows || []).includes(r.num)) || null;
+      const qs = (c.questions || []).filter((q) => (q.rows || []).includes(r.num));
+      out.push({ key: c.id + ":" + r.num, c, r, b, qs, st: itemStage(c, r, b) });
+    }
+    return out;
+  }
+
+  // Every item that waits on the rider (kind "you") or is ready for a press (kind "ready"), with where to go.
+  function attention() {
+    const a = [];
+    const b = board || {};
+    for (const c of liveCycles()) {
+      const n = c.number;
+      if (stat(c, "plan") === "draft") a.push({ sec: "cycles", cid: c.id, stage: "plan", text: `Review plan revision ${planRev(c)} on cycle ${n}`, kind: "you" });
+      for (const q of unanswered(c)) a.push({ sec: "cycles", cid: c.id, stage: "plan", text: `Answer ${q.id.toUpperCase()} on cycle ${n}` + (q.rows && q.rows.length ? ` (${q.rows.join(", ")} wait on it)` : ""), kind: "you" });
+      for (const k of ORDER) { const s = stat(c, k); if (s === "blocked") a.push({ sec: "cycles", cid: c.id, stage: k, text: `${STEP[k].label} on cycle ${n} needs you: ${stepOf(c, k).summary || "see the card"}`, kind: "you" }); }
+      const nx = nextStep(c);
+      if (nx === "ship-prod" && stat(c, nx) === "idle" && gate(c, nx).ok) a.push({ sec: "cycles", cid: c.id, stage: nx, text: `Cycle ${n} is verified and ready for ${STEP[nx].label}`, kind: "ready" });
+    }
+    if (b.intake && b.intake.status === "blocked") a.push({ sec: "triage", text: `Triage needs you: ${b.intake.summary || ""}`, kind: "you" });
+    const pend = pendingInputs();
+    if (pend.length && !busy((b.intake || {}).status)) a.push({ sec: "triage", text: `Waiting for triage: ${pend.length} input${pend.length === 1 ? "" : "s"} not looked at (${inputCounts(pend)})`, kind: "ready" });
+    else if (b.intake && b.intake.pending && !pend.length && !busy(b.intake.status) && !(b.intake.inputs || []).length) a.push({ sec: "triage", text: `Waiting for triage: ${b.intake.pending}`, kind: "ready" });
+    return a;
+  }
+
+  // Intake inputs: one entry per comment, ride report or nightly; `became` null = not looked at yet.
+  const inputs = () => (((board || {}).intake || {}).inputs || []).filter((e) => e && typeof e === "object").slice().sort((p, q) => (q.at || 0) - (p.at || 0));
+  const pendingInputs = () => inputs().filter((e) => !e.became);
+  function inputCounts(list) {
+    const n = { comment: 0, report: 0, nightly: 0 }; for (const e of list) n[e.kind] = (n[e.kind] || 0) + 1;
+    return [n.comment ? `${n.comment} comment${n.comment === 1 ? "" : "s"}` : "", n.report ? `${n.report} report${n.report === 1 ? "" : "s"}` : "", n.nightly ? "nightly" : ""].filter(Boolean).join(", ");
+  }
+
+  function runningNow() {
+    const r = [];
+    const b = board || {};
+    if (b.intake && busy(b.intake.status)) r.push({ sec: "triage", text: "Triage", s: b.intake.status, at: b.intake.startedAt || b.intake.requestedAt });
+    for (const c of liveCycles()) for (const k of ORDER) { const st = stepOf(c, k); if (busy(st.status)) r.push({ sec: "cycles", cid: c.id, stage: k, text: `${STEP[k].label} · cycle ${c.number}`, s: st.status, at: st.startedAt || st.requestedAt }); }
+    return r;
+  }
+
+  // The cycle the Cycles section shows: the remembered one, else the newest live one.
+  function currentCycle() {
+    if (ui.cycle && ui.cycle !== "new" && ui.cycle !== "retired") { const c = cyc(ui.cycle); if (c) return c; }
+    return liveCycles()[0] || retiredCycles()[0] || null;
+  }
+  function goto(sec, cid, stage) {
+    ui.sec = sec;
+    if (cid !== undefined) ui.cycle = cid;
+    if (stage) ui.stage = stage;
+    else if (cid && cyc(cid)) ui.stage = cycleHint(cyc(cid)).stage;
+    ui.item = null; saveUi(); render(); window.scrollTo({ top: 0 });
+  }
+  const gotoAttrs = (x) => `data-sec="${x.sec}"${x.cid ? ` data-cycle="${esc(x.cid)}"` : ""}${x.stage ? ` data-stage="${x.stage}"` : ""}`;
+
+  // ---- shared renderers -------------------------------------------------
+  function trackHtml(st, big) {
+    return `<span class="track ${big ? "big" : ""}" data-tone="${st.tone}" aria-hidden="true">${STATIONS.map((_, i) => `<i class="${i <= st.i ? "on" : ""} ${i === st.i ? "cur" : ""}"></i>`).join("")}</span>`;
+  }
+  function stageLbl(st) { return `<span class="stage-lbl" data-tone="${st.tone}">${esc(st.label)}</span>`; }
+
+  function report(st, label) {
+    if (!st || (!st.summary && !st.detail)) return "";
+    return `<div class="report" data-s="${st.status || ""}">${label ? `<div class="rl">${esc(label)}</div>` : ""}${st.summary ? `<div class="rs">${esc(st.summary)}</div>` : ""}${st.detail ? `<details><summary>Details</summary><div class="rd">${esc(st.detail)}</div></details>` : ""}</div>`;
+  }
+
+  function wakeLine(st) {
+    if (!st.wake) return "";
+    if (st.wake.ok) return `Sent to Claude ${clock(st.wake.at)}.`;
+    return `Saved on the board, but not sent: ${st.wake.why}. Tell Claude “check the pipeline board”.`;
+  }
+
+  // The one action block per step: note field + button when ready, a status strip otherwise.
+  function actionBlock(o) {
+    const s = STATUS_LABEL[o.st.status] ? o.st.status : "idle";
+    const note = o.st.note ? `<div class="k">Your note</div><div class="v">${esc(o.st.note)}</div>` : "";
+    if (s === "requested") {
+      const stale = o.st.requestedAt && Date.now() - o.st.requestedAt > 10 * 60000;
+      return `<div class="action"><div class="status" data-s="requested">
+        <div class="k">Requested</div><div class="v">${clock(o.st.requestedAt)} · ${ago(o.st.requestedAt)}</div>
+        <div class="k">Now</div><div class="v ${stale ? "warn" : ""}">${stale ? "Not picked up after 10 minutes. Is a session watching this board? Tell Claude “check the pipeline board”." : "Waiting for Claude to pick it up. This page updates itself when it starts."}<br><span class="mono">${esc(wakeLine(o.st))}</span></div>
+        ${note}
+        ${o.auto ? "" : `<div class="actions"><button class="quiet" ${o.cancelAttrs}>Cancel request</button></div>`}
+      </div></div>`;
+    }
+    if (s === "running") {
+      return `<div class="action"><div class="status" data-s="running">
+        <div class="k">Running</div><div class="v">since ${clock(o.st.startedAt)} · ${ago(o.st.startedAt)}</div>
+        <div class="k">Now</div><div class="v">Claude is working on ${esc(o.label)}. This page updates itself when it finishes; the reply also lands on the comment thread.</div>
+        ${note}
+      </div>${report(o.st, "Progress so far")}</div>`;
+    }
+    const autoRow = `<p class="auto">${esc(o.autoText || "")}</p>${o.secondary || ""}`;
+    const readyRow = `<div class="field"><label for="${o.noteId}">Note for Claude</label><textarea id="${o.noteId}" placeholder="${esc(o.notePh)}" ${o.ready ? "" : "disabled"}>${esc(drafts[o.noteId] || "")}</textarea></div>${o.extra || ""}
+      <div class="go-row"><button class="go" ${o.dataAttrs} ${o.ready && canEdit !== false ? "" : "disabled"}>${esc(o.verb)}</button>${o.why ? `<span class="why ${o.ready ? "warn" : ""}">${esc(o.why)}</span>` : ""}</div>`;
+    if (s === "blocked") {
+      return `<div class="action"><div class="status" data-s="blocked">
+        <div class="k">Stopped</div><div class="v bad">${clock(o.st.finishedAt)} · ${esc(o.label)} needs something from you before it can finish.</div>
+        ${note}
+      </div>${report(o.st, "What Claude said")}
+      <div class="what" style="margin-top:12px">When that is sorted, press again to resume.</div>${readyRow}</div>`;
+    }
+    if (s === "done") {
+      return `<div class="action"><div class="status" data-s="done">
+        <div class="k">Done</div><div class="v">${when(o.st.finishedAt)}${o.st.startedAt && o.st.finishedAt ? ` · took ${Math.max(1, Math.round((o.st.finishedAt - o.st.startedAt) / 60000))} min` : ""}</div>
+        ${note}
+      </div>${report(o.st, "")}${o.auto ? (o.autoAfter ? `<p class="auto">${esc(o.autoAfter)}</p>${o.secondary || ""}` : "") : o.again ? `<div class="what" style="margin-top:12px">${esc(o.again)}</div>${readyRow}` : ""}</div>`;
+    }
+    if (o.auto) return `<div class="action"><div class="what">${esc(o.what)}</div>${autoRow}</div>`;
+    return `<div class="action"><div class="what">${esc(o.what)}</div>${readyRow}</div>`;
+  }
+
+  function branchCard(c, b, opts) {
+    opts = opts || {};
+    const sd = stat(c, "ship-dev");
+    const d = b.shippable === false ? "na" : !isBuilt(c, b) ? "na" : (b.decision || "none");
+    const kv = [["What changed", b.summary, ""], ["Measured", b.measured, ""], ["Tests", b.tests, "mono"], ["Files", b.files, "mono"], ["Screenshots", (b.screenshots || []).join("\n"), "mono"], ["Risks", b.risks, ""], ["Ships as", b.vehicle, ""]]
+      .filter(([, v]) => v).map(([k, v, cls]) => `<dt>${k}</dt><dd class="${cls}">${esc(v)}</dd>`).join("");
+    let state, controls = "";
+    if (b.shippable === false) state = `<span class="state">Measurement only — nothing to ship.</span>`;
+    else if (!isBuilt(c, b)) state = `<span class="state">Proposed by the plan — it ships to dev on its own once Build reports, unless you hold it.</span>`;
+    else {
+      const out = isOut(c, b), hold = b.decision === "hold";
+      const gateFail = hold && b.decidedBy === "build";
+      let txt;
+      if (out) txt = `On dev as ${c.bundle && c.bundle.dev ? c.bundle.dev : "the bundle"}`;
+      else if (hold) txt = (gateFail ? "Held by Build: its gate failed" : `Held ${clock(b.decidedAt)}`) + (sd === "done" ? " · press Ship to send it to dev" : " · ship-dev leaves it out");
+      else if (busy(sd)) txt = "Being merged to dev now";
+      else txt = "Passed its gates · ships to dev on its own";
+      state = `<span class="state ${hold ? "warn" : ""}">${esc(txt)}</span>`;
+      if (!out) {
+        const dis = canEdit === false || busy(sd) || c.retiredAt ? "disabled" : "";
+        controls = `<div class="seg" role="group" aria-label="Decision">
+        <button data-decide="approve" data-cycle="${esc(c.id)}" data-branch="${esc(b.name)}" aria-pressed="${!hold}" ${dis}>Ship</button>
+        <button data-decide="hold" data-cycle="${esc(c.id)}" data-branch="${esc(b.name)}" aria-pressed="${hold}" ${dis}>Hold</button>
+      </div>`;
+      }
+    }
+    return `<div class="branch" data-d="${d}">
+      <div class="bh"><h5 title="${esc(b.label || b.name)}">${esc(b.label || b.name)}</h5><span class="rows">${esc((b.rows || []).join(", "))}</span>${b.kind ? `<span class="pill">${esc(b.kind)}</span>` : ""}</div>
+      ${opts.full ? `<dl class="kv">${kv}</dl>` : `${b.summary ? `<div class="sum">${esc(b.summary)}</div>` : ""}`}
+      <span class="sha">${esc(b.name)}${b.sha ? " @ " + esc(b.sha) : ""}</span>
+      ${!opts.full && kv ? `<details><summary>Measured, tests, files, risks</summary><dl class="kv">${kv}</dl></details>` : ""}
+      <div class="decide">${controls}${state}</div>
+    </div>`;
+  }
+
+  function questionsBlock(c) {
+    const qs = c.questions || [];
+    if (!qs.length) return `<p class="sub muted">No questions on this cycle.</p>`;
+    const open = unanswered(c);
+    return `<div class="qs">${qs.map((q) => `
+      <div class="q" data-open="${!q.answer}">
+        <div class="qt"><b>${esc(q.id.toUpperCase())}</b> ${esc(q.text)}</div>
+        <div class="qm">${q.rows && q.rows.length ? "blocks " + esc(q.rows.join(", ")) : ""}${q.answeredAt ? " · answered " + when(q.answeredAt) : ""}</div>
+        ${q.answer ? `<div class="ans"><b>You:</b> ${esc(q.answer)}</div>` : `<textarea id="ans-${esc(c.id)}-${esc(q.id)}" placeholder="Your answer — one word is enough">${esc(drafts["ans-" + c.id + "-" + q.id] || "")}</textarea>`}
+      </div>`).join("")}
+      ${open.length ? `<div class="go-row" style="margin-top:0"><button class="go" data-answers="${esc(c.id)}" ${canEdit === false ? "disabled" : ""}>Send answers</button><span class="why">${open.length} open. Claude records each answer on its row and unblocks it.</span></div>` : ""}
+    </div>`;
+  }
+
+  function rowsTable(c, filterFn, opts) {
+    opts = opts || {};
+    const rs = (c.rows || []).filter(filterFn || (() => true));
+    if (!rs.length) return `<p class="sub muted">No rows.</p>`;
+    const draft = stat(c, "plan") === "draft";
+    const keepCell = (r) => {
+      if (!opts.keep) return "";
+      if (!draft) return `<td class="kp">${r.keep === false ? `<span class="pill">dropped</span>` : `<span class="pill" data-s="done">kept</span>`}</td>`;
+      const a = `data-cycle="${esc(c.id)}" data-row="${esc(r.num)}" ${canEdit === false ? "disabled" : ""}`;
+      return `<td class="kp"><div class="seg sm" role="group" aria-label="Keep ${esc(r.num)}"><button data-keep="1" ${a} aria-pressed="${r.keep !== false}">Keep</button><button data-keep="0" ${a} aria-pressed="${r.keep === false}">Drop</button></div></td>`;
+    };
+    return `<div class="tbl"><table><thead><tr>${opts.keep ? "<th>Keep</th>" : ""}<th>Row</th><th>Finding</th><th>Branch</th><th>Where</th></tr></thead><tbody>${rs.map((r) => {
+      const b = branches(c).find((x) => x.name === r.branch) || null; const st = itemStage(c, r, b);
+      return `<tr class="${r.keep === false ? "dropped" : ""}">${keepCell(r)}<td class="num"><button data-item="${esc(c.id + ":" + r.num)}">${esc(r.num)}</button></td><td>${esc(r.title)}</td><td class="br">${esc(r.branch || "")}</td><td>${trackHtml(st)} ${stageLbl(st)}</td></tr>`;
+    }).join("")}</tbody></table></div>`;
+  }
+
+  // Page head for a cycle: title on one line, state pills and the opened time on a meta line under it.
+  function cycleHead(c) {
+    const h = cycleHint(c);
+    const pills = (c.retiredAt ? `<span class="pill">Retired ${esc(when(c.retiredAt))}</span>` : `<span class="pill" data-s="${h.tone || "idle"}"><span class="dot" data-s="${h.tone}"></span>${esc(h.text)}</span>`)
+      + (c.bundle && c.bundle.dev ? `<span class="pill" data-s="accent">dev ${esc(c.bundle.dev)}</span>` : "")
+      + (c.bundle && c.bundle.prod ? `<span class="pill" data-s="done">prod ${esc(c.bundle.prod)}</span>` : "");
+    return `<div class="head"><h3>Cycle ${esc(c.number)}${c.title ? " — " + esc(c.title) : ""}</h3><div class="meta">${pills}<span>opened <span class="mono">${esc(when(c.createdAt))}</span></span>${c.retiredAt ? "" : `<span>Talk to it: its terminal in the Chat view (<b>cycle ${esc(c.number)}</b> · Terminal)</span>`}</div></div>`;
+  }
+  function stepper(c) {
+    const sts = ORDER.map((k) => [k, stepState(c, k)]);
+    return `<div class="stepper-wrap"><div class="stepper" role="tablist" aria-label="Steps">${sts.map(([k, s]) => `<button class="step" role="tab" data-s="${s.s}" aria-current="${ui.stage === k}" data-stage="${k}" data-sec="cycles" data-cycle="${esc(c.id)}"><span class="l">${STEP[k].label}</span><span class="st">${esc(s.t)}</span></button>`).join("")}</div></div>
+      <div class="steps-row" role="tablist" aria-label="Steps">${sts.map(([k, s]) => `<button class="sp" role="tab" aria-current="${ui.stage === k}" data-stage="${k}" data-sec="cycles" data-cycle="${esc(c.id)}"><span class="dot" data-s="${s.s}"></span>${STEP[k].label}</button>`).join("")}</div>`;
+  }
+
+  // ---- sections ---------------------------------------------------------
+  function renderFlow() {
+    const a = attention();
+    const you = a.filter((x) => x.kind === "you"), ready = a.filter((x) => x.kind === "ready");
+    const attn = `<section class="attn ${you.length ? "" : "calm"}">
+      <h3>${you.length ? `Needs you (${you.length})` : "Nothing waits on you"}</h3>
+      ${a.length ? `<ul>${you.concat(ready).map((x) => `<li><span>${esc(x.text)}</span><button class="link go" ${gotoAttrs(x)}>${x.kind === "you" ? "Go" : "Open"}</button></li>`).join("")}</ul>` : `<p class="sub">Claude is either working or idle. New rows arrive through Triage; a cycle starts under Cycles.</p>`}
+    </section>`;
+    const its = items();
+    const counts = STATIONS.map((_, i) => its.filter((x) => x.st.i === i).length);
+    const line = `<div class="line-wrap"><div class="line">${STATIONS.map((s, i) => `<button class="stn" data-zero="${counts[i] === 0}" data-filter="s${i}" title="Show items at ${s}"><span class="n">${counts[i]}</span><span class="l">${s}</span></button>`).join("")}</div></div>`;
+    const F = [["all", `All ${its.length}`], ["you", "Needs you"], ["s3", "On dev"], ["blocked", "Blocked"], ["deferred", "Deferred"], ["done", "Done"]];
+    const f = ui.filter;
+    const pass = (x) => f === "all" ? true : f === "you" ? (x.st.tone === "warn" || x.st.tone === "bad") : f === "blocked" ? (x.r.status === "blocked") : f === "deferred" ? (x.r.status === "next cycle") : f === "done" ? (x.st.i >= 4 && x.st.tone === "done") : f.startsWith("s") ? x.st.i === +f.slice(1) : true;
+    const shown = its.filter(pass).sort((p, q) => q.st.i - p.st.i || (q.c.number - p.c.number));
+    const list = shown.length ? `<div class="items">${shown.map((x) => `<button class="item" data-item="${esc(x.key)}">
+        <span class="num">${esc(x.r.num)}</span>
+        <span class="ttl">${esc(x.r.title)}</span>
+        <span class="st">${trackHtml(x.st)} ${stageLbl(x.st)} <span class="cyc">cycle ${esc(x.c.number)}</span></span>
+      </button>`).join("")}</div>` : `<p class="empty">No items match.</p>`;
+    return `<div class="head only-desk"><h3>Flow</h3><p class="lead">Every row in a cycle, on its way from planned to production.</p></div>${attn}${line}
+      <div class="filters">${F.map(([k, l]) => `<button class="chip" aria-pressed="${f === k}" data-filter="${k}">${l}</button>`).join("")}</div>
+      ${its.length ? list : `<p class="empty">No items yet. Run Triage to bring notes into the backlog, then open a cycle under Cycles.</p>`}
+      <div class="only-phone"><div class="sec">System</div>${sysHtml(false)}</div>`;
+  }
+
+  // ---- triage: the intake card and the ledger of every input ------------
+  const KIND_L = { comment: "C", report: "R", nightly: "N" };
+  const BECAME = { row: "New row", sighting: "Seen before", praise: "Praise", question: "Question back", none: "Nothing to do" };
+  function dayLabel(ms) {
+    const d = new Date(ms), t = new Date(); const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const diff = Math.round((day(t) - day(d)) / 86400000);
+    const dm = new Intl.DateTimeFormat(undefined, { weekday: "long", month: "short", day: "numeric" }).format(d);
+    return diff === 0 ? `Today · ${dm}` : diff === 1 ? `Yesterday · ${dm}` : dm;
+  }
+  function inputText(e) {
+    const txt = e.kind === "comment" ? `“${e.text || ""}”` : (e.text || "");
+    const img = e.image ? `<span class="img">img</span>` : "";
+    return `<span class="inwrap"><span class="kind" data-k="${esc(e.kind)}" title="${esc(e.kind)}">${KIND_L[e.kind] || "?"}</span><span>${esc(txt)}${img}</span></span>`;
+  }
+  function inputBecame(e) {
+    if (!e.became) return `<span class="stage-lbl" data-tone="warn">Not looked at</span>${e.flag ? `<span class="sub">${esc(e.flag)}</span>` : ""}`;
+    const b = e.became; const rows = b.rows || [];
+    const head = b.type === "sighting" ? `<span class="mono" style="color:var(--accent)">${esc(rows.join(", "))}</span> · seen before` : b.type === "row" ? `<span class="mono" style="color:var(--accent)">${esc(rows.join(", "))}</span>${rows.length > 1 ? "" : " · new row"}` : `<span class="stage-lbl" data-tone="neutral">${esc(BECAME[b.type] || b.type || "—")}</span>`;
+    return head + (b.note ? `<span class="sub">${esc(b.note)}</span>` : "");
+  }
+  function inputWhere(e) {
+    if (!e.became) return `<span class="wn"><span>${trackHtml({ i: 0, tone: "warn" })}<span class="stage-lbl" data-tone="warn">Waiting for triage</span></span></span>`;
+    const rows = (e.became.rows || []); if (!rows.length) return `<span class="muted">—</span>`;
+    const its = items();
+    return `<span class="wn">${rows.slice(0, 3).map((num) => {
+      const x = its.find((i) => i.r.num === num);
+      if (x) return `<span><button class="link" data-item="${esc(x.key)}">${esc(num)}</button>${trackHtml(x.st)}${stageLbl(x.st)}<span class="cyc">cycle ${esc(x.c.number)}</span></span>`;
+      return `<span><span class="mono" style="font-size:13px">${esc(num)}</span>${trackHtml({ i: 1, tone: "neutral" })}<span class="stage-lbl" data-tone="neutral">In the backlog, no cycle yet</span></span>`;
+    }).join("")}${rows.length > 3 ? `<span class="sub">+ ${rows.length - 3} more rows</span>` : ""}</span>`;
+  }
+  function ledger() {
+    const all = inputs(); const pend = pendingInputs();
+    const f = ui.tfilter || "all";
+    const F = [["all", "All", all.length, ""], ["new", "Not looked at", pend.length, "you"], ["comment", "Comments", all.filter((e) => e.kind === "comment").length, ""], ["report", "Reports", all.filter((e) => e.kind === "report").length, ""], ["nightly", "Nightly", all.filter((e) => e.kind === "nightly").length, ""]];
+    const chips = `<div class="filters tchips">${F.map(([k, l, n, t]) => `<button class="chip" aria-pressed="${f === k}" data-tfilter="${k}" ${t ? `data-t="${t}"` : ""}>${l}<span class="n">${n}</span></button>`).join("")}</div>`;
+    const shown = all.filter((e) => f === "all" ? true : f === "new" ? !e.became : e.kind === f).slice(0, 80);
+    if (!all.length) return chips + `<p class="empty">No inputs registered yet. The next scan or Triage run lists every comment, ride report and nightly here.</p>`;
+    if (!shown.length) return chips + `<p class="empty">${f === "new" ? "Everything has been looked at." : "Nothing of that kind."}</p>`;
+    let last = null; const body = [];
+    for (const e of shown) {
+      const dl = dayLabel(e.at || 0);
+      if (dl !== last) { body.push(`<tr class="day"><td colspan="4">${esc(dl)}</td></tr>`); last = dl; }
+      body.push(`<tr data-new="${!e.became}"><td class="when">${esc(clock(e.at))}</td><td class="in">${inputText(e)}</td><td class="became">${inputBecame(e)}</td><td class="where">${inputWhere(e)}</td></tr>`);
+    }
+    return chips + `<div class="tbl ledger"><table><thead><tr><th>When</th><th>Input</th><th>Became</th><th>Where now</th></tr></thead><tbody>${body.join("")}</tbody></table></div>`;
+  }
+
+  window.PV_TRIAGE = { html: () => ledger(), setFilter: (k) => { ui.tfilter = k; saveUi(); }, openItem: (key) => { ui.sec = "flow"; ui.item = key; saveUi(); } };
+  function renderTriage() {
+    const b = board || {}; const it = Object.assign({ status: "idle" }, b.intake || {});
+    const s = STATUS_LABEL[it.status] ? it.status : "idle";
+    const pend = pendingInputs(); const n = pend.length;
+    const pill = busy(s) || s === "blocked" ? `<span class="pill" data-s="${s}">${STATUS_LABEL[s]}</span>` : n ? `<span class="pill" data-s="you">${n} not looked at</span>` : `<span class="pill" data-s="done">Up to date</span>`;
+    const meta = `<div class="meta"><span>Last run <span class="mono">${it.lastTriageAt ? esc(when(it.lastTriageAt)) : "never"}</span></span><span>Scanned <span class="mono">${it.scannedAt ? esc(ago(it.scannedAt)) : "—"}</span></span><span>Open rows <span class="mono">${esc(b.facts && b.facts.openRows != null ? b.facts.openRows : "—")}</span></span></div>`;
+    const quiet = Object.assign({}, it, { summary: "", detail: "", status: s === "done" ? "idle" : s });
+    const body = actionBlock({
+      st: quiet, label: "Triage", verb: "Run triage", what: "Evaluates every input not yet looked at: dedupes against the backlog, opens or updates rows, and writes what each one became into the list below.",
+      noteId: "note-intake", notePh: "Anything to look at first (optional)", ready: true,
+      why: busy(s) ? "" : n ? `${n} new input${n === 1 ? "" : "s"} waiting: ${inputCounts(pend)}.` : "Nothing new since the last run.",
+      dataAttrs: `data-start-intake="1"`, cancelAttrs: `data-cancel-intake="1"`,
+      extra: `<label class="opt-row"><input type="checkbox" id="intake-then-plan" ${ui.thenPlan !== false ? "checked" : ""}> Then open cycle ${nextNumber()} with what it finds and plan it <span class="muted">— Build still waits for your press</span></label>`,
+    });
+    const lastRun = it.summary || it.detail ? `<details class="lastrun"><summary>What the last run said${it.lastTriageAt ? " · " + esc(when(it.lastTriageAt)) : ""}</summary>${report({ summary: it.summary, detail: it.detail, status: "done" }, "")}</details>` : "";
+    return `<div class="head only-desk"><h3>Triage</h3><p class="lead">Every comment, ride report and nightly, what it became, and where that is now. Continuous, not part of any cycle.</p></div>
+      <section class="card ${busy(s) ? "live" : ""}"><div class="card-head"><h4>Intake</h4>${pill}</div>${meta}${body}${lastRun}</section>
+      ${ledger()}`;
+  }
+
+  function stepCard(c, key, opts) {
+    opts = opts || {};
+    const st = stepOf(c, key); const s = stat(c, key); const g = gate(c, key);
+    const n = c.number;
+    const verb = STEP[key].verb(n, approved(c).length, c.bundle && c.bundle.sha);
+    const skip = key === "build" ? unanswered(c).flatMap((q) => q.rows || []) : [];
+    let why = g.ok ? "" : g.why;
+    if (g.ok && key === "build" && skip.length) why = `Rows ${skip.join(", ")} will be skipped until their question is answered under Plan.`;
+    const rev = planRev(c);
+    let body;
+    if (key === "plan" && s === "draft") {
+      const nk = keptRows(c).length, nd = droppedRows(c).length, nq = unanswered(c).length;
+      body = `<div class="action">
+        <div class="what">Read the plan, drop any row you don't want, answer the questions, and send notes — Claude revises and posts the next revision. Approving builds it and ships it to the dev app on its own; you can hold any branch while it builds. Production still waits for your Ship to prod.</div>
+        <div class="field"><label for="note-${esc(c.id)}-planfb">Your notes on this plan</label><textarea id="note-${esc(c.id)}-planfb" placeholder="e.g. drop 26.2, add 12.11 instead, why is 21.5 blocked?">${esc(drafts[`note-${c.id}-planfb`] || "")}</textarea></div>
+        <div class="go-row">
+          <button class="quiet" data-planfb="${esc(c.id)}" ${canEdit === false ? "disabled" : ""}>Send notes for revision ${rev + 1}</button>
+          <button class="go" data-planapprove="${esc(c.id)}" ${canEdit === false ? "disabled" : ""}>Approve plan · build it</button>
+          <span class="why">${nk} row${nk === 1 ? "" : "s"} kept · ${nd} dropped · ${nq} question${nq === 1 ? "" : "s"} open (rows with an open question are skipped by Build, not the cycle)</span>
+        </div>
+      </div>`;
+    } else if (key === "plan" && s === "done" && rev) {
+      body = `<div class="action"><div class="status" data-s="done"><div class="k">Approved</div><div class="v">${when(c.plan.approvedAt || st.finishedAt)} · revision ${rev}</div></div></div>`;
+    } else {
+      const reviseRun = key === "plan" && revising(c);
+      body = actionBlock({
+      st: reviseRun ? Object.assign({}, st, { summary: "", detail: "" }) : st, label: reviseRun ? `Plan revision ${rev + 1}` : `${STEP[key].label} for cycle ${n}`, verb, what: STEP[key].what, noteId: `note-${c.id}-${key}`, notePh: NOTE_PH[key] || "",
+      ready: g.ok && !c.retiredAt, why, dataAttrs: `data-start="${esc(c.id)}" data-step="${key}"`, cancelAttrs: `data-cancel="${esc(c.id)}" data-step="${key}"`,
+      again: opts.again || "", auto: !!opts.auto, autoText: opts.autoText || "", autoAfter: opts.autoAfter || "", secondary: opts.secondary || "",
+      });
+    }
+    return `<section class="card ${busy(s) ? "live" : ""}" id="card-${esc(c.id)}-${key}"><h4>${STEP[key].label}</h4>${opts.before || ""}${body}${opts.after || ""}</section>`;
+  }
+
+  function stageBody(c, key) {
+    const b = board || {}; const facts = b.facts || {};
+    if (key === "plan") {
+      const s = stat(c, "plan"); const pst = stepOf(c, "plan"); const p = c.plan || {}; const rev = planRev(c);
+      const before = rev ? `<div class="report" data-s="${esc(s)}"><div class="rl">Plan · revision ${esc(rev)}${s === "done" && p.approvedAt ? " · approved " + esc(when(p.approvedAt)) : p.revisedAt ? " · " + esc(when(p.revisedAt)) : ""}</div>${p.changes ? `<div class="rs"><b>What changed:</b> ${esc(p.changes)}</div>` : ""}${pst.summary ? `<div class="rs">${esc(pst.summary)}</div>` : ""}${pst.detail ? `<details><summary>Details</summary><div class="rd">${esc(pst.detail)}</div></details>` : ""}</div>` : "";
+      const fb = (c.feedback || []).filter((f) => f && typeof f === "object");
+      const thread = fb.length ? `<div class="sec">Notes so far <span class="cnt">${fb.length}</span></div><ul class="journey">${fb.map((f) => `<li data-t="${f.by === "rider" ? "cur" : "done"}"><span class="jt">${esc(when(f.t))} · ${f.by === "rider" ? "You" : "Claude"}</span><span class="jx">${esc(f.text)}</span></li>`).join("")}</ul>` : "";
+      // Legacy cycles (planned before revisions existed) have no plan.revision but are done: still show their questions and rows.
+      const show = rev || s === "done";
+      const nd = droppedRows(c).length;
+      const after = show ? `${thread}<div class="sec">Questions ${unanswered(c).length ? `<span class="cnt">${unanswered(c).length} open</span>` : ""}</div>${questionsBlock(c)}<div class="sec">Rows in this cycle <span class="cnt">${keptRows(c).length} kept${nd ? ` · ${nd} dropped` : ""}</span></div>${rowsTable(c, null, { keep: !!rev })}` : "";
+      return stepCard(c, "plan", { before, after });
+    }
+    if (key === "build") {
+      const s = stat(c, "build"); const bs = branches(c);
+      const summary = s === "done" || bs.some((x) => x.sha) ? `<div class="sec">Branches <span class="cnt">${ships(c).length} ship · ${held(c).length} held · ${bs.filter((x) => x.shippable === false).length} measurement-only</span></div>` : bs.length ? `<div class="sec">Branches <span class="cnt">${bs.filter((x) => !isBuilt(c, x)).length ? "proposed by the plan — decisions open once Build reports" : ""}</span></div>` : "";
+      const list = bs.length ? `<div class="branches">${bs.map((x) => branchCard(c, x)).join("")}</div>` : (s === "done" ? `<p class="sub muted">Build finished with no branches recorded.</p>` : "");
+      const take = s === "idle" ? `<div class="sec">Rows Build will take</div>${rowsTable(c, (r) => r.status !== "closed" && r.keep !== false)}` : "";
+      const gp = stat(c, "plan") === "done";
+      return stepCard(c, "build", { after: summary + list + take, auto: true, autoText: gp ? "Starting on its own." : "Waiting for you to approve the plan.", autoAfter: "Rows unblocked by an answer build on their own." });
+    }
+    if (key === "ship-dev") {
+      const ap = ships(c), hd = held(c), na = branches(c).filter((x) => x.shippable === false);
+      const lst = (arr) => arr.length ? arr.map((x) => `<li>${esc(x.label || x.name)} <span class="mono muted" style="font-size:12px">${esc((x.rows || []).join(", "))}</span></li>`).join("") : "<li class='muted'>none</li>";
+      const before = `<p class="now">On dev now <span class="mono">${esc(facts.devBundle || "—")}</span> · otprr main <span class="mono">${esc(facts.otprrMain || "—")}</span> · daemon <span class="mono">${esc(facts.daemon || "—")}</span></p>
+        ${branches(c).length ? `<dl class="kv" style="margin-top:12px"><dt>Ships (${ap.length})</dt><dd><ul class="plain">${lst(ap)}</ul></dd><dt>Held (${hd.length})</dt><dd><ul class="plain">${lst(hd)}</ul>${hd.length ? `<button class="link" data-sec="cycles" data-cycle="${esc(c.id)}" data-stage="build">Change under Build</button>` : ""}</dd>${na.length ? `<dt>Not shippable</dt><dd><ul class="plain">${lst(na)}</ul></dd>` : ""}</dl>` : ""}`;
+      return stepCard(c, "ship-dev", { before, auto: true, autoText: stat(c, "build") === "done" ? "Starting on its own." : "Waiting for Build to finish.", autoAfter: held(c).length ? "A held branch you set back to Ship goes to dev on its own within 30 minutes." : "" });
+    }
+    if (key === "verify") {
+      const rowsOnDev = (c.rows || []).filter((r) => ["on-dev", "not-exercised"].includes(r.status)).length;
+      const v = stepOf(c, "verify");
+      const rl = window.pvRideLine(c);
+      const before = (rl ? `<p class="now ride-line">${esc(rl)}</p>` : "") + `<p class="now">Bundle on dev <span class="mono">${esc(facts.devBundle || "—")}</span>. Cycle ${esc(c.number)} only${rowsOnDev ? ` — ${rowsOnDev} row${rowsOnDev === 1 ? "" : "s"} waiting on a ride` : ""}; other cycles verify themselves. Which app and bundle a ride ran is read from checks.jsonl, never from the report.</p>`;
+      const after = (stat(c, "ship-dev") === "done" ? `<div class="sec">Rows on dev from this cycle</div>${rowsTable(c, (r) => r.branch && r.status !== "next cycle")}` : "");
+      const vn = "";
+      return stepCard(c, "verify", { before, after, auto: true, autoText: stat(c, "ship-dev") === "done" ? "Waiting for your next ride on the dev app." : "Waiting for Ship dev to finish.", autoAfter: onDev(c) ? "The next ride on the dev app scores the rows it did not exercise, on its own." : "", secondary: vn });
+    }
+    if (key === "ship-prod") {
+      const rs = c.rows || []; const pass = rs.filter((r) => ["pass", "closed"].includes(r.status)).length, fail = rs.filter((r) => r.status === "fail").length, ne = rs.filter((r) => r.status === "not-exercised").length;
+      const before = `<p class="now">In production now <span class="mono">${esc(facts.prodBundle || "—")}</span>. Promotion ships the same web sha a ride verified; a later cycle's promotion carries earlier ones with it.</p>
+        ${stat(c, "verify") === "done" ? `<p class="sub" style="margin-top:8px">Ride verdicts: ${pass} pass · ${fail} fail · ${ne} not exercised. Web sha <span class="mono">${esc(c.bundle && c.bundle.sha || "—")}</span> (dev ${esc(c.bundle && c.bundle.dev || "—")}).</p>` : ""}`;
+      return stepCard(c, "ship-prod", { before });
+    }
+    return "";
+  }
+
+  function renderNewCycle() {
+    const n = nextNumber();
+    const anyPlanning = liveCycles().some((c) => busy(stat(c, "plan")));
+    return `<div class="head"><h3>Open cycle ${n}</h3><div class="meta"><span>A cycle is one dev bundle. Cycles overlap, so a new one can be planned while another waits on dev for a ride.</span></div></div>
+      <section class="card"><h4>Plan</h4><div class="action" style="border-top:0;padding-top:4px;margin-top:6px"><div class="what">Opens the next cycle and asks Claude to draft a plan: your named rows first, otherwise the most-sighted rows and your asks from the backlog. You review and revise it before anything is built.</div>
+      <div class="field"><label for="note-newcycle">Rows to include</label><textarea id="note-newcycle" placeholder="${esc(NOTE_PH.plan)}">${esc(drafts["note-newcycle"] || "")}</textarea></div>
+      <div class="go-row"><button class="go" id="newcycle" ${canEdit === false ? "disabled" : ""}>Open cycle ${n} and draft a plan</button>${anyPlanning ? `<span class="why">A plan is already in progress on another cycle; a second one queues behind it.</span>` : ""}</div></div></section>`;
+  }
+  function renderRetired() {
+    const rs = retiredCycles();
+    return `<div class="head"><h3>Retired cycles</h3><div class="meta"><span>Shipped to production. Rows marked “closes on a ride” wait for a ride; Triage closes them.</span></div></div>
+      ${rs.length ? `<div class="stack">${rs.map((c) => `<section class="card dim"><div class="card-head"><h4>Cycle ${esc(c.number)}${c.title ? " — " + esc(c.title) : ""}</h4><span class="pill">Retired ${esc(when(c.retiredAt))}</span>${c.bundle && c.bundle.prod ? `<span class="pill" data-s="done">prod ${esc(c.bundle.prod)}</span>` : ""}</div><div style="margin-top:10px">${rowsTable(c)}</div></section>`).join("")}</div>` : `<p class="empty">No retired cycles yet.</p>`}`;
+  }
+  function renderCycles() {
+    if (ui.cycle === "new") return renderNewCycle();
+    if (ui.cycle === "retired") return renderRetired();
+    const c = currentCycle();
+    if (!c) return `<div class="head"><h3>Cycles</h3></div><p class="empty">No cycle yet. <button class="link" data-sec="cycles" data-cycle="new">Open cycle 1.</button></p>`;
+    if (!ui.stage || !ORDER.includes(ui.stage)) ui.stage = cycleHint(c).stage;
+    return cycleHead(c) + stepper(c) + stageBody(c, ui.stage);
+  }
+
+  function renderLog() {
+    const log = ((board || {}).log || []).slice().reverse();
+    return `<div class="head only-desk"><h3>Log</h3><p class="lead">Every press, answer, decision and finish, newest first.</p></div><ul class="log">${log.length ? log.map((e) => `<li><span class="t">${when(e.t)}</span><span class="s">${esc(e.stage || "")}</span><span class="x">${esc(e.event)}${e.text ? " — " + esc(e.text) : ""}</span></li>`).join("") : "<li><span class='t'></span><span class='s'></span><span class='x muted'>Nothing yet.</span></li>"}</ul>`;
+  }
+
+  // ---- drawer -----------------------------------------------------------
+  function journey(x) {
+    const { c, r, qs, st } = x; const J = []; const b = x.b && isBuilt(c, x.b) ? x.b : null;
+    const plan = stepOf(c, "plan"), build = stepOf(c, "build"), sd = stepOf(c, "ship-dev"), v = stepOf(c, "verify"), sp = stepOf(c, "ship-prod");
+    if (stat(c, "plan") !== "done") J.push({ t: "cur", when: (c.plan && c.plan.revisedAt) || c.createdAt, text: `Planned into cycle ${c.number} — draft revision ${planRev(c)}, waiting for your review.` });
+    else J.push({ t: "done", when: plan.finishedAt || c.createdAt, text: `Planned into cycle ${c.number}${r.kind === "measure" ? " as a measurement" : r.kind === "daemon" ? " as a daemon change" : ""}.` });
+    if (r.keep === false) { J.push({ t: "warn", when: null, text: "Dropped from this cycle by you." }); return J; }
+    for (const q of qs) J.push(q.answer ? { t: "done", when: q.answeredAt, text: `${q.id.toUpperCase()} answered: “${q.answer}”` } : { t: "bad", when: null, text: `Waiting on your answer to ${q.id.toUpperCase()}: ${q.text}` });
+    if (r.status === "next cycle") { J.push({ t: "warn", when: null, text: "Deferred: builds in the next cycle." }); return J; }
+    if (r.status === "blocked") return J;
+    if (b) {
+      J.push({ t: "done", when: build.finishedAt, text: `Built on ${b.name}${b.sha ? " @ " + b.sha : ""}${b.tests ? " · " + b.tests : ""}` });
+      if (b.shippable === false) { J.push({ t: "done", when: build.finishedAt, text: "Measurement only — nothing to ship. Closes on the row." }); return J; }
+      if (b.decision === "hold") J.push({ t: "warn", when: b.decidedAt, text: b.decidedBy === "build" ? "Held by Build: its gate failed." : "Held back by you — not in the next dev bundle." });
+      else J.push({ t: "done", when: b.decidedAt || build.finishedAt, text: "Passed its gates — ships to dev on its own." });
+    } else if (r.status === "measured") { J.push({ t: "done", when: build.finishedAt, text: "Measured — nothing to ship." }); return J; }
+    else if (busy(build.status)) J.push({ t: "cur", when: build.startedAt || build.requestedAt, text: build.status === "running" ? "Building now." : "Build requested." });
+    else J.push({ t: "todo", when: null, text: "Build" });
+    if (sd.status === "done" && (r.status === "on-dev" || r.status === "not-exercised" || r.status === "pass" || r.status === "fail" || r.status === "closed" || (b && b.decision !== "hold"))) J.push({ t: "done", when: sd.finishedAt, text: `On dev as ${c.bundle && c.bundle.dev || "the bundle"}${c.bundle && c.bundle.sha ? " (web " + c.bundle.sha + ")" : ""}.` });
+    else if (busy(sd.status) && b && b.decision !== "hold") J.push({ t: "cur", when: sd.startedAt || sd.requestedAt, text: "Shipping to dev now." });
+    else J.push({ t: "todo", when: null, text: "Ships to dev on its own" });
+    if (r.status === "in-prod") { J.push({ t: "done", when: sp.finishedAt, text: `In production as ${c.bundle && c.bundle.prod || "the bundle"}; the cycle retired when it shipped.` }); J.push({ t: "warn", when: null, text: "Not exercised on a ride yet — Triage closes it on the first ride that shows it working." }); return J; }
+    if (r.status === "pass" || r.status === "closed") J.push({ t: "done", when: v.finishedAt, text: "Verified on a ride — pass." });
+    else if (r.status === "fail") J.push({ t: "bad", when: v.finishedAt, text: "Failed on the ride — back to the backlog for a later cycle." });
+    else if (r.status === "not-exercised") J.push({ t: "warn", when: v.finishedAt, text: "Last ride did not exercise it — waits for the next ride." });
+    else if (busy(v.status)) J.push({ t: "cur", when: v.startedAt || v.requestedAt, text: "Verifying the last ride now." });
+    else J.push({ t: "todo", when: null, text: "Verifies on its own on a dev-app ride" });
+    if (c.bundle && c.bundle.prod && (r.status === "pass" || r.status === "closed")) J.push({ t: "done", when: sp.finishedAt, text: `In production as ${c.bundle.prod}.` });
+    else J.push({ t: "todo", when: null, text: "Ship prod" });
+    return J;
+  }
+
+  function renderDrawer() {
+    const d = $("drawer");
+    if (!ui.item) { d.hidden = true; $("scrim").hidden = true; return; }
+    const x = items().find((i) => i.key === ui.item);
+    if (!x) { ui.item = null; saveUi(); d.hidden = true; $("scrim").hidden = true; return; }
+    const J = journey(x);
+    d.innerHTML = `<div class="dh"><span class="num">${esc(x.r.num)}</span><h2 id="drawer-title">${esc(x.r.title)}</h2><button class="close" data-close="1" aria-label="Close">×</button></div>
+      <div class="dmeta"><button class="link" data-sec="cycles" data-cycle="${esc(x.c.id)}">cycle ${esc(x.c.number)}</button>${x.r.kind ? `<span class="pill">${esc(x.r.kind)}</span>` : ""}${x.r.branch ? `<span class="mono">${esc(x.r.branch)}</span>` : ""}</div>
+      <div class="trackrow">${trackHtml(x.st, true)}${stageLbl(x.st)}</div>
+      <div class="stn-names" aria-hidden="true">${STATIONS.map((s) => `<span>${s}</span>`).join("")}</div>
+      <h3>Journey</h3><ul class="journey">${J.map((j) => `<li data-t="${j.t}">${j.when ? `<span class="jt">${esc(when(j.when))}</span>` : ""}<span class="jx">${esc(j.text)}</span></li>`).join("")}</ul>
+      ${x.b ? `<h3>Branch report</h3>${branchCard(x.c, x.b, { full: true })}` : ""}
+      ${x.qs.length ? `<h3>Questions</h3>${questionsBlock(Object.assign({}, x.c, { questions: x.qs }))}` : ""}`;
+    d.hidden = false; $("scrim").hidden = false;
+  }
+
+  // ---- chrome -----------------------------------------------------------
+  function sysHtml(stack) {
+    const f = (board || {}).facts || {};
+    return `<div class="sys ${stack ? "stack" : ""}">${[["Dev", f.devBundle], ["Prod", f.prodBundle], ["Open", f.openRows != null ? f.openRows + " rows" : null], ["Main", f.otprrMain], ["Daemon", f.daemon]].map(([k, v]) => `<span><b>${k}</b><i>${esc(v ?? "—")}</i></span>`).join("")}</div>`;
+  }
+  function liveState(run) {
+    if (!connected) return { s: "off", text: "not connected" };
+    if (run.length) return { s: "run", text: run.map((r) => `${r.text} ${r.s === "running" ? "running" : "requested"} ${ago(r.at)}`).join(" · ") };
+    const b = board || {};
+    return { s: "live", text: "live · " + (b.updatedAt ? "updated " + when(b.updatedAt) : "empty board") };
+  }
+  function secBadge(k, a, run) {
+    const you = a.filter((x) => x.kind === "you" && x.sec === k).length;
+    const running = run.some((r) => r.sec === k);
+    if (k === "flow") { const n = a.filter((x) => x.kind === "you").length; return n ? `<span class="badge" data-t="you">${n}</span>` : ""; }
+    if (k === "triage") { if (running) return `<span class="badge" data-t="run">●</span>`; const n = pendingInputs().length; return n ? `<span class="badge" data-t="you">${n}</span>` : ""; }
+    if (running) return `<span class="badge" data-t="run">●</span>`;
+    return you ? `<span class="badge" data-t="you">${you}</span>` : "";
+  }
+  function sidebarHtml(a, run) {
+    const lv = liveState(run);
+    const inCycles = ui.sec === "cycles";
+    const items = SECS.map(([k, l]) => {
+      let h = `<button class="it" aria-current="${ui.sec === k && !(k === "cycles" && (ui.cycle === "new" || ui.cycle === "retired"))}" data-sec="${k}"${k === "cycles" ? ` data-cycle="${esc((currentCycle() || {}).id || "new")}"` : ""}>${l}${secBadge(k, a, run)}</button>`;
+      if (k === "cycles") {
+        const cur = currentCycle();
+        h += liveCycles().map((c) => { const hint = cycleHint(c); return `<button class="it sub" aria-current="${inCycles && cur && cur.id === c.id && ui.cycle !== "new" && ui.cycle !== "retired"}" data-sec="cycles" data-cycle="${esc(c.id)}"><span class="dot" data-s="${hint.tone}"></span>Cycle ${esc(c.number)}<span class="hint" title="${esc(hint.text)}">${esc(hint.text)}</span></button>`; }).join("");
+        if (retiredCycles().length) h += `<button class="it sub" aria-current="${inCycles && ui.cycle === "retired"}" data-sec="cycles" data-cycle="retired"><span class="dot" data-s="done"></span>Retired<span class="hint">${retiredCycles().length}</span></button>`;
+        h += `<button class="it sub new" aria-current="${inCycles && ui.cycle === "new"}" data-sec="cycles" data-cycle="new">+ Open cycle ${nextNumber()}</button>`;
+      }
+      return h;
+    }).join("");
+    return `<div class="brand">TransitNav Pipeline</div><div class="live"><span class="dot" data-s="${lv.s}"></span><span title="${esc(lv.text)}">${esc(lv.text)}</span></div>${PV.switchHtml("pv-sb")}${items}<div class="foot">${sysHtml(true)}</div>`;
+  }
+  function phoneHeadHtml(a, run) {
+    const lv = liveState(run);
+    const secLabel = (SECS.find((s) => s[0] === ui.sec) || SECS[0])[1];
+    if (ui.sec !== "cycles") return `<div class="eyebrow"><span class="dot" data-s="${lv.s}"></span><span>${esc(lv.text)}</span></div><h2>${secLabel}</h2>`;
+    const cur = currentCycle();
+    const chips = `<div class="cyc-row">${liveCycles().map((c) => `<button class="cp" aria-current="${cur && cur.id === c.id && ui.cycle !== "new" && ui.cycle !== "retired"}" data-sec="cycles" data-cycle="${esc(c.id)}"><span class="dot" data-s="${cycleHint(c).tone}"></span><b>${esc(c.number)}</b></button>`).join("")}${retiredCycles().length ? `<button class="cp dim" aria-current="${ui.cycle === "retired"}" data-sec="cycles" data-cycle="retired">Retired <span class="h">${retiredCycles().length}</span></button>` : ""}<button class="cp new" aria-current="${ui.cycle === "new"}" data-sec="cycles" data-cycle="new">+ ${nextNumber()}</button></div>`;
+    if (ui.cycle === "new") return `<div class="eyebrow"><span>Cycles</span></div><h2>Open cycle ${nextNumber()}</h2>${chips}`;
+    if (ui.cycle === "retired") return `<div class="eyebrow"><span>Cycles</span></div><h2>Retired</h2>${chips}`;
+    if (!cur) return `<div class="eyebrow"><span>Cycles</span></div><h2>No cycle yet</h2>${chips}`;
+    const h = cycleHint(cur);
+    return `<div class="eyebrow"><span class="dot" data-s="${h.tone}"></span><span>Cycle ${esc(cur.number)} · ${esc(h.text)}</span></div><h2>${cur.title ? esc(cur.title) : "Cycle " + esc(cur.number)}</h2>${chips}`;
+  }
+  function bottomBarHtml(a, run) {
+    return SECS.map(([k, l]) => `<button class="it" aria-current="${ui.sec === k}" data-sec="${k}"${k === "cycles" ? ` data-cycle="${esc((currentCycle() || {}).id || "new")}"` : ""}>${ICONS[k]}${l}${secBadge(k, a, run)}</button>`).join("");
+  }
+
+  // ---- top-level render -------------------------------------------------
+  function render() {
+    if (!PV.shown("classic")) return; // hidden view: render on show
+    if (!SECS.some((s) => s[0] === ui.sec)) ui.sec = "flow";
+    const a = attention(); const run = runningNow();
+    $("sb").innerHTML = sidebarHtml(a, run);
+    $("phead").innerHTML = PV.switchHtml("pv-ph") + phoneHeadHtml(a, run);
+    $("bbar").innerHTML = bottomBarHtml(a, run);
+    const focused = document.activeElement && document.activeElement.tagName === "TEXTAREA" ? document.activeElement.id : null;
+    const R = { flow: renderFlow, triage: renderTriage, cycles: renderCycles, log: renderLog };
+    $("main").innerHTML = (connected ? "" : `<div class="offline">This page can't reach its board from here. Open it inside claude.ai to press anything.</div>`) + (R[ui.sec] || renderFlow)();
+    renderDrawer();
+    if (focused) { const el = $(focused); if (el) { el.focus(); try { el.setSelectionRange(el.value.length, el.value.length); } catch (_) {} } }
+  }
+
+  let toastTimer;
+  function toast(msg, ms) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), ms || 4500); }
+
+  // ---- events -----------------------------------------------------------
+  ROOT.addEventListener("input", (e) => { const el = e.target; if (el.tagName === "TEXTAREA" && el.id) drafts[el.id] = el.value; });
+  ROOT.addEventListener("change", (e) => { if (e.target.id === "intake-then-plan") { ui.thenPlan = e.target.checked; saveUi(); } });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && ui.item && PV.shown("classic")) { ui.item = null; saveUi(); renderDrawer(); } });
+  ROOT.addEventListener("click", (e) => {
+    if (e.target.id === "scrim") { ui.item = null; saveUi(); return renderDrawer(); }
+    const t = e.target.closest("button"); if (!t) return;
+    if (t.dataset.close) { ui.item = null; saveUi(); return renderDrawer(); }
+    if (t.dataset.decide) return decideBranch(t.dataset.cycle, t.dataset.branch, t.dataset.decide, t);
+    if (t.dataset.keep !== undefined) return setKeep(t.dataset.cycle, t.dataset.row, t.dataset.keep === "1", t);
+    if (t.dataset.planfb) return sendPlanFeedback(t.dataset.planfb, t);
+    if (t.dataset.planapprove) return approvePlan(t.dataset.planapprove, t);
+    if (t.dataset.sec) return goto(t.dataset.sec, t.dataset.cycle, t.dataset.stage);
+    if (t.dataset.tfilter) { ui.tfilter = t.dataset.tfilter; saveUi(); return render(); }
+    if (t.dataset.filter) { ui.filter = t.dataset.filter; ui.sec = "flow"; saveUi(); return render(); }
+    if (t.dataset.item) { ui.item = t.dataset.item; saveUi(); return renderDrawer(); }
+    if (t.dataset.startIntake) return requestIntake(t);
+    if (t.dataset.cancelIntake) return cancelIntake();
+    if (t.id === "newcycle") return newCycle(t);
+    if (t.dataset.start) return requestStep(t.dataset.start, t.dataset.step, t);
+    if (t.dataset.cancel) return cancelStep(t.dataset.cancel, t.dataset.step);
+    if (t.dataset.answers) return sendAnswers(t.dataset.answers, t);
+  });
+
+  // ---- writes -----------------------------------------------------------
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  function appendLog(b, entry) { b.log = (b.log || []).concat([entry]).slice(-80); }
+  async function readDoc(path) { const ref = db.doc(path); const s = await ref.get(); return { ref, data: s.exists ? clone(s.data()) : null }; }
+  async function logBoard(entry) { const { ref, data } = await readDoc(BOARD); const b = data || {}; appendLog(b, entry); b.updatedAt = Date.now(); await ref.set(b); }
+
+  async function wake(anchorEl, text) {
+    if (!comments) return { ok: false, why: "comments aren't available in this view" };
+    try {
+      const can = await comments.canSendToClaude();
+      if (can !== "available") return { ok: false, why: can === "no_session" ? "no Claude session is watching the board" : can === "writers_only" ? "this account can't send to Claude here" : "sending to Claude is off here" };
+      const anchor = await comments.anchorFor(anchorEl || $("main"));
+      await comments.sendToClaude({ anchor, text });
+      return { ok: true };
+    } catch (err) { return { ok: false, why: err && err.code === "consent_required" ? "you didn't allow the page to comment" : (err && err.code) || "the send failed" }; }
+  }
+  const noDb = () => { toast("No board connection. Open this page inside claude.ai."); return false; };
+
+  async function requestIntake(btn) {
+    if (!db) return noDb();
+    const note = (drafts["note-intake"] || "").trim(); const now = Date.now(); btn.disabled = true;
+    try {
+      const { ref, data } = await readDoc(BOARD); const b = data || {};
+      b.intake = Object.assign({}, b.intake || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null, thenPlan: ui.thenPlan !== false });
+      appendLog(b, { t: now, stage: "triage", event: "requested", text: (note ? note + " · " : "") + (ui.thenPlan !== false ? "then plan cycle " + nextNumber() : "triage only") }); b.updatedAt = now; await ref.set(b); drafts["note-intake"] = "";
+    } catch (err) { btn.disabled = false; return toast("Couldn't write the request (" + (err && err.code || "error") + "). Nothing was queued."); }
+    const r = await wake($("main"), `START triage` + (ui.thenPlan !== false ? ` — then plan cycle ${nextNumber()}` : "") + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "triage", update pipeline/board.intake` + (ui.thenPlan !== false ? `, then open cycles/c${nextNumber()} with the rows triage opened or touched and run stage "plan" on it` : "") + `, and reply here when it is done.`);
+    try { const { ref, data } = await readDoc(BOARD); if (data && data.intake) { data.intake.wake = { ok: r.ok, at: Date.now(), why: r.why || "" }; await ref.set(data); } } catch (_) {}
+    toast(r.ok ? (ui.thenPlan !== false ? "Sent to Claude. Triage is queued; a plan follows." : "Sent to Claude. Triage is queued.") : `Queued on the board, but ${r.why}.`, r.ok ? 4000 : 7000);
+  }
+  async function cancelIntake() {
+    if (!db) return noDb(); const now = Date.now();
+    try { const { ref, data } = await readDoc(BOARD); if (!data || !data.intake || data.intake.status !== "requested") return toast("Too late — Claude already picked it up.");
+      data.intake = Object.assign({}, data.intake, { status: data.intake.finishedAt ? "done" : "idle", requestedAt: null, note: "", wake: null }); appendLog(data, { t: now, stage: "triage", event: "request cancelled" }); data.updatedAt = now; await ref.set(data); toast("Cancelled.");
+    } catch (err) { toast("Couldn't cancel (" + (err && err.code || "error") + ")."); }
+  }
+
+  async function newCycle(btn) {
+    if (!db) return noDb();
+    const note = (drafts["note-newcycle"] || "").trim(); const now = Date.now(); btn.disabled = true;
+    const number = nextNumber(); const id = "c" + number;
+    try {
+      await db.doc("cycles/" + id).set({ id, number, createdAt: now, rows: [], questions: [], branches: [], bundle: {}, steps: { plan: { status: "requested", requestedAt: now, note, requestedBy: uid || null } } });
+      await logBoard({ t: now, stage: "cycle " + number, event: "opened", text: note }); drafts["note-newcycle"] = "";
+      ui.cycle = id; ui.stage = "plan"; saveUi();
+    } catch (err) { btn.disabled = false; return toast("Couldn't open the cycle (" + (err && err.code || "error") + ")."); }
+    const r = await wake($("main"), `START plan — cycle ${number}` + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "plan" on cycles/${id}, and reply here when the plan is ready to read.`);
+    await recordWake([id], "plan", r);
+    toast(r.ok ? `Sent to Claude. Cycle ${number} is being planned.` : `Cycle ${number} is open on the board, but ${r.why}.`, r.ok ? 4000 : 7000);
+  }
+
+  async function recordWake(ids, key, r) {
+    for (const id of ids) { try { const { ref, data } = await readDoc("cycles/" + id); if (data && data.steps && data.steps[key]) { data.steps[key].wake = { ok: r.ok, at: Date.now(), why: r.why || "" }; await ref.set(data); } } catch (_) {} }
+  }
+
+  async function requestStep(cid, key, btn) {
+    if (!db) return noDb();
+    const note = (drafts["note-" + cid + "-" + key] || "").trim(); const now = Date.now(); btn.disabled = true;
+    // A press acts on the cycle it was pressed on, never on others (2026-09-24: Verify used to fan out to every cycle on dev).
+    const targets = [cid];
+    try {
+      for (const id of targets) {
+        const { ref, data } = await readDoc("cycles/" + id); if (!data) continue;
+        data.steps = data.steps || {}; data.steps[key] = Object.assign({}, data.steps[key] || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null });
+        await ref.set(data);
+      }
+      const c0 = cyc(cid); await logBoard({ t: now, stage: "cycle " + (c0 ? c0.number : cid), event: key + " requested", text: note }); drafts["note-" + cid + "-" + key] = "";
+    } catch (err) { btn.disabled = false; return toast("Couldn't write the request (" + (err && err.code || "error") + "). Nothing was queued."); }
+    const c0 = cyc(cid); const n = c0 ? c0.number : cid;
+    const text = key === "verify"
+      ? `START verify — cycle ${n} (last ride)` + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "verify" on cycles/${cid} ONLY — score this cycle's rows against the last dev ride, touch no other cycle, update it, and reply here when done.`
+      : key === "ship-dev"
+        ? `START ship-dev — cycle ${n}\nApproved: ${ships(c0 || {}).map((b) => b.name).join(", ") || "(none)"}\nHeld: ${held(c0 || {}).map((b) => b.name).join(", ") || "(none)"}` + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "ship-dev" on cycles/${cid}: merge every built branch that is not held, update it, and reply here when it is done.`
+        : `START ${key} — cycle ${n}` + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "${key}" on cycles/${cid}, update it, and reply here when it is done.`;
+    const r = await wake($("card-" + cid + "-" + key) || $("main"), text);
+    await recordWake(targets, key, r);
+    toast(r.ok ? `Sent to Claude. ${STEP[key].label} is queued.` : `Queued on the board, but ${r.why}.`, r.ok ? 4000 : 7000);
+  }
+  async function cancelStep(cid, key) {
+    if (!db) return noDb(); const now = Date.now();
+    const targets = [cid];
+    try {
+      let any = false;
+      for (const id of targets) { const { ref, data } = await readDoc("cycles/" + id); if (!data) continue; const st = (data.steps || {})[key] || {}; if (st.status !== "requested") continue;
+        data.steps[key] = Object.assign({}, st, { status: key === "plan" && st.mode === "revise" ? "draft" : st.finishedAt ? "done" : "idle", mode: key === "plan" && st.mode === "revise" ? null : (st.mode || null), requestedAt: null, note: "", wake: null }); await ref.set(data); any = true; }
+      if (!any) return toast("Too late — Claude already picked it up.");
+      const c = cyc(cid); await logBoard({ t: now, stage: "cycle " + (c ? c.number : cid), event: key + " request cancelled" }); toast("Cancelled.");
+    } catch (err) { toast("Couldn't cancel (" + (err && err.code || "error") + ")."); }
+  }
+
+  async function sendAnswers(cid, btn) {
+    if (!db) return noDb();
+    const c0 = cyc(cid); if (!c0) return;
+    const answers = unanswered(c0).map((q) => ({ q, a: (drafts["ans-" + cid + "-" + q.id] || "").trim() })).filter((x) => x.a);
+    if (!answers.length) return toast("Type an answer first.");
+    const now = Date.now(); btn.disabled = true; let inReview = false, rev = 0;
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return;
+      data.questions = (data.questions || []).map((q) => { const hit = answers.find((x) => x.q.id === q.id); return hit ? Object.assign({}, q, { answer: hit.a, answeredAt: now }) : q; });
+      if (((data.steps || {}).plan || {}).status === "draft") { inReview = true; rev = (data.plan && data.plan.revision) || 0; data.steps.plan = Object.assign({}, data.steps.plan, { status: "requested", mode: "revise", requestedAt: now, startedAt: null, finishedAt: null, requestedBy: uid || null, wake: null }); }
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + (c0.number || cid), event: "answers", text: answers.map((x) => x.q.id.toUpperCase() + ": " + x.a).join(" · ") });
+      answers.forEach((x) => { drafts["ans-" + cid + "-" + x.q.id] = ""; });
+    } catch (err) { btn.disabled = false; return toast("Couldn't save the answers (" + (err && err.code || "error") + ")."); }
+    const r = await wake($("main"), `ANSWERS — cycle ${c0.number}\n` + answers.map((x) => `${x.q.id.toUpperCase()} (${(x.q.rows || []).join(", ")}): ${x.a}`).join("\n") + (inReview ? `\n\nThe plan is in review (revision ${rev}): record these answers on their rows and post the next plan revision, then reply here with what changed.` : `\n\nRecord these on the rows they affect; if Build is running for this cycle, add the unblocked rows to it.`));
+    if (inReview) await recordWake([cid], "plan", r);
+    toast(r.ok ? "Answers saved and sent to Claude." : `Answers saved on the board, but ${r.why}. They are read at the next step.`, r.ok ? 4000 : 7000);
+  }
+
+  async function decideBranch(cid, name, decision, btn) {
+    if (!db) return noDb();
+    const now = Date.now(); btn.disabled = true;
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return;
+      let hit = false;
+      data.branches = (data.branches || []).map((b) => { if (b && typeof b === "object" && b.name === name) { hit = true; return Object.assign({}, b, { decision, decidedAt: now, decidedBy: uid || null }); } return b; });
+      if (!hit) return toast("That branch is no longer on the cycle.");
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + (data.number || cid), event: decision === "approve" ? "set to ship" : "held", text: name });
+      toast(decision === "approve" ? `${name} ships to dev on its own.` : `Held: ${name}. Ship dev leaves it out.`);
+    } catch (err) { btn.disabled = false; toast("Couldn't save the decision (" + (err && err.code || "error") + ")."); }
+  }
+
+  // ---- plan review ------------------------------------------------------
+  async function setKeep(cid, rowNum, keep, btn) {
+    if (!db) return noDb();
+    const now = Date.now(); btn.disabled = true;
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return;
+      let hit = false;
+      data.rows = (data.rows || []).map((r) => { if (r && r.num === rowNum) { hit = true; return Object.assign({}, r, { keep }); } return r; });
+      if (!hit) { btn.disabled = false; return toast("That row is no longer on the cycle."); }
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + (data.number || cid), event: keep ? "row kept" : "row dropped", text: rowNum });
+      toast(keep ? `Kept ${rowNum} in this cycle.` : `Dropped ${rowNum}. It goes back to the backlog when you approve the plan.`);
+    } catch (err) { btn.disabled = false; toast("Couldn't save that (" + (err && err.code || "error") + ")."); }
+  }
+
+  async function sendPlanFeedback(cid, btn) {
+    if (!db) return noDb();
+    const key = `note-${cid}-planfb`;
+    const text = (drafts[key] || "").trim();
+    if (!text) return toast("Type your notes first.");
+    const now = Date.now(); btn.disabled = true;
+    let n = cid, rev = 0, dropped = [];
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return;
+      n = data.number || cid; rev = (data.plan && data.plan.revision) || 0;
+      dropped = (data.rows || []).filter((r) => r && r.keep === false).map((r) => r.num);
+      data.feedback = (data.feedback || []).concat([{ t: now, by: "rider", text }]);
+      data.steps = data.steps || {};
+      data.steps.plan = Object.assign({}, data.steps.plan || {}, { status: "requested", mode: "revise", requestedAt: now, startedAt: null, finishedAt: null, note: text, requestedBy: uid || null, wake: null });
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + n, event: "plan notes", text });
+      drafts[key] = "";
+    } catch (err) { btn.disabled = false; return toast("Couldn't save your notes (" + (err && err.code || "error") + "). Nothing was sent."); }
+    const r = await wake($("card-" + cid + "-plan") || $("main"), `START plan — cycle ${n} · revise (revision ${rev + 1})\n\nRider notes:\n${text}\n\nDropped rows: ${dropped.join(", ") || "(none)"}\n\nRun the transitnav-pipeline skill for stage "plan" on cycles/${cid} in revise mode: read feedback[] and rows[].keep, post the next revision (plan.revision+1, plan.changes, steps.plan.summary), set steps.plan.status back to "draft", and reply here with what changed.`);
+    await recordWake([cid], "plan", r);
+    toast(r.ok ? `Notes sent. Claude is drafting revision ${rev + 1}.` : `Notes saved on the board, but ${r.why}.`, r.ok ? 4000 : 7000);
+  }
+
+  async function approvePlan(cid, btn) {
+    if (!db) return noDb();
+    const now = Date.now(); btn.disabled = true;
+    let n = cid, rev = 0, dropped = [], kept = 0, skip = [];
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return;
+      if (((data.steps || {}).plan || {}).status !== "draft") { btn.disabled = false; return toast("The plan is not waiting for review any more."); }
+      n = data.number || cid; rev = (data.plan && data.plan.revision) || 0;
+      dropped = (data.rows || []).filter((r) => r && r.keep === false).map((r) => r.num);
+      kept = (data.rows || []).filter((r) => r && r.keep !== false).length;
+      skip = (data.questions || []).filter((q) => q && !q.answer).flatMap((q) => q.rows || []);
+      data.steps.plan = Object.assign({}, data.steps.plan, { status: "done", finishedAt: now });
+      data.plan = Object.assign({}, data.plan || {}, { approvedAt: now, approvedBy: uid || null });
+      // Approving is the build press: one decision, not two.
+      data.steps.build = Object.assign({}, data.steps.build || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note: "", requestedBy: uid || null, wake: null });
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + n, event: "plan approved · build requested", text: `revision ${rev} · ${kept} rows kept, ${dropped.length} dropped` });
+    } catch (err) { btn.disabled = false; return toast("Couldn't approve (" + (err && err.code || "error") + ")."); }
+    const r = await wake($("card-" + cid + "-plan") || $("main"), `PLAN APPROVED — cycle ${n} (revision ${rev}) · START build — cycle ${n}\nDropped rows: ${dropped.join(", ") || "(none)"}\nRows skipped (question open): ${skip.join(", ") || "(none)"}\n\nRecord the approval on the backlog's cycle plan section and move dropped rows back to the backlog's candidates. Then run the transitnav-pipeline skill for stage "build" on cycles/${cid} (already marked requested), update it, and reply here when it is done.`);
+    await recordWake([cid], "build", r);
+    toast(r.ok ? "Plan approved. Build is queued." : `Plan approved on the board, but ${r.why}. Tell Claude “check the pipeline board”.`, r.ok ? 4000 : 7000);
+  }
+
+  // ---- boot -------------------------------------------------------------
+  PV.register("classic", () => render());
+  render();
+  setInterval(() => { if (!ui.item) render(); }, 60000); // keep "N min ago" honest
+  (async () => {
+    if (!window.claude || !window.claude.use) { render(); return; }
+    const [d, c, u] = await PV.caps();
+    db = d; comments = c; user = u;
+    if (!db) { render(); return; }
+    if (user) { try { uid = await user.id(); } catch (_) {} try { canEdit = await user.can("data.write"); } catch (_) { canEdit = null; } }
+    connected = true;
+    PV.watch("board", (ok, bad) => db.doc(BOARD).onSnapshot(ok, bad), (snap) => { board = snap.exists ? snap.data() : null; render(); }, (err) => { connected = false; render(); toast("Lost the board connection (" + err.code + "). Reload to reconnect."); });
+    PV.watch("cycles", (ok, bad) => db.collection("cycles").onSnapshot(ok, bad), (qs) => { cycles = qs.docs.filter((x) => x.exists).map((x) => x.data()); render(); }, (err) => { connected = false; render(); toast("Lost the cycles feed (" + err.code + "). Reload to reconnect."); });
+  })();
+})();
+</script>
+
+<script>
+(function () {
+  "use strict";
+  // Review copy: presses write only to this artifact's own database and nothing is sent to Claude.
+  // For the live board set this to false and publish to the live board's URL.
+  const REVIEW_COPY = false;
+  const MONITOR = "https://rwtpc4.tail9d6464.ts.net:7443/";
+  const TERMINALS = {};
+  const loadTerminals = () => fetch("/api/terminals").then((r) => r.json()).then((t) => { const changed = JSON.stringify(t) !== JSON.stringify(TERMINALS); for (const k in TERMINALS) delete TERMINALS[k]; Object.assign(TERMINALS, t); if (changed) render(true); }).catch(() => {});
+  loadTerminals(); setInterval(loadTerminals, 20000);
+  const BOARD = "pipeline/board";
+  const ORDER = ["plan", "build", "ship-dev", "verify", "ship-prod"];
+  const LABEL = { plan: "Plan", build: "Build", "ship-dev": "Ship dev", verify: "Verify", "ship-prod": "Ship prod" };
+  const PRED = { build: "plan", "ship-dev": "build", verify: "ship-dev", "ship-prod": "verify" };
+
+  const $ = (id) => document.getElementById(id);
+  const ROOT = $("pv-chat");
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const fmtD = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const fmtT = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+  const when = (ms) => { if (!ms) return ""; const d = new Date(ms); return d.toDateString() === new Date().toDateString() ? fmtT.format(d) : fmtD.format(d); };
+
+  let db = null, comments = null, uid = null, canEdit = null, connected = false;
+  let board = null, cycles = [];
+  const ui = { view: null, noTarget: {}, open: {} };
+  try { ui.view = localStorage.getItem("pipeline-simple-view"); } catch (_) {}
+  const drafts = {};
+
+  // ---- derived (same rules as the tabbed board) -------------------------
+  const stepOf = (c, k) => (c.steps && c.steps[k]) || { status: "idle" };
+  const stat = (c, k) => stepOf(c, k).status || "idle";
+  const busy = (s) => s === "requested" || s === "running";
+  const branches = (c) => (c.branches || []).filter((b) => b && typeof b === "object");
+  const isBuilt = (c, b) => !!(b && (b.sha || stat(c, "build") === "done"));
+  const built = (c) => branches(c).filter((b) => isBuilt(c, b));
+  const approved = (c) => built(c).filter((b) => b.decision === "approve");
+  const undecided = (c) => built(c).filter((b) => b.shippable !== false && !b.decision);
+  const ships = (c) => built(c).filter((b) => b.shippable !== false && b.decision !== "hold");
+  const heldB = (c) => built(c).filter((b) => b.decision === "hold");
+  const OUT = ["on-dev", "not-exercised", "pass", "fail", "closed", "in-prod"];
+  const isOut = (c, b) => { const rs = (c.rows || []).filter((r) => (b.rows || []).includes(r.num)); if (rs.length) return rs.some((r) => OUT.includes(r.status)); const sd = stepOf(c, "ship-dev"); return sd.status === "done" && b.decision !== "hold" && !(b.decidedAt > (sd.finishedAt || 0)); };
+  const unanswered = (c) => (c.questions || []).filter((q) => q && !q.answer);
+  const planRev = (c) => (c.plan && c.plan.revision) || 0;
+  const nextStep = (c) => { if (c.retiredAt) return null; for (const k of ORDER) if (stat(c, k) !== "done") return k; return null; };
+  const liveCycles = () => cycles.filter((c) => !c.retiredAt).sort((a, z) => (a.number || 0) - (z.number || 0));
+  const cyc = (id) => cycles.find((c) => c.id === id);
+  const nextNumber = () => cycles.reduce((m, c) => Math.max(m, c.number || 0), 0) + 1;
+  function gate(c, k) {
+    const p = PRED[k];
+    if (p && stat(c, p) !== "done") return { ok: false, why: `Waiting for ${LABEL[p]}` };
+    return { ok: true, why: "" };
+  }
+
+  // Where a cycle is and what it waits on: {k: current phase, s: you|run|ride|ready|done|"", text}
+  function where(c) {
+    if (c.retiredAt) return { k: "ship-prod", s: "done", text: "In production" };
+    for (const k of ORDER) if (busy(stat(c, k))) return { k, s: "run", text: stat(c, k) === "running" ? "Claude is on it" : "Sent, waiting for Claude to start" };
+    if (stat(c, "plan") === "draft") return { k: "plan", s: "you", text: `Plan revision ${planRev(c)} waits on you` };
+    for (const k of ORDER) if (stat(c, k) === "blocked") return { k, s: "you", text: `${LABEL[k]} stopped, needs you` };
+    const k = nextStep(c);
+    if (!k) return { k: "ship-prod", s: "done", text: "All steps done" };
+    if (unanswered(c).length) return { k, s: "you", text: `${unanswered(c).length} question${unanswered(c).length === 1 ? "" : "s"} for you` };
+    if (k === "build") return { k, s: "run", text: "Builds on its own" };
+    if (k === "ship-dev") return { k, s: "run", text: "Ships to dev on its own" };
+    if (k === "verify") return { k, s: "ride", text: "On dev · verifies on your next dev-app ride" };
+    if (k === "ship-prod") {
+      // Say what the ride actually showed, not just that Verify ran.
+      const rs = (c.rows || []).filter((r) => r.keep !== false && r.branch);
+      const pass = rs.filter((r) => ["pass", "closed"].includes(r.status)).length;
+      const fail = rs.filter((r) => r.status === "fail").length;
+      const wait = rs.filter((r) => ["on-dev", "not-exercised"].includes(r.status)).length;
+      if (fail) return { k, s: "you", text: `${fail} failed on the ride · ${pass} passed` };
+      if (wait) return { k, s: "ride", text: `${pass} passed · ${wait} not tried on a ride yet` };
+      return { k, s: "ready", text: pass ? `All ${pass} passed on a ride` : "Verified" };
+    }
+    return gate(c, k).ok ? { k, s: "ready", text: `Ready to ${LABEL[k].toLowerCase()}` } : { k, s: "", text: gate(c, k).why };
+  }
+
+  const waitingOnRide = (c) => (c.rows || []).some((r) => r.keep !== false && ["on-dev", "not-exercised"].includes(r.status));
+  // The one allowed next press for a cycle (same writes and gating as the tabbed board).
+  function nextPress(c) {
+    if (c.retiredAt) return null;
+    if (ORDER.some((k) => busy(stat(c, k)))) return null;
+    if (stat(c, "plan") === "draft") return { label: "Approve plan · build it", act: () => approvePlan(c.id) };
+    for (const k of ORDER) if (stat(c, k) === "blocked") return { label: `Resume ${LABEL[k].toLowerCase()}`, act: () => requestStep(c.id, k) };
+    const k = nextStep(c); if (!k) return null;
+    // Build, ship-dev and verify all run on their own (verify on each trip that ends, since 2026-10-09):
+    // no press for any of them.
+    if (k === "build" || k === "ship-dev" || k === "verify") return null;
+    const g = gate(c, k);
+    const lbl = { plan: `Plan cycle ${c.number}`, "ship-prod": "Ship to prod" }[k];
+    const p = { label: lbl, act: () => requestStep(c.id, k), disabled: !g.ok };
+    return p;
+  }
+
+  // ---- conversation -----------------------------------------------------
+  function thread(c) {
+    const out = [];
+    const add = (t, kind, who, text, extra) => { if (text) out.push(Object.assign({ t: t || c.createdAt || 0, kind, who, text }, extra || {})); };
+    add(c.createdAt, "sys", "", `Cycle ${c.number} opened${c.title ? ": " + c.title : ""}`);
+    for (const k of ORDER) {
+      const st = stepOf(c, k);
+      if (st.requestedAt && (busy(st.status) || st.finishedAt)) add(st.requestedAt, "sys", "", `${LABEL[k]} requested${st.note ? ": " + st.note : ""}`);
+      if (st.startedAt && st.status === "running") add(st.startedAt, "sys", "", `${LABEL[k]} started`);
+      const sum = k === "plan" ? [c.plan && c.plan.changes ? "What changed: " + c.plan.changes : "", st.summary].filter(Boolean).join("\n\n") : st.summary;
+      const t = k === "plan" ? ((c.plan && c.plan.revisedAt) || st.finishedAt) : st.finishedAt;
+      if (sum && !(busy(st.status) && k !== "plan")) add(t, "cl", k === "plan" && planRev(c) ? `Plan · revision ${planRev(c)}` : `${LABEL[k]}${st.status === "blocked" ? " · stopped" : " · done"}`, sum);
+      if (k === "plan" && c.plan && c.plan.approvedAt) add(c.plan.approvedAt, "sys", "", `You approved plan revision ${planRev(c)}`);
+    }
+    const bt = stepOf(c, "build").finishedAt;
+    for (const b of built(c)) {
+      add((bt || 0) + 1, "cl", `Branch · ${b.label || b.name}`, [b.summary, b.measured ? "Measured: " + b.measured : "", b.risks ? "Risks: " + b.risks : ""].filter(Boolean).join("\n\n"));
+      if (b.decidedAt) add(b.decidedAt, "sys", "", b.decision === "hold" ? (b.decidedBy === "build" ? `${b.label || b.name} held: its gate failed` : `You held ${b.label || b.name}`) : `You set ${b.label || b.name} to ship`);
+    }
+    for (const f of (c.feedback || [])) if (f && f.text) add(f.t, f.by === "rider" ? "me" : "cl", f.by === "rider" ? "You" : "Claude", f.text);
+    for (const q of (c.questions || [])) if (q && q.answer) { add((q.answeredAt || 0) - 1, "cl", `Question ${q.id}`, q.text); add(q.answeredAt, "me", "You", q.answer); }
+    out.sort((a, z) => a.t - z.t);
+    for (const q of unanswered(c)) out.push({ t: Infinity, kind: "q", who: `Question ${q.id} for you${q.rows && q.rows.length ? " · holds " + q.rows.join(", ") : ""}`, text: q.text });
+    return out;
+  }
+  function triageThread() {
+    const it = (board && board.intake) || {};
+    const out = [];
+    const ins = (it.inputs || []).filter((e) => e && typeof e === "object").sort((a, z) => (a.at || 0) - (z.at || 0)).slice(-40);
+    for (const e of ins) {
+      if (e.kind === "comment") out.push({ t: e.at, kind: "me", who: "You", text: e.text || "" });
+      else out.push({ t: e.at, kind: "cl", who: e.kind === "report" ? "Ride report" : "Nightly check", text: e.text || "" });
+      const b = e.became;
+      out.push({ t: (e.at || 0) + 1, kind: "sys", text: !b ? "Not looked at yet" : ({ row: "New row", sighting: "Seen before", praise: "Praise", question: "Question back", none: "Nothing to do" }[b.type] || b.type) + ((b.rows || []).length ? " " + b.rows.join(", ") : "") + (b.note ? " · " + b.note : "") });
+    }
+    if (it.summary && it.lastTriageAt) out.push({ t: it.lastTriageAt, kind: "cl", who: "Triage", text: it.summary });
+    if (it.requestedAt && busy(it.status)) out.push({ t: it.requestedAt, kind: "sys", text: "Triage requested" });
+    return out.sort((a, z) => a.t - z.t);
+  }
+
+  // ---- render -----------------------------------------------------------
+  function current() {
+    if (ui.view === "triage") return "triage";
+    const live = liveCycles();
+    if (ui.view && live.some((c) => c.id === ui.view)) return ui.view;
+    const you = live.find((c) => where(c).s === "you");
+    return (you || live[live.length - 1] || { id: "triage" }).id;
+  }
+  function triageState() {
+    const it = (board && board.intake) || {};
+    const pend = (it.inputs || []).filter((e) => e && !e.became).length;
+    if (busy(it.status)) return { s: "run", text: "Claude is on it" };
+    if (it.status === "blocked") return { s: "you", text: "Triage needs you" };
+    return pend ? { s: "ready", text: `${pend} not looked at` } : { s: "done", text: "Up to date" };
+  }
+
+  const cycSub = () => { try { return localStorage.getItem("pipeline-cycle-sub") === "actions" ? "actions" : "terminal"; } catch (_) { return "terminal"; } };
+  const triSub = () => { try { return localStorage.getItem("pipeline-triage-sub") === "terminal" ? "terminal" : "inbox"; } catch (_) { return "inbox"; } };
+  function renderHeader(v) {
+    const ts = triageState();
+    $("chips").innerHTML = `<button class="chip" data-view="triage" aria-current="${v === "triage"}"><span class="dot" data-s="${ts.s}"></span>Triage</button>`
+      + liveCycles().map((c) => `<button class="chip" data-view="${esc(c.id)}" aria-current="${v === c.id}" aria-label="Cycle ${esc(c.number)}"><span class="dot" data-s="${where(c).s}"></span><b>${esc(c.number)}</b></button>`).join("");
+    const c = cyc(v);
+    if (!c) { const s = triSub(); $("phase").innerHTML = `<span class="p" data-cur="true" data-s="${ts.s}">Triage · ${esc(ts.text)}</span><span class="pv-switch tri-sub" role="group" aria-label="Triage view"><button type="button" data-trisub="inbox" aria-pressed="${s === "inbox"}">Inbox</button><button type="button" data-trisub="terminal" aria-pressed="${s === "terminal"}">Terminal</button></span>`; return; }
+    const w = where(c); const ci = ORDER.indexOf(w.k);
+    $("phase").innerHTML = ORDER.map((k, i) => `${i ? '<span class="sep" aria-hidden="true">›</span>' : ""}<span class="p" data-cur="${i === ci}" data-done="${stat(c, k) === "done"}" data-s="${i === ci ? w.s : ""}">${LABEL[k]}</span>`).join("") + (TERMINALS["c" + c.number] ? `<span class="pv-switch tri-sub" role="group" aria-label="Cycle view"><button type="button" data-csub="terminal" aria-pressed="${cycSub() === "terminal"}">Terminal</button><button type="button" data-csub="actions" aria-pressed="${cycSub() === "actions"}">Actions</button></span>` : "");
+  }
+
+  function renderChat(v, keepScroll) {
+    const el = $("chat");
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    const c = cyc(v);
+    // The literal terminal IS the chat window for a cycle (2026-10-09, the rider: "no links, embedded",
+    // then "the old chat is still there?"). An Artifact can't frame or fetch another site, so the cycle
+    // thread writes its own tmux pane text onto cycles/cN.terminalSnapshot and it arrives through the
+    // same live feed as everything else. Typing into it from here is not possible; a tap on the pane
+    // opens the real one in Termius (same target as the Terminal button). The dock below still works.
+    // The agent as it is: its tmux window, live, writable, in a ttyd iframe (self-hosted since
+    // 2026-10-09; the Artifact sandbox could never do this). Only the src changes when the cycle
+    // changes, so a re-render never reloads the terminal.
+    if (!c && window.PV_TRIAGE) {
+      el.classList.remove("tty-cyc");
+      if (triSub() === "terminal" && TERMINALS.board) {
+        el.classList.add("tty-full");
+        const fr = el.querySelector("iframe.tty");
+        if (!fr || fr.dataset.w !== "board") el.innerHTML = `<iframe class="tty" data-w="board" src="${esc(TERMINALS.board)}" title="Terminal board" allow="clipboard-write"></iframe>`;
+        return;
+      }
+      el.classList.remove("tty-full");
+      let led = el.querySelector(".tri-ledger");
+      if (!led) { el.innerHTML = '<div class="tri tri-ledger"></div>'; led = el.querySelector(".tri-ledger"); }
+      const top = el.scrollTop; led.innerHTML = window.PV_TRIAGE.html(); el.scrollTop = keepScroll ? top : 0;
+      return;
+    }
+    const win = c ? "c" + c.number : "board";
+    const src = TERMINALS[win];
+    if (src && cycSub() === "terminal") {
+      el.classList.add("tty-full", "tty-cyc");
+      const cur = el.querySelector("iframe.tty");
+      if (!cur || cur.dataset.w !== win) el.innerHTML = `<iframe class="tty" data-w="${esc(win)}" src="${esc(src)}" title="Terminal ${esc(win)}" allow="clipboard-write"></iframe>`;
+      return;
+    }
+    el.classList.remove("tty-full", "tty-cyc");
+    const items = c ? thread(c) : triageThread();
+    el.innerHTML = items.length ? items.map((m, i) => {
+      if (m.kind === "sys") return `<div class="sys">${esc(m.text)}${isFinite(m.t) && m.t ? " · " + esc(when(m.t)) : ""}</div>`;
+      const long = m.kind !== "q" && m.text.length > 420 || m.text.split("\n").length > 9;
+      const key = v + ":" + i + ":" + m.t;
+      const open = !!ui.open[key];
+      return `<div class="msg ${m.kind === "me" ? "me" : m.kind === "q" ? "cl q" : "cl"}"><span class="who">${esc(m.who)}${isFinite(m.t) && m.t ? " · " + esc(when(m.t)) : ""}</span><div class="b ${long && !open ? "clamp" : ""}">${esc(m.text)}</div>${long ? `<button class="more" data-more="${esc(key)}">${open ? "Show less" : "Show all"}</button>` : ""}</div>`;
+    }).join("") : `<p class="empty">${c ? "Nothing yet." : "No inputs registered yet."}</p>`;
+    if (!keepScroll || atBottom) el.scrollTop = el.scrollHeight;
+  }
+
+  function renderDock(v) {
+    const c = cyc(v);
+    const dis = canEdit === false ? "disabled" : "";
+    // Ship / Hold per branch: built branches not yet on dev. They ship on their own unless held.
+    const pend = c && !c.retiredAt ? built(c).filter((b) => b.shippable !== false && b.sha && !isOut(c, b)) : [];
+    const showBr = pend.length > 0;
+    const sdBusy = c && busy(stat(c, "ship-dev"));
+    $("brs").hidden = !showBr;
+    $("brs").innerHTML = showBr ? pend.map((b) => `<div class="br"><span class="l" title="${esc(b.label || b.name)}">${esc(b.label || b.name)}</span><span class="seg" role="group" aria-label="${esc(b.label || b.name)}"><button data-decide="approve" data-branch="${esc(b.name)}" aria-pressed="${b.decision !== "hold"}" ${dis || (sdBusy ? "disabled" : "")}>Ship</button><button data-decide="hold" data-branch="${esc(b.name)}" aria-pressed="${b.decision === "hold"}" ${dis || (sdBusy ? "disabled" : "")}>Hold</button></span></div>`).join("") : "";
+    // status + the one next press
+    let st, press;
+    if (c) {
+      const w = where(c); st = w; press = nextPress(c);
+    } else {
+      st = triageState();
+      const it = (board && board.intake) || {};
+      press = busy(it.status) ? null : { label: "Run triage", act: async () => { if (await requestIntake(box.value)) { box.value = ""; drafts.triage = ""; grow(); } } };
+    }
+    const rl = c ? window.pvRideLine(c) : "";
+    $("next").innerHTML = `<span class="st"><span class="dot" data-s="${st.s}"></span><span>${esc(st.text)}${rl ? `<span class="ride">${esc(rl)}</span>` : ""}</span></span>`
+      + (press && press.alt ? `<button class="quiet" id="alt" ${dis}>${esc(press.alt.label)}</button>` : "")
+      + (press && press.label ? `<button class="go" id="go" ${press.disabled || dis ? "disabled" : ""}>${esc(press.label)}</button>` : "");
+    ui.press = press;
+    // what the text box does
+    const q = c && !ui.noTarget[c.id] ? unanswered(c)[0] : null;
+    const draft = c && stat(c, "plan") === "draft";
+    $("target").hidden = !q;
+    $("target").innerHTML = q ? `<span>Answering question ${esc(q.id)}</span><button id="untarget" aria-label="Send as a plain message instead">×</button>` : "";
+    ui.target = q ? q.id : null;
+    $("box").placeholder = !c ? "Note for triage (optional)" : q ? `Your answer to ${q.id}` : draft ? `Notes on the plan, for revision ${planRev(c) + 1}` : c.retiredAt ? "This cycle is retired" : `Message cycle ${c.number}`;
+    $("box").disabled = !!(c && c.retiredAt) || canEdit === false;
+    $("send").hidden = !c;
+  }
+
+  function renderTerm(v) {
+    // One tap: the monitor focuses this agent's tmux window and redirects straight to Termius.
+    const c0 = cyc(v); const go = MONITOR + "go?w=" + encodeURIComponent("transitnav:" + (c0 ? "c" + c0.number : "board"));
+    for (const id of ["termbtn", "pv-term"]) { const a = document.getElementById(id); if (a) a.href = go; }
+    $("term").hidden = true; // the terminal itself lives in the chat window now (renderChat)
+  }
+
+  function render(keepScroll) {
+    if (!PV.shown("chat")) return; // hidden view: render on show
+    const v = current();
+    $("tag").hidden = !REVIEW_COPY;
+    renderHeader(v);
+    const ch = $("chips"), cur = ch.querySelector('[aria-current="true"]');
+    if (cur && (cur.offsetLeft + cur.offsetWidth > ch.scrollLeft + ch.clientWidth || cur.offsetLeft < ch.scrollLeft)) ch.scrollLeft = cur.offsetLeft - 8;
+    renderChat(v, keepScroll); renderDock(v); renderTerm(v);
+    if (!connected) $("next").innerHTML = `<span class="st"><span class="dot" data-s="you"></span><span>Not connected. Open this page in claude.ai.</span></span>`;
+  }
+
+  let toastTimer;
+  function toast(msg, ms) { if (!msg) return; const t = $("chat-toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), ms || 4000); }
+
+  // ---- events -----------------------------------------------------------
+  const box = $("box");
+  const grow = () => { box.style.height = "auto"; box.style.height = Math.min(box.scrollHeight + 2, 140) + "px"; };
+  box.addEventListener("input", () => { drafts[current()] = box.value; grow(); });
+  box.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && matchMedia("(hover:hover) and (pointer:fine)").matches) { e.preventDefault(); $("compose").requestSubmit(); } });
+  $("compose").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+    ROOT.addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    if (b.dataset.csub) { try { localStorage.setItem("pipeline-cycle-sub", b.dataset.csub); } catch (_) {} return render(false); }
+    if (b.dataset.trisub) { try { localStorage.setItem("pipeline-triage-sub", b.dataset.trisub); } catch (_) {} return render(false); }
+    if (b.dataset.tfilter && window.PV_TRIAGE) { window.PV_TRIAGE.setFilter(b.dataset.tfilter); return render(true); }
+    if (b.dataset.item && window.PV_TRIAGE) { window.PV_TRIAGE.openItem(b.dataset.item); const sw = document.querySelector('[data-pv="classic"]'); if (sw) sw.click(); return; }
+    if (b.dataset.view) { drafts[current()] = box.value; ui.view = b.dataset.view; try { localStorage.setItem("pipeline-simple-view", ui.view); } catch (_) {} render(false); box.value = drafts[current()] || ""; grow(); return; }
+    if (b.dataset.more) { ui.open[b.dataset.more] = !ui.open[b.dataset.more]; return render(true); }
+    if (b.dataset.decide) return decideBranch(current(), b.dataset.branch, b.dataset.decide, b);
+    if (b.id === "go" && ui.press) { b.disabled = true; return ui.press.act(); }
+    if (b.id === "alt" && ui.press && ui.press.alt) { b.disabled = true; return ui.press.alt.act(); }
+    if (b.id === "untarget") { const c = cyc(current()); if (c) ui.noTarget[c.id] = true; return renderDock(current()); }
+    if (b.id === "copy") { const txt = $("cmd").textContent; (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(() => toast("Copied"), () => { const r = document.createRange(); r.selectNodeContents($("cmd")); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }); }
+  });
+
+  async function send() {
+    if (!PV.shown("chat")) return;
+    const v = current(); const text = box.value.trim();
+    const c = cyc(v);
+    if (!c) return ui.press && ui.press.act();
+    {
+      if (!text) return toast("Type something first.");
+      let ok;
+      if (ui.target) ok = await sendAnswer(c.id, ui.target, text);
+      else if (stat(c, "plan") === "draft") ok = await sendPlanFeedback(c.id, text);
+      else ok = await sendMessage(c.id, text);
+      if (!ok) return;
+    }
+    box.value = ""; drafts[v] = ""; grow();
+  }
+
+  // ---- writes (same docs and comment text as the tabbed board) ----------
+  const clone = (o) => JSON.parse(JSON.stringify(o));
+  function appendLog(b, entry) { b.log = (b.log || []).concat([entry]).slice(-80); }
+  async function readDoc(path) { const ref = db.doc(path); const s = await ref.get(); return { ref, data: s.exists ? clone(s.data()) : null }; }
+  async function logBoard(entry) { const { ref, data } = await readDoc(BOARD); const b = data || {}; appendLog(b, entry); b.updatedAt = Date.now(); await ref.set(b); }
+  const noDb = () => { toast("No board connection. Open this page inside claude.ai."); render(true); return false; };
+  // No success toasts: the agent's terminal shows the press landing (rider, 2026-10-09: "redundant"). Failures still toast.
+  const sentMsg = (r, okMsg) => r.ok ? "" : REVIEW_COPY ? "Saved to the review copy. Nothing was sent to Claude." : `Saved on the board, but ${r.why}.`;
+
+  async function wake(text) {
+    if (REVIEW_COPY) { console.info("[review copy] would send to Claude:\n" + text); return { ok: false, why: "review copy, nothing sent" }; }
+    if (!comments) return { ok: false, why: "comments aren't available in this view" };
+    try {
+      const can = await comments.canSendToClaude();
+      if (can !== "available") return { ok: false, why: can === "no_session" ? "no Claude session is watching the board" : can === "writers_only" ? "this account can't send to Claude here" : "sending to Claude is off here" };
+      const anchor = await comments.anchorFor($("chat"));
+      await comments.sendToClaude({ anchor, text });
+      return { ok: true };
+    } catch (err) { return { ok: false, why: err && err.code === "consent_required" ? "you didn't allow the page to comment" : (err && err.code) || "the send failed" }; }
+  }
+  async function recordWake(id, key, r) {
+    try { const { ref, data } = await readDoc("cycles/" + id); if (data && data.steps && data.steps[key]) { data.steps[key].wake = { ok: r.ok, at: Date.now(), why: r.why || "" }; await ref.set(data); } } catch (_) {}
+  }
+
+  async function requestIntake(note) {
+    if (!db) return noDb();
+    note = (note || "").trim(); const now = Date.now(); const n = nextNumber();
+    try {
+      const { ref, data } = await readDoc(BOARD); const b = data || {};
+      b.intake = Object.assign({}, b.intake || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null, thenPlan: true });
+      appendLog(b, { t: now, stage: "triage", event: "requested", text: (note ? note + " · " : "") + "then plan cycle " + n }); b.updatedAt = now; await ref.set(b);
+    } catch (err) { render(true); toast("Couldn't write the request (" + (err && err.code || "error") + "). Nothing was queued."); return false; }
+    const r = await wake(`START triage — then plan cycle ${n}` + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "triage", update pipeline/board.intake, then open cycles/c${n} with the rows triage opened or touched and run stage "plan" on it, and reply here when it is done.`);
+    try { const { ref, data } = await readDoc(BOARD); if (data && data.intake) { data.intake.wake = { ok: r.ok, at: Date.now(), why: r.why || "" }; await ref.set(data); } } catch (_) {}
+    toast(sentMsg(r, "Sent. Triage is queued; a plan follows."));
+    return true;
+  }
+
+  async function requestStep(cid, key) {
+    if (!db) return noDb();
+    const now = Date.now();
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return false;
+      data.steps = data.steps || {}; data.steps[key] = Object.assign({}, data.steps[key] || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note: "", requestedBy: uid || null, wake: null });
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + (data.number || cid), event: key + " requested", text: "" });
+    } catch (err) { render(true); toast("Couldn't write the request (" + (err && err.code || "error") + "). Nothing was queued."); return false; }
+    const c0 = cyc(cid) || {}; const n = c0.number || cid;
+    const text = key === "verify"
+      ? `START verify — cycle ${n} (last ride)\n\nRun the transitnav-pipeline skill for stage "verify" on cycles/${cid} ONLY — score this cycle's rows against the last dev ride, touch no other cycle, update it, and reply here when done.`
+      : key === "ship-dev"
+        ? `START ship-dev — cycle ${n}\nApproved: ${ships(c0).map((b) => b.name).join(", ") || "(none)"}\nHeld: ${heldB(c0).map((b) => b.name).join(", ") || "(none)"}\n\nRun the transitnav-pipeline skill for stage "ship-dev" on cycles/${cid}: merge every built branch that is not held, update it, and reply here when it is done.`
+        : `START ${key} — cycle ${n}\n\nRun the transitnav-pipeline skill for stage "${key}" on cycles/${cid}, update it, and reply here when it is done.`;
+    const r = await wake(text);
+    await recordWake(cid, key, r);
+    toast(sentMsg(r, `Sent. ${LABEL[key]} is queued.`));
+    return true;
+  }
+
+  async function approvePlan(cid) {
+    if (!db) return noDb();
+    const now = Date.now(); let n = cid, rev = 0, dropped = [], kept = 0, skip = [];
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return false;
+      if (((data.steps || {}).plan || {}).status !== "draft") { render(true); toast("The plan is not waiting for review any more."); return false; }
+      n = data.number || cid; rev = (data.plan && data.plan.revision) || 0;
+      dropped = (data.rows || []).filter((r) => r && r.keep === false).map((r) => r.num);
+      kept = (data.rows || []).filter((r) => r && r.keep !== false).length;
+      skip = (data.questions || []).filter((q) => q && !q.answer).flatMap((q) => q.rows || []);
+      data.steps.plan = Object.assign({}, data.steps.plan, { status: "done", finishedAt: now });
+      data.plan = Object.assign({}, data.plan || {}, { approvedAt: now, approvedBy: uid || null });
+      data.steps.build = Object.assign({}, data.steps.build || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note: "", requestedBy: uid || null, wake: null });
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + n, event: "plan approved · build requested", text: `revision ${rev} · ${kept} rows kept, ${dropped.length} dropped` });
+    } catch (err) { render(true); toast("Couldn't approve (" + (err && err.code || "error") + ")."); return false; }
+    const r = await wake(`PLAN APPROVED — cycle ${n} (revision ${rev}) · START build — cycle ${n}\nDropped rows: ${dropped.join(", ") || "(none)"}\nRows skipped (question open): ${skip.join(", ") || "(none)"}\n\nRecord the approval on the backlog's cycle plan section and move dropped rows back to the backlog's candidates. Then run the transitnav-pipeline skill for stage "build" on cycles/${cid} (already marked requested), update it, and reply here when it is done.`);
+    await recordWake(cid, "build", r);
+    toast(sentMsg(r, "Plan approved. Build is queued."));
+    return true;
+  }
+
+  async function sendPlanFeedback(cid, text) {
+    if (!db) return noDb();
+    const now = Date.now(); let n = cid, rev = 0, dropped = [];
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return false;
+      n = data.number || cid; rev = (data.plan && data.plan.revision) || 0;
+      dropped = (data.rows || []).filter((r) => r && r.keep === false).map((r) => r.num);
+      data.feedback = (data.feedback || []).concat([{ t: now, by: "rider", text }]);
+      data.steps = data.steps || {};
+      data.steps.plan = Object.assign({}, data.steps.plan || {}, { status: "requested", mode: "revise", requestedAt: now, startedAt: null, finishedAt: null, note: text, requestedBy: uid || null, wake: null });
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + n, event: "plan notes", text });
+    } catch (err) { toast("Couldn't save your notes (" + (err && err.code || "error") + "). Nothing was sent."); return false; }
+    const r = await wake(`START plan — cycle ${n} · revise (revision ${rev + 1})\n\nRider notes:\n${text}\n\nDropped rows: ${dropped.join(", ") || "(none)"}\n\nRun the transitnav-pipeline skill for stage "plan" on cycles/${cid} in revise mode: read feedback[] and rows[].keep, post the next revision (plan.revision+1, plan.changes, steps.plan.summary), set steps.plan.status back to "draft", and reply here with what changed.`);
+    await recordWake(cid, "plan", r);
+    toast(sentMsg(r, `Sent. Claude is drafting revision ${rev + 1}.`));
+    return true;
+  }
+
+  async function sendAnswer(cid, qid, a) {
+    if (!db) return noDb();
+    const now = Date.now(); let inReview = false, rev = 0, q0 = null, n = cid;
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return false;
+      n = data.number || cid;
+      data.questions = (data.questions || []).map((q) => { if (q && q.id === qid && !q.answer) { q0 = q; return Object.assign({}, q, { answer: a, answeredAt: now }); } return q; });
+      if (!q0) { toast("That question is already answered."); render(true); return false; }
+      if (((data.steps || {}).plan || {}).status === "draft") { inReview = true; rev = (data.plan && data.plan.revision) || 0; data.steps.plan = Object.assign({}, data.steps.plan, { status: "requested", mode: "revise", requestedAt: now, startedAt: null, finishedAt: null, requestedBy: uid || null, wake: null }); }
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + n, event: "answers", text: qid.toUpperCase() + ": " + a });
+    } catch (err) { toast("Couldn't save the answer (" + (err && err.code || "error") + ")."); return false; }
+    const r = await wake(`ANSWERS — cycle ${n}\n${qid.toUpperCase()} (${(q0.rows || []).join(", ")}): ${a}` + (inReview ? `\n\nThe plan is in review (revision ${rev}): record these answers on their rows and post the next plan revision, then reply here with what changed.` : `\n\nRecord these on the rows they affect; if Build is running for this cycle, add the unblocked rows to it.`));
+    if (inReview) await recordWake(cid, "plan", r);
+    toast(sentMsg(r, "Answer saved and sent."));
+    return true;
+  }
+
+  // New: a plain message to the cycle's agent. Saved in feedback[]; the router forwards any comment naming "cycle N".
+  async function sendMessage(cid, text) {
+    if (!db) return noDb();
+    const now = Date.now(); let n = cid;
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return false;
+      n = data.number || cid;
+      data.feedback = (data.feedback || []).concat([{ t: now, by: "rider", text }]);
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + n, event: "message", text });
+    } catch (err) { toast("Couldn't save the message (" + (err && err.code || "error") + "). Nothing was sent."); return false; }
+    const r = await wake(`MESSAGE — cycle ${n} (msg ${now})\n\n${text}\n\nThe rider wrote this in cycle ${n}'s chat on the board; it is saved in cycles/${cid} feedback[]. Answer by appending {t, by: "claude", text} to that feedback[], and act on it only within cycle ${n}.`);
+    toast(sentMsg(r, `Sent to cycle ${n}.`));
+    return true;
+  }
+
+  async function decideBranch(cid, name, decision, btn) {
+    if (!db) return noDb();
+    const now = Date.now(); btn.disabled = true;
+    try {
+      const { ref, data } = await readDoc("cycles/" + cid); if (!data) return;
+      let hit = false;
+      data.branches = (data.branches || []).map((b) => { if (b && typeof b === "object" && b.name === name) { hit = true; return Object.assign({}, b, { decision, decidedAt: now, decidedBy: uid || null }); } return b; });
+      if (!hit) { btn.disabled = false; return toast("That branch is no longer on the cycle."); }
+      await ref.set(data);
+      await logBoard({ t: now, stage: "cycle " + (data.number || cid), event: decision === "approve" ? "set to ship" : "held", text: name });
+    } catch (err) { btn.disabled = false; toast("Couldn't save the decision (" + (err && err.code || "error") + ")."); }
+  }
+
+  // ---- boot -------------------------------------------------------------
+  PV.register("chat", () => render(false));
+  render(false);
+  setInterval(() => render(true), 60000);
+  window.addEventListener("resize", () => render(true)); // the terminal's font is sized to the width
+  (async () => {
+    if (!window.claude || !window.claude.use) return;
+    const [d, c0, u] = await PV.caps(); const c = REVIEW_COPY ? null : c0;
+    db = d; comments = c;
+    if (!db) return;
+    if (u) { try { uid = await u.id(); } catch (_) {} try { canEdit = await u.can("data.write"); } catch (_) { canEdit = null; } }
+    connected = true;
+    let first = true;
+    const again = () => { render(!first); first = false; };
+    PV.watch("board", (ok, bad) => db.doc(BOARD).onSnapshot(ok, bad), (snap) => { board = snap.exists ? snap.data() : null; again(); }, (err) => { connected = false; render(true); toast("Lost the board connection (" + err.code + "). Reload to reconnect."); });
+    PV.watch("cycles", (ok, bad) => db.collection("cycles").onSnapshot(ok, bad), (qs) => { cycles = qs.docs.filter((x) => x.exists).map((x) => x.data()); again(); }, (err) => { connected = false; render(true); toast("Lost the cycles feed (" + err.code + "). Reload to reconnect."); });
+  })();
+})();
+</script>
+
+<script>
+(function () {
+  const vv = window.visualViewport; if (!vv) return;
+  const fit = () => {
+    const chat = document.getElementById("pv-chat"), bar = document.getElementById("pv-bar");
+    if (document.body.dataset.pv !== "chat") { chat.style.height = ""; return; }
+    const barH = bar && getComputedStyle(bar).display !== "none" ? bar.offsetHeight : 0;
+    chat.style.height = Math.max(200, vv.height - barH) + "px";
+    window.scrollTo(0, 0);
+  };
+  vv.addEventListener("resize", fit); vv.addEventListener("scroll", fit); window.addEventListener("resize", fit);
+  document.addEventListener("click", (e) => { if (e.target.closest("[data-pv]")) setTimeout(fit, 0); });
+  fit();
+})();
+</script>
+</body></html>
