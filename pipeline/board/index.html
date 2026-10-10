@@ -521,8 +521,17 @@
   #pv-chat .phase .tri-sub { margin-left: auto; }
   #pv-chat .next .st .ride { display: block; font-size: 12px; color: var(--ink-3); margin-top: 2px; }
   #pv-classic .ride-line { margin-bottom: 8px; font-weight: 500; }
-  #pv-chat .chat.tty-cyc ~ .dock { display: none; }
-  #pv-chat .phase { flex-wrap: wrap; row-gap: 6px; }
+  #pv-chat .dock { display: none !important; }
+  #pv-chat .ship-list { display: grid; gap: 12px; padding: 4px 0 16px; }
+  #pv-chat .shipc { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); padding: 14px 16px; display: grid; gap: 4px; }
+  #pv-chat .shipc p { margin: 0; }
+  #pv-chat .shipc h3 { margin: 0 0 2px; font-size: 15px; font-weight: 600; color: var(--ink); }
+  #pv-chat .shipc .st { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--ink-2); }
+  #pv-chat .shipc .ride, #pv-chat .shipc .bun { font-size: 12.5px; color: var(--ink-3); }
+  #pv-chat .shipc .bun { font-family: var(--mono); }
+  #pv-chat .shipc .act { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; }
+  #pv-chat .shipc .go:disabled { background: var(--surface-2); color: var(--ink-3); cursor: default; }
+  #pv-chat .shipc .why { font-size: 13px; color: var(--ink-3); }
   #pv-chat .chat.tty-full a.ttyl { flex: 1; min-height: 0; min-width: 0; display: flex; color: inherit; text-decoration: none; -webkit-user-drag: none; }
   #pv-chat .chat.tty-full pre.tty { flex: 1; min-height: 0; min-width: 0; margin: 0; overflow-y: auto; overflow-x: auto; padding: 4px 3px 6px; background: #0d1211; color: #d6e0dc; font: 12px/1.4 var(--mono); white-space: pre; -webkit-overflow-scrolling: touch; }
 
@@ -1752,6 +1761,7 @@ window.PV = (function () {
 
   // ---- render -----------------------------------------------------------
   function current() {
+    if (ui.view === "ship") return "ship";
     if (ui.view === "triage") return "triage";
     const live = liveCycles();
     if (ui.view && live.some((c) => c.id === ui.view)) return ui.view;
@@ -1766,16 +1776,42 @@ window.PV = (function () {
     return pend ? { s: "ready", text: `${pend} not looked at` } : { s: "done", text: "Up to date" };
   }
 
-  const cycSub = () => { try { return localStorage.getItem("pipeline-cycle-sub") === "actions" ? "actions" : "terminal"; } catch (_) { return "terminal"; } };
+  // Ship to prod for one cycle: allowed once every row has been through a scored dev ride (none still
+  // waiting for its first one) and none failed; rows a ride did not exercise go to production as in-prod.
+  function shipState(c) {
+    const st = (k) => ((c.steps || {})[k] || {}).status;
+    const rs = (c.rows || []).filter((r) => r.keep !== false && r.branch);
+    const fail = rs.filter((r) => r.status === "fail").length;
+    if (busy(st("ship-prod"))) return { ok: false, why: "shipping to production now" };
+    if (st("ship-prod") === "done" || (c.bundle && c.bundle.prod)) return { ok: false, why: "already in production" };
+    if (st("ship-dev") !== "done") return { ok: false, why: "not on the dev app yet" };
+    if (fail) return { ok: false, why: `${fail} failed on the ride — see the backlog` };
+    if (st("verify") !== "done" || rs.some((r) => r.status === "on-dev")) return { ok: false, why: "waiting for a dev ride" };
+    return { ok: true, why: "" };
+  }
+  function shipCards() {
+    const live = liveCycles(); const fx = (board && board.facts) || {};
+    if (!live.length) return `<p class="empty">No live cycles.</p>`;
+    return `<div class="ship-list">${live.map((c) => {
+      const w = where(c), s = shipState(c), rl = window.pvRideLine(c);
+      return `<section class="shipc"><h3>Cycle ${esc(c.number)}${(() => { const t = (c.title || "").replace(new RegExp("^ *cycle +" + c.number + " *[—:-]? *", "i"), "").trim(); return t ? " — " + esc(t) : ""; })()}</h3>`
+        + `<p class="st"><span class="dot" data-s="${w.s}"></span><span>${esc(w.text)}</span></p>`
+        + (rl ? `<p class="ride">${esc(rl)}</p>` : "")
+        + `<p class="bun">dev ${esc((c.bundle && c.bundle.dev) || "—")} · production ${esc(fx.prodBundle || "—")}</p>`
+        + `<div class="act"><button type="button" class="go" data-shipprod="${esc(c.id)}" ${s.ok && canEdit !== false ? "" : "disabled"}>Ship to prod</button>${s.ok ? "" : `<span class="why">${esc(s.why)}</span>`}</div></section>`;
+    }).join("")}</div>`;
+  }
   const triSub = () => { try { return localStorage.getItem("pipeline-triage-sub") === "terminal" ? "terminal" : "inbox"; } catch (_) { return "inbox"; } };
   function renderHeader(v) {
     const ts = triageState();
     $("chips").innerHTML = `<button class="chip" data-view="triage" aria-current="${v === "triage"}"><span class="dot" data-s="${ts.s}"></span>Triage</button>`
       + liveCycles().map((c) => `<button class="chip" data-view="${esc(c.id)}" aria-current="${v === c.id}" aria-label="Cycle ${esc(c.number)}"><span class="dot" data-s="${where(c).s}"></span><b>${esc(c.number)}</b></button>`).join("");
+    $("chips").insertAdjacentHTML("beforeend", `<button class="chip" data-view="ship" aria-current="${v === "ship"}"><span class="dot" data-s="${liveCycles().some((x) => shipState(x).ok) ? "ready" : ""}"></span>Ship</button>`);
+    if (v === "ship") { $("phase").innerHTML = `<span class="p" data-cur="true" data-s="ready">Ship to production · one press per cycle</span>`; return; }
     const c = cyc(v);
     if (!c) { const s = triSub(); $("phase").innerHTML = `<span class="p" data-cur="true" data-s="${ts.s}">Triage · ${esc(ts.text)}</span><span class="pv-switch tri-sub" role="group" aria-label="Triage view"><button type="button" data-trisub="inbox" aria-pressed="${s === "inbox"}">Inbox</button><button type="button" data-trisub="terminal" aria-pressed="${s === "terminal"}">Terminal</button></span>`; return; }
     const w = where(c); const ci = ORDER.indexOf(w.k);
-    $("phase").innerHTML = ORDER.map((k, i) => `${i ? '<span class="sep" aria-hidden="true">›</span>' : ""}<span class="p" data-cur="${i === ci}" data-done="${stat(c, k) === "done"}" data-s="${i === ci ? w.s : ""}">${LABEL[k]}</span>`).join("") + (TERMINALS["c" + c.number] ? `<span class="pv-switch tri-sub" role="group" aria-label="Cycle view"><button type="button" data-csub="terminal" aria-pressed="${cycSub() === "terminal"}">Terminal</button><button type="button" data-csub="actions" aria-pressed="${cycSub() === "actions"}">Actions</button></span>` : "");
+    $("phase").innerHTML = ORDER.map((k, i) => `${i ? '<span class="sep" aria-hidden="true">›</span>' : ""}<span class="p" data-cur="${i === ci}" data-done="${stat(c, k) === "done"}" data-s="${i === ci ? w.s : ""}">${LABEL[k]}</span>`).join("");
   }
 
   function renderChat(v, keepScroll) {
@@ -1790,8 +1826,8 @@ window.PV = (function () {
     // The agent as it is: its tmux window, live, writable, in a ttyd iframe (self-hosted since
     // 2026-10-09; the Artifact sandbox could never do this). Only the src changes when the cycle
     // changes, so a re-render never reloads the terminal.
+    if (v === "ship") { el.classList.remove("tty-full"); el.innerHTML = shipCards(); return; }
     if (!c && window.PV_TRIAGE) {
-      el.classList.remove("tty-cyc");
       if (triSub() === "terminal" && TERMINALS.board) {
         el.classList.add("tty-full");
         const fr = el.querySelector("iframe.tty");
@@ -1806,13 +1842,13 @@ window.PV = (function () {
     }
     const win = c ? "c" + c.number : "board";
     const src = TERMINALS[win];
-    if (src && cycSub() === "terminal") {
-      el.classList.add("tty-full", "tty-cyc");
+    if (src) {
+      el.classList.add("tty-full");
       const cur = el.querySelector("iframe.tty");
       if (!cur || cur.dataset.w !== win) el.innerHTML = `<iframe class="tty" data-w="${esc(win)}" src="${esc(src)}" title="Terminal ${esc(win)}" allow="clipboard-write"></iframe>`;
       return;
     }
-    el.classList.remove("tty-full", "tty-cyc");
+    el.classList.remove("tty-full");
     const items = c ? thread(c) : triageThread();
     el.innerHTML = items.length ? items.map((m, i) => {
       if (m.kind === "sys") return `<div class="sys">${esc(m.text)}${isFinite(m.t) && m.t ? " · " + esc(when(m.t)) : ""}</div>`;
@@ -1887,7 +1923,7 @@ window.PV = (function () {
   $("compose").addEventListener("submit", (e) => { e.preventDefault(); send(); });
     ROOT.addEventListener("click", (e) => {
     const b = e.target.closest("button"); if (!b) return;
-    if (b.dataset.csub) { try { localStorage.setItem("pipeline-cycle-sub", b.dataset.csub); } catch (_) {} return render(false); }
+    if (b.dataset.shipprod) { b.disabled = true; return requestStep(b.dataset.shipprod, "ship-prod").then(() => render(true)); }
     if (b.dataset.trisub) { try { localStorage.setItem("pipeline-triage-sub", b.dataset.trisub); } catch (_) {} return render(false); }
     if (b.dataset.tfilter && window.PV_TRIAGE) { window.PV_TRIAGE.setFilter(b.dataset.tfilter); return render(true); }
     if (b.dataset.item && window.PV_TRIAGE) { window.PV_TRIAGE.openItem(b.dataset.item); const sw = document.querySelector('[data-pv="classic"]'); if (sw) sw.click(); return; }

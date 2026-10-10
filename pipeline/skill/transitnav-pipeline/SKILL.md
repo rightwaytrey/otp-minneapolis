@@ -35,7 +35,8 @@ under `~/.claude/pipeline/db/`, read and written only through `~/bin/pipeline-db
   `branches[] {name, label, sha, kind: build|measure|daemon, rows[],
   shippable, decision: approve|hold|null, decidedAt, summary, measured,
   tests, files, screenshots[], risks, vehicle}` — ONE OBJECT PER AGENT'S
-  BRANCH, rendered as a tab with a Ship / Hold control (per-branch
+  BRANCH, rendered as a tab with a Ship / Hold control in Classic (Chat has
+  none since 2026-10-09: the rider types "hold <branch>" in the terminal; per-branch
   decisions added 2026-09-21: "we'll decide to ship on an individual basis";
   since 2026-10-08 `null` and `approve` both mean *ships*, only `hold` keeps
   it out — see *Auto-advance*), `plan {revision, revisedAt, changes, approvedAt, approvedBy}`,
@@ -349,6 +350,31 @@ text}` and `{t, by: "claude", text}` to `cycles/cN.feedback[]`
 (read-modify-write, pin `if_version`). Monitor events, the kickoff and the
 self-check are not the rider and are never mirrored. A direct instruction
 from the rider is their own consent, within cycle N.
+
+**Since 2026-10-09 ~22:30 this is the ONLY way the rider approves, holds or
+answers from the Chat view** (rider: "All we need is one ship button"): a
+cycle's Chat view is its terminal, with no dock, no message box and no
+buttons; Ship to prod is one central **Ship** tab for all cycles. (Classic
+still has every control and writes the same fields.) So when the rider types
+it, write exactly what the page's button would have written, then act:
+
+- **"approve the plan" / "build it"** → `steps.plan.status = "done"`,
+  `plan.approvedAt`, `plan.approvedBy: "rider"`, `steps.build = {status:
+  "requested", requestedAt, requestedBy: "rider"}`, a board log line `plan
+  approved · build requested`, then run it as the `PLAN APPROVED … START
+  build` press (record the approval on the backlog's cycle plan section).
+- **"hold <branch>" / "ship <branch>"** → that `branches[]` object's
+  `decision: "hold" | "approve"`, `decidedAt`, `decidedBy: "rider"` (rejected
+  while ship-dev is `running`: say so); a released Hold goes out under
+  self-check rule 4.
+- **an answer to Qn** → `questions[].answer` (verbatim) and `answeredAt` on
+  that question, then run `answers` as for an `ANSWERS — cycle N` press.
+- **plan notes while the plan is a `draft`** → append `{by: "rider"}` to
+  `feedback[]`, set `steps.plan.status = "requested"`, `mode: "revise"`, and
+  post the next revision as for a `· revise` press.
+- **"ship to prod"** typed here → the same as the Ship tab's press:
+  `steps.ship-prod = {status: "requested", requestedAt, requestedBy: "rider"}`
+  and run `ship-prod`.
 
 - **Every phase is still a fresh Opus agent** (plan, build per branch, ship,
   verify). The thread dispatches, checks the agents' claims in the diff, and

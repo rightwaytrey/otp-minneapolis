@@ -229,34 +229,66 @@ one("  #pv-chat .chat.tty-full a.ttyl {", """  #pv-chat .next .st .ride { displa
   #pv-classic .ride-line { margin-bottom: 8px; font-weight: 500; }
   #pv-chat .chat.tty-full a.ttyl {""")
 
-# 15. a cycle's Chat view has two sub-views like Triage's (rider, 2026-10-09): Terminal (default) = the
-#     agent's live window filling everything, no dock at all; Actions = the old conversation (step
-#     summaries, branch reports, feedback[], questions) and the whole dock (status, Ship/Hold, Approve
-#     plan · build it, Ship to prod, the message box). Only the active one is in the DOM; the choice is
-#     remembered in localStorage pipeline-cycle-sub.
-one('''    if (src) {
-      el.classList.add("tty-full");
-      const cur = el.querySelector("iframe.tty");''', '''    if (src && cycSub() === "terminal") {
-      el.classList.add("tty-full", "tty-cyc");
-      const cur = el.querySelector("iframe.tty");''')
-one('''    el.classList.remove("tty-full");
-    const items''', '''    el.classList.remove("tty-full", "tty-cyc");
-    const items''')
-one('''    if (!c && window.PV_TRIAGE) {
-''', '''    if (!c && window.PV_TRIAGE) {
-      el.classList.remove("tty-cyc");
-''')
-one('''  const triSub = () =>''', '''  const cycSub = () => { try { return localStorage.getItem("pipeline-cycle-sub") === "actions" ? "actions" : "terminal"; } catch (_) { return "terminal"; } };
+# 15. Chat has no dock and no buttons but one Ship tab (rider, 2026-10-09 ~22:30, after a Terminal ·
+#     Actions split that brought the dock back: "why did you bring actions back, that's terrible. All we
+#     need is one ship button; let's put the ship buttons centrally for all cycles"). A cycle's Chat view
+#     is its terminal edge to edge; approval, holds and answers are typed to the agent there (the thread
+#     writes the doc fields the page would). The "Ship" chip after the cycle chips lists every live
+#     cycle with one Ship to prod button each, via the same requestStep(cid, "ship-prod") as before.
+#     Classic keeps every control.
+one('''  #pv-chat .chat.tty-full a.ttyl {''', '''  #pv-chat .dock { display: none !important; }
+  #pv-chat .ship-list { display: grid; gap: 12px; padding: 4px 0 16px; }
+  #pv-chat .shipc { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); padding: 14px 16px; display: grid; gap: 4px; }
+  #pv-chat .shipc p { margin: 0; }
+  #pv-chat .shipc h3 { margin: 0 0 2px; font-size: 15px; font-weight: 600; color: var(--ink); }
+  #pv-chat .shipc .st { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--ink-2); }
+  #pv-chat .shipc .ride, #pv-chat .shipc .bun { font-size: 12.5px; color: var(--ink-3); }
+  #pv-chat .shipc .bun { font-family: var(--mono); }
+  #pv-chat .shipc .act { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; }
+  #pv-chat .shipc .go:disabled { background: var(--surface-2); color: var(--ink-3); cursor: default; }
+  #pv-chat .shipc .why { font-size: 13px; color: var(--ink-3); }
+  #pv-chat .chat.tty-full a.ttyl {''')
+one('''  const triSub = () =>''', '''  // Ship to prod for one cycle: allowed once every row has been through a scored dev ride (none still
+  // waiting for its first one) and none failed; rows a ride did not exercise go to production as in-prod.
+  function shipState(c) {
+    const st = (k) => ((c.steps || {})[k] || {}).status;
+    const rs = (c.rows || []).filter((r) => r.keep !== false && r.branch);
+    const fail = rs.filter((r) => r.status === "fail").length;
+    if (busy(st("ship-prod"))) return { ok: false, why: "shipping to production now" };
+    if (st("ship-prod") === "done" || (c.bundle && c.bundle.prod)) return { ok: false, why: "already in production" };
+    if (st("ship-dev") !== "done") return { ok: false, why: "not on the dev app yet" };
+    if (fail) return { ok: false, why: `${fail} failed on the ride — see the backlog` };
+    if (st("verify") !== "done" || rs.some((r) => r.status === "on-dev")) return { ok: false, why: "waiting for a dev ride" };
+    return { ok: true, why: "" };
+  }
+  function shipCards() {
+    const live = liveCycles(); const fx = (board && board.facts) || {};
+    if (!live.length) return `<p class="empty">No live cycles.</p>`;
+    return `<div class="ship-list">${live.map((c) => {
+      const w = where(c), s = shipState(c), rl = window.pvRideLine(c);
+      return `<section class="shipc"><h3>Cycle ${esc(c.number)}${(() => { const t = (c.title || "").replace(new RegExp("^ *cycle +" + c.number + " *[—:-]? *", "i"), "").trim(); return t ? " — " + esc(t) : ""; })()}</h3>`
+        + `<p class="st"><span class="dot" data-s="${w.s}"></span><span>${esc(w.text)}</span></p>`
+        + (rl ? `<p class="ride">${esc(rl)}</p>` : "")
+        + `<p class="bun">dev ${esc((c.bundle && c.bundle.dev) || "—")} · production ${esc(fx.prodBundle || "—")}</p>`
+        + `<div class="act"><button type="button" class="go" data-shipprod="${esc(c.id)}" ${s.ok && canEdit !== false ? "" : "disabled"}>Ship to prod</button>${s.ok ? "" : `<span class="why">${esc(s.why)}</span>`}</div></section>`;
+    }).join("")}</div>`;
+  }
   const triSub = () =>''')
-one('''${LABEL[k]}</span>`).join("");
-  }''', '''${LABEL[k]}</span>`).join("") + (TERMINALS["c" + c.number] ? `<span class="pv-switch tri-sub" role="group" aria-label="Cycle view"><button type="button" data-csub="terminal" aria-pressed="${cycSub() === "terminal"}">Terminal</button><button type="button" data-csub="actions" aria-pressed="${cycSub() === "actions"}">Actions</button></span>` : "");
-  }''')
-one('''    if (b.dataset.trisub) {''', '''    if (b.dataset.csub) { try { localStorage.setItem("pipeline-cycle-sub", b.dataset.csub); } catch (_) {} return render(false); }
+one('''  function current() {
+''', '''  function current() {
+    if (ui.view === "ship") return "ship";
+''')
+one('''    const c = cyc(v);
+    if (!c) { const s = triSub();''', '''    $("chips").insertAdjacentHTML("beforeend", `<button class="chip" data-view="ship" aria-current="${v === "ship"}"><span class="dot" data-s="${liveCycles().some((x) => shipState(x).ok) ? "ready" : ""}"></span>Ship</button>`);
+    if (v === "ship") { $("phase").innerHTML = `<span class="p" data-cur="true" data-s="ready">Ship to production · one press per cycle</span>`; return; }
+    const c = cyc(v);
+    if (!c) { const s = triSub();''')
+one('''    if (!c && window.PV_TRIAGE) {
+''', '''    if (v === "ship") { el.classList.remove("tty-full"); el.innerHTML = shipCards(); return; }
+    if (!c && window.PV_TRIAGE) {
+''')
+one('''    if (b.dataset.trisub) {''', '''    if (b.dataset.shipprod) { b.disabled = true; return requestStep(b.dataset.shipprod, "ship-prod").then(() => render(true)); }
     if (b.dataset.trisub) {''')
-one("  #pv-chat .chat.tty-full a.ttyl {", """  #pv-chat .chat.tty-cyc ~ .dock { display: none; }
-  #pv-chat .phase { flex-wrap: wrap; row-gap: 6px; }
-  #pv-chat .chat.tty-full a.ttyl {""")
-assert "Verify now" not in page
 
 # 16. no Remote Control since 2026-10-09 (rider): a cycle's session is reached through its terminal on
 #     the Chat view (or tmux), not the Claude app
