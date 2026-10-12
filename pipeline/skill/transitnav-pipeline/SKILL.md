@@ -745,6 +745,25 @@ If the request said "then plan cycle N", continue into the plan step as describe
 
 ## `plan` — choose a cycle's rows and write the close-out
 
+**Who does what (rider, 2026-10-12: "we have a plan step but we aren't using
+plan mode"):** the reading and deciding below goes to ONE fresh `Agent` with
+`subagent_type: "Plan"` and `model: "opus"` — the read-only architect type,
+with no Edit/Write, so the plan phase cannot change code, the backlog or
+the board. Its prompt says it may use Bash **only to read** (git log/show,
+grep, `pipeline-db get`, test listings), never to write a file or commit;
+its one write is the *Agent progress* narration (append-only entries in
+`cycles/cN.feedback[]`, no other field), and it returns the plan as its final report:
+per row the corrected finding, repo, branch, tests, vehicle, kind, any
+question (with its visual), Sequencing and measure-first calls. **The cycle
+thread then does every write itself** — the backlog's `## Pipeline cycle N
+— plan` section and row corrections, `rows[]`, `questions[]`,
+`steps.plan.summary`, the draft revision and its `feedback[]` line — after
+checking the agent's claims against source. A `· revise` round is a new
+fresh Plan agent given the previous plan plus the rider's notes. Approval is
+unchanged: plan mode's own prompt is NOT used (it would block the waiter,
+the board's presses can't answer it, and it is lost on a relaunch); the
+draft in the db plus "approve the plan" is the gate.
+
 - Candidates: the request `note` if the rider named rows; otherwise from
   the backlog — rider asks and most-sighted first, then rows whose
   Sequencing predecessor is closed. Never re-plan a row that is `on-dev`
