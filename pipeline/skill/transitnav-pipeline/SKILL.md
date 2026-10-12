@@ -838,11 +838,22 @@ settled that the ride ran on the dev app with this cycle's code.
 
 ## `ship-prod` — promote the verified sha
 
-Only on this press. `WEB_SHA=<dev sha> SKIP_WEB=1 scripts/ship_web.sh
-"<one line>"` in `transitnav-ios` (production target) — the **same sha**
-the ride verified (rebuild at that sha with `build-web.sh` first if
-needed). One line of comma-separated rider-visible changes, no internals.
-Verify the checksum; `bundle.prod`, `facts.prodBundle`; note the promotion
+Only on this press (or the rider typing "ship to prod" in this thread).
+The publish is **one command and nothing else**:
+`~/bin/pipeline-ship-prod.sh N <sha> "<one line>"` — the **same sha** the
+ride verified. Run `~/bin/pipeline-ship-prod.sh --check N <sha>` first
+(read-only): `ALREADY` means production contains it (do not ship; record
+and retire as below), `WOULD SHIP` means go, `REFUSED` (a rollback) goes
+back to the rider. The script takes the ship lock, builds that exact sha in
+a detached worktree (`build-web.sh` with `WEB_SHA`, even when main has moved
+on), publishes with `ship_web.sh`, verifies the checksum over the public URL
+and restarts `otp-frontend-dev`. It is the command the rider's settings
+allow. **Never** build, `rsync` into `www/` or call `ship_web.sh` by hand
+for production: on 2026-10-12 cycle 13's agent did exactly that and was
+refused `[Production Deploy]`. If the script itself is refused, stop: mark
+the step `blocked`, give the rider that one command, and do nothing else.
+One line of comma-separated rider-visible changes, no internals.
+`bundle.prod`, `facts.prodBundle`; note the promotion
 on each row and in the record's Session index. A native change needs
 `testflight.yml` + `promote.sh <build>` instead — `lane.sh` says which.
 **Then retire this cycle** (`retiredAt`), whether or not every row was
