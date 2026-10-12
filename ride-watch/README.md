@@ -606,10 +606,12 @@ The daemon **appends one line per milestone** to the thread's events file
 ```
 
 **Nothing is typed into the pane** (since 2026-09-21). The thread is launched
-with a kickoff prompt on its command line that makes it arm its own `Monitor`
-on that file (`tail -n +1 -F`), and every appended line reaches it as a
-notification; when the monitor expires (30 min) the thread re-arms from `#N`,
-so a line is never replayed or skipped. `#N` restarts from the file, so a
+with a kickoff prompt on its command line that makes it start its own
+one-shot waiter on that file — `ride-wait.sh <file> 1` as a background Bash
+(since 2026-10-10; a `Monitor` before, which expired every 30 min and cost a
+wake-up and a re-arm each time). The waiter blocks until line M exists, prints
+every line from M on and exits; the thread handles the batch and restarts it
+from one past the highest `#N`, so a line is never replayed or skipped. `#N` restarts from the file, so a
 daemon restarted mid-ride keeps counting.
 
 Milestones are exactly: **trip start · leg transition · any rule finding ·
@@ -823,7 +825,7 @@ event, on the worker thread:
 | state | screen says | what happens |
 | --- | --- | --- |
 | `blocked` | `Do you want to proceed?` | the rider is paged once per pane: *"Ride thread is waiting on a permission prompt — open Claude and answer it"* — the dialog is in their app and nobody else can clear it; the events keep queueing behind it |
-| anything else | the `❯` prompt, `esc to interrupt`, or nothing recognisable | nothing — the monitor delivers the line whenever the thread is next free |
+| anything else | the `❯` prompt, `esc to interrupt`, or nothing recognisable | nothing — the waiter's exit is delivered whenever the thread is next free |
 
 The deadline also records **which tmux pane** was asked, and
 `_kill_previous_threads` spares that pane. The next ride's thread used to kill

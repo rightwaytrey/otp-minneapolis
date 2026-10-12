@@ -11,7 +11,7 @@
 #
 #   $1  display name shown in the rider's Claude app list ("ride 07-31 14:32")
 #   $2  the kickoff prompt: the session's first message, which tells it to arm
-#       its Monitor on the ride's events file. Passed as claude's positional
+#       its one-shot waiter (ride-wait.sh) on the ride's events file. Passed as claude's positional
 #       prompt — since 2026-09-21 nothing is ever typed into this pane.
 set -u
 

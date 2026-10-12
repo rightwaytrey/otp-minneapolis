@@ -3824,8 +3824,8 @@ BLOCKED_PANE = (
 
 class TestThreadEventsFile(RuleTestCase):
     """2026-09-21: nothing is typed into the pane. A milestone is one numbered
-    line appended to `<name>.events.log`; the thread watches the file with its
-    Monitor tool, armed by the kickoff prompt it is launched with. 12.4's
+    line appended to `<name>.events.log`; the thread waits on the file with
+    ride-wait.sh (a Monitor until 2026-10-10), started by its kickoff prompt. 12.4's
     whole family (a wrap-up typed into a permission dialog) and the window
     mix-up of the same evening cannot happen to a file append.
     """
@@ -3903,15 +3903,26 @@ class TestThreadEventsFile(RuleTestCase):
             watch._tmux = ScriptedTmux([screen])
             self.assertEqual(watch._pane_state("ride-1040"), expected)
 
-    def test_the_kickoff_prompt_arms_and_re_arms_the_monitor(self):
+    def test_the_kickoff_prompt_starts_and_restarts_the_waiter(self):
+        """2026-10-10: a one-shot background waiter, not a Monitor (which
+        expired every 30 min and cost a wake-up and a re-arm each time)."""
         p = ride_watch.thread_kickoff_prompt(
             "ride-1646", "ride 09-21 16:46", "/x/ride-1646.events.log",
             "/x/sess.digest.md", "sess")
-        self.assertIn("Monitor", p)
-        self.assertIn("tail -n +1 -F /x/ride-1646.events.log", p)
-        self.assertIn("tail -n +M -F /x/ride-1646.events.log", p)
+        w = ride_watch.RIDE_WAIT
+        self.assertTrue(w.endswith("ride-watch/ride-wait.sh"))
+        self.assertIn("%s /x/ride-1646.events.log 1" % w, p)
+        self.assertIn("%s /x/ride-1646.events.log M" % w, p)
+        self.assertIn("run_in_background", p)
+        self.assertIn("Never use the Monitor tool", p)
         self.assertIn("/x/sess.digest.md", p)
-        self.assertIn("1800000", p)
+
+    def test_the_waiter_is_allowed_and_monitor_is_not(self):
+        with open(os.path.join(os.path.dirname(ride_watch.RIDE_WAIT),
+                               "ride-thread-settings.json")) as f:
+            allow = json.load(f)["permissions"]["allow"]
+        self.assertIn("Bash(%s:*)" % ride_watch.RIDE_WAIT, allow)
+        self.assertNotIn("Monitor", allow)
 
 
 class TestDaemonProvenance(RuleTestCase):
@@ -9452,7 +9463,7 @@ class TestThreadPaneIsolation(RuleTestCase):
         original = ride_watch.THREAD_READY_POLL_S
         ride_watch.THREAD_READY_POLL_S = 0
         self.addCleanup(setattr, ride_watch, "THREAD_READY_POLL_S", original)
-        self.watch._thread_kickoff["ride-1646"] = "arm the monitor on X"
+        self.watch._thread_kickoff["ride-1646"] = "start the waiter on X"
 
     def spawn(self, pane_id):
         fake = PaneTmux([READY_PANE], pane_id)
@@ -9471,7 +9482,7 @@ class TestThreadPaneIsolation(RuleTestCase):
         fake = self.spawn("%120\n")
         cmd = [a for a in fake.calls if a[0] == "new-session"][0][-1]
         self.assertIn("ride-thread-run.sh", cmd)
-        self.assertIn("arm the monitor on X", cmd)
+        self.assertIn("start the waiter on X", cmd)
 
     def test_the_spawn_starts_an_empty_events_file(self):
         path = self.watch._events_path("ride-1646")

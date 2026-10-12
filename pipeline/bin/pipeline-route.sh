@@ -4,7 +4,7 @@
 # The board's router session (pipeline-worker.sh) is the ONLY session watching
 # the board artifact. When a press names a cycle, it calls this; the cycle's own
 # thread (pipeline-cycle-thread.sh, window cN of the `transitnav` tmux session)
-# watches its inbox with Monitor and runs the action; `--key` makes a repeat
+# is woken by pipeline-wait.sh N when its inbox grows and runs the action; `--key` makes a repeat
 # idempotent. Since 2026-10-08 there is no router sweep: a press whose comment
 # never arrived is picked up by the cycle thread's own 30-minute self-check.
 #
@@ -30,7 +30,7 @@ done
 [ -n "$KEY" ] || { echo "--key is required (e.g. verify:1790255731941)" >&2; exit 2; }
 
 # "board" (2026-10-09, self-hosted board): a press that names no cycle — START
-# triage — goes to the router's own inbox, which pipeline-board-watch.sh follows.
+# triage — goes to the router's own inbox, which pipeline-wait.sh board follows.
 if [ "$N" = "board" ]; then DIR="$HOME/.claude/pipeline/board"; else DIR="$HOME/.claude/pipeline/c$N"; fi
 INBOX="$DIR/inbox.log"
 mkdir -p "$DIR"; touch "$INBOX" "$DIR/handled"
@@ -47,7 +47,7 @@ else
 fi
 flock -u 9
 
-# Make sure the thread is alive. It re-arms its Monitor from `handled`, so a
+# Make sure the thread is alive. Its waiter resumes from `handled`, so a
 # thread started now picks up everything routed but not yet handled. A cycle
 # that retired closed its own thread (cN/retired); never start it again here.
 if [ "$N" = "board" ]; then

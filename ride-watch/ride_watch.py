@@ -1295,9 +1295,11 @@ ROUTE_FEED_KEEP = 8
 #     logged, none fatal. Telemetry keeps being read and pages keep going out.
 #   * NOTHING IS TYPED INTO THE PANE. Since 2026-09-21 a milestone is one line
 #     appended to `<watch_dir>/<name>.events.log` (`#N [ride-watch] …`), and
-#     the thread itself watches that file with its Monitor tool — armed by the
-#     kickoff prompt it is launched with, re-armed from `#N` when the monitor
-#     expires. The keystroke era (send-keys, the Enter beat, pane-state holds,
+#     the thread itself waits on that file with `ride-wait.sh` run as a
+#     background Bash (since 2026-10-10; a Monitor before that, which expired
+#     every 30 min and cost the thread a wake-up and a re-arm each time) —
+#     started by the kickoff prompt it is launched with, restarted from `#N`
+#     after every batch. The keystroke era (send-keys, the Enter beat, pane-state holds,
 #     a permission dialog eating the wrap-up — 12.4 —, a line landing in
 #     whatever window the rider had active) is over. `_pane_state` survives
 #     only to page the rider once when the thread is stuck on a permission
@@ -1305,6 +1307,8 @@ ROUTE_FEED_KEEP = 8
 THREAD_ENABLED = os.environ.get("RIDE_THREAD_ENABLED", "1") not in (
     "0", "false", "no", "off")
 THREAD_RUNNER = os.path.join(REPO_DIR, "ride-watch", "ride-thread-run.sh")
+# The thread's one-shot waiter on its events file (2026-10-10, replaced Monitor).
+RIDE_WAIT = os.path.join(REPO_DIR, "ride-watch", "ride-wait.sh")
 # Namespace for both the tmux session (`ride-1432`) and the app display name
 # ("ride 07-31 14:32"). Overridable so an end-to-end test can spawn a real
 # thread without ever colliding with — or cleaning up — the rider's own.
@@ -1600,24 +1604,28 @@ def one_line(text, limit=THREAD_LINE_MAX):
 def thread_kickoff_prompt(name, display, events_path, digest_path, session):
     """The ride thread's first message, handed to it on the command line.
 
-    It has to make the thread arm its own Monitor on the events file before
-    anything else, and say how to re-arm from the `#N` numbering, because
-    from here on nothing is ever typed into the pane.
+    It has to make the thread start its own waiter on the events file before
+    anything else, and say how to restart it from the `#N` numbering, because
+    from here on nothing is ever typed into the pane. The waiter is a one-shot
+    background Bash (`ride-wait.sh`), not a Monitor: it exits only when there
+    is a line, so a quiet stretch of the ride costs the thread nothing.
     """
     return (
         "You are the ride thread for Go Mode session %s (\"%s\"). The "
         "ride-watch daemon appends one line per milestone to %s; each line is "
         "numbered `#N [ride-watch] <what changed> - digest: %s`. FIRST, before "
-        "replying, arm the Monitor tool on that file: command "
-        "`tail -n +1 -F %s`, timeout_ms 1800000, description \"%s events\". "
-        "Every event line is a milestone: handle it as your brief says (read "
-        "the digest; one short line for a routine milestone; the trip-ended "
-        "line is the wrap-up). When the monitor expires, re-arm it at once "
-        "with `tail -n +M -F %s` where M is one past the highest #N you have "
-        "seen, so nothing is replayed or skipped. Do not poll the file by "
-        "hand. Reply to this message with one line saying the monitor is armed."
-        % (session, display, events_path, digest_path, events_path, name,
-           events_path))
+        "replying, start the waiter: run `%s %s 1` with the Bash tool, "
+        "run_in_background true. It prints nothing until there is a line, then "
+        "prints every line from #1 on and exits, and you are notified. Every "
+        "event line is a milestone: handle it as your brief says (read the "
+        "digest; one short line for a routine milestone; the trip-ended line "
+        "is the wrap-up). After each batch, start it again the same way with "
+        "`%s %s M` where M is one past the highest #N you have seen, so "
+        "nothing is replayed or skipped. Never use the Monitor tool and do not "
+        "poll the file by hand. Reply to this message with one line saying the "
+        "waiter is running."
+        % (session, display, events_path, digest_path, RIDE_WAIT, events_path,
+           RIDE_WAIT, events_path))
 
 
 def ride_thread_sessions(names, prefix=THREAD_NAME_PREFIX):

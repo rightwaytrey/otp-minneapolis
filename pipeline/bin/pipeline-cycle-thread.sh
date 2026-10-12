@@ -15,7 +15,8 @@
 # It watches no board (since 2026-10-09 the self-hosted board's server routes
 # presses itself, via pipeline-route.sh, into ~/.claude/pipeline/cN/
 # inbox.log via pipeline-route.sh; this thread follows that and the ride-report
-# folder through ONE Monitor, ~/bin/pipeline-cycle-watch.sh N. Started by
+# folder with a one-shot background waiter, ~/bin/pipeline-wait.sh N, which
+# exits only when there is work (no Monitor since 2026-10-10). Started by
 # pipeline-route.sh as window cN of the `transitnav` tmux session; /exit
 # relaunches it; `touch ~/.claude/pipeline/cN/stop` then /exit ends it.
 set -u
@@ -42,20 +43,26 @@ ONLY with ~/bin/pipeline-db (get / update --if-version / set; read 'The board's 
 and presses' in the skill) — never ArtifactData or ArtifactComments, the old Artifact \
 is retired. There are no comment threads: a reply is the step summary plus one \
 {by: \"claude\"} line in feedback[]. Do not write terminalSnapshot (the board embeds \
-your live window now). FIRST arm the Monitor tool: command \`$HOME/bin/pipeline-cycle-watch.sh $N\`, \
-timeout_ms 1800000, description \"cycle $N inbox + rides\". An 'INBOX #K …' line is \
-a press: read its text= file and run that one action for cycle $N as the skill \
-says. A 'RIDE <path>' line is a new ride report: run the skill's 'Verify on a \
-ride' for cycle $N only. When the monitor expires, run the skill's self-check and \
-re-arm the same command. Then run the self-check once now. Never touch another \
-cycle's doc, rows or windows. When the rider talks to you directly in this \
+your live window now). HOW YOU ARE WOKEN: run \`$HOME/bin/pipeline-wait.sh $N\` with \
+the Bash tool, run_in_background true. It prints nothing and stays running until there \
+is work, then exits with a batch of lines and you are notified; read its output, handle \
+every line, then start it again the same way. Never use the Monitor tool, never poll, \
+never set a timer — an idle thread costs nothing. An 'INBOX #K …' line is a press: read \
+its text= file and run that one action for cycle $N as the skill says. A 'RIDE …' line \
+is a trip that ended: run the skill's 'Verify on a ride' for cycle $N only. A 'CHECK \
+<key> :: <what>' line is a self-check rule that fired: act on it as the self-check \
+says. Run the full self-check once now, at startup, then start the waiter. Never touch \
+another cycle's doc, rows or windows. When the rider talks to you directly in this \
 session, mirror the gist into cycles/c$N.feedback[] as the skill says. Ignore any \
-'[ride-watch]' lines. Reply now with one line: whether the monitor is armed, \
+'[ride-watch]' lines. Reply now with one line: whether the waiter is running, \
 cycle $N's steps, and what the self-check found."
 
 rm -f "$STOP"
 trap 'echo; echo "cycle-thread c$N: interrupted — exiting loop."; exit 0' INT
 while true; do
+  # A new session gets every press not yet marked handled, and no waiter left
+  # over from the last one (it would print to nobody) is still holding a press.
+  pkill -f "pipeline-wait.sh $N\$" 2>/dev/null; : > "$DIR/delivered"
   claude --model opus --name "cycle $N" --permission-mode auto "$KICKOFF"   # opus: the rider, 2026-10-09
   if [ -f "$STOP" ]; then rm -f "$STOP"; echo "cycle-thread c$N: stop requested."; break; fi
   if [ -f "$DIR/retired" ]; then echo "cycle-thread c$N: cycle retired."; break; fi

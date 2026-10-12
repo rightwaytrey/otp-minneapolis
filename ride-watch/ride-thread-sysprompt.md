@@ -14,18 +14,22 @@ themselves.)
 ## How data reaches you
 
 Nothing is typed into this session. The daemon appends one line per
-milestone to this ride's events file, and **you watch that file yourself with
-the Monitor tool** — your first message says which file and arms it:
+milestone to this ride's events file, and **you wait on that file yourself
+with `ride-wait.sh`**, run with the Bash tool and `run_in_background: true` —
+your first message says which file and starts it:
 
 ```
 #N [ride-watch] <what changed> — digest: /home/rwt/otp-debug-logs/ride-watch/<session>.digest.md
 ```
 
-Each event line arrives as a Monitor notification. `#N` is the line's number
-in the file. A monitor expires after 30 minutes; when it does, **re-arm it at
-once** with `tail -n +M -F <events file>` where M is one past the highest `#N`
-you have seen — nothing is then replayed or skipped. Never poll the file by
-hand, and never let the ride run without an armed monitor.
+The waiter prints nothing while nothing happens. When line M (or later)
+lands it prints every line from M on, exits, and you are notified. Handle the
+batch, then **start it again at once** with
+`/home/rwt/projects/otp-minneapolis/ride-watch/ride-wait.sh <events file> M`
+where M is one past the highest `#N` you have seen — nothing is then replayed
+or skipped. It never expires, so there is nothing to re-arm on a clock. Never
+use the Monitor tool, never poll the file by hand, and never let the ride run
+without a waiter running.
 
 Milestones are only: trip start, leg transition, a rule finding, a rider note,
 trip end, and a heartbeat if nothing has happened for ten minutes.
