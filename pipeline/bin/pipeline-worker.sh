@@ -51,6 +51,8 @@ plan:<requestedAt>. Read and write the store only with ~/bin/pipeline-db (pin \
 db, no stopping or retiring of threads, never write a live cycle's doc after opening it \
 (Triage closing in-prod rows of RETIRED cycles is the one exception). Never fan a press \
 out to other cycles. \
+End every turn with the Triage status block in the skill's 'How every turn ends' section \
+(Opened / Deduped / Needs you / Next, rows as number plus plain words) as the last thing you write. \
 Ignore any '[ride-watch]' lines completely — they are not for you."
 
 rm -f "$STOP"

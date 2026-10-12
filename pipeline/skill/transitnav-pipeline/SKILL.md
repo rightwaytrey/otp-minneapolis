@@ -354,6 +354,57 @@ happened to that ride.
 Never fan out: every live cycle's thread sees the same `RIDE` line and
 decides for itself. Another cycle's rows and `steps` are never touched.
 
+### How every turn ends — the status block (since 2026-10-12)
+
+The rider works these threads directly in the terminal (rider: "i want the
+agent to be easy to use directly, like the dashboard"), so **every turn's
+final text ends with this block**, however short the turn: after a press,
+a RIDE or CHECK line, a MESSAGE, or the rider typing. It is the last thing
+in the reply; nothing comes after it. Fill it from `cycles/cN` as it stands
+after your writes, not from memory.
+
+```
+── Cycle N · <current step + status, e.g. "build running"> ──
+Working on   18.3 aboard match · 18.5 ETA freeze          (build: 2 agents)
+Needs you    Q2 (18.4) keep the 3-min auto-end? → type "Q2: yes" / "Q2: no"
+             plan rev 2 ready → type "approve the plan"
+Shipping     dev 2026.1012.1 — 18.1 stop-tap fix · 18.2 board banner
+Waiting      18.1 · 18.2 on dev, need a ride to verify
+Held         18.6 (you held it) — type "ship <branch>" to release
+Next         build finishes → ship-dev runs by itself
+```
+
+- **All seven lines, every time**, in this order. A line with nothing in it
+  says `—`; never drop it, so the rider always reads the same shape.
+- **Every row by number AND a few plain words** (`18.3 aboard match`), never a
+  number alone, a branch name alone, or a sha.
+- **Working on** = rows an agent is on *right now* (the step running).
+  **Shipping** = rows going out in the bundle being built or just pushed
+  (dev or prod — say which, with the bundle number). **Waiting** = rows on
+  dev or in prod waiting for a ride. **Held** = `decision: hold` or
+  `keep: false`.
+- **Needs you** is the only line with work for the rider: each entry names
+  what is waiting (question, plan revision, ship-to-prod) and the **exact
+  words to type** here. If nothing needs the rider, it says `— nothing, I'll
+  carry on` — that sentence is the point of the line.
+- **Next** = what happens without the rider (auto-advance), or `waits for
+  you` when it doesn't.
+- Rows that failed verify go on **Needs you** with the failure in plain words
+  only if the rider must decide; otherwise under **Working on** if an agent is
+  fixing them.
+- Retired cycle: `── Cycle N · retired ──` and only `Shipping` (prod bundle
+  + rows) and `Waiting`.
+
+The router's turns end with the same idea for Triage:
+
+```
+── Triage · <done / running> ──
+Opened       21.4 kerb snap · 21.5 late push
+Deduped      18.3 (now 3rd sighting)
+Needs you    — nothing  /  plan these as cycle N? → press the next-phase button
+Next         next scan in ≤ 15 min
+```
+
 ### Closing the thread
 
 After ship-prod finishes (or a self-check finds `retiredAt`): write the

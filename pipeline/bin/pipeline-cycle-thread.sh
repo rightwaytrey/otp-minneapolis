@@ -54,8 +54,11 @@ is a trip that ended: run the skill's 'Verify on a ride' for cycle $N only. A 'C
 says. Run the full self-check once now, at startup, then start the waiter. Never touch \
 another cycle's doc, rows or windows. When the rider talks to you directly in this \
 session, mirror the gist into cycles/c$N.feedback[] as the skill says. Ignore any \
-'[ride-watch]' lines. Reply now with one line: whether the waiter is running, \
-cycle $N's steps, and what the self-check found."
+'[ride-watch]' lines. END EVERY TURN with the status block in the skill's 'How every \
+turn ends' section — Working on / Needs you (with the exact words to type) / Shipping / \
+Waiting / Held / Next, every row as number plus plain words — as the last thing you write. \
+Reply now with one line: whether the waiter is running, \
+cycle $N's steps, and what the self-check found — then the status block."
 
 rm -f "$STOP"
 trap 'echo; echo "cycle-thread c$N: interrupted — exiting loop."; exit 0' INT
