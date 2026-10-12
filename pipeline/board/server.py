@@ -16,6 +16,9 @@ Store: ~/.claude/pipeline/db/<collection>/<doc>.json = {data, version, updatedAt
   POST /api/press          {text, key} -> ~/bin/pipeline-route.sh <N|board> --thread - --key <key>
                            (text on stdin; N from "cycle N" in the first line, else the
                            whole text; START triage always goes to "board")
+  POST /api/inject         {win: cN|board, text} -> types the text (one line) into tmux window
+                           transitnav:<win> and presses Enter: the Chat view's one "next phase"
+                           button (rider, 2026-10-12), read by the thread as typed instructions
   GET  /api/terminals      {cN|board: "https://<tailnet host>:<port>"} for each live window
                            of tmux session `transitnav`; ensures a WRITABLE ttyd on
                            127.0.0.1:20000+N (board 19999) and a tailscale serve mapping
@@ -144,6 +147,25 @@ def press(text, key):
     return (200 if p.returncode == 0 else 500), {"ok": p.returncode == 0, "routed": n, "key": key, "out": out}
 
 
+def inject(win, text):
+    if not isinstance(win, str) or not re.fullmatch(r"c\d+|board", win):
+        return 400, {"error": "win must be cN or board"}
+    if not isinstance(text, str) or not text.strip():
+        return 400, {"error": "text required"}
+    text = " ".join(text.split())[:2000]  # one line: a newline would submit early
+    t = f"transitnav:{win}"
+    names = subprocess.run(["tmux", "list-windows", "-t", "transitnav", "-F", "#{window_name}"], capture_output=True, text=True).stdout.split()
+    if win not in names:
+        return 404, {"error": f"no tmux window {t}"}
+    mode = subprocess.run(["tmux", "display-message", "-p", "-t", t, "#{pane_in_mode}"], capture_output=True, text=True).stdout.strip()
+    if mode == "1":  # scrolled back in copy-mode: keys would go to copy-mode, not to claude
+        subprocess.run(["tmux", "send-keys", "-t", t, "-X", "cancel"])
+    subprocess.run(["tmux", "send-keys", "-t", t, "-l", "--", text], check=True)
+    time.sleep(0.4)  # let claude's input settle the typed text before Enter
+    subprocess.run(["tmux", "send-keys", "-t", t, "Enter"], check=True)
+    return 200, {"ok": True, "win": win}
+
+
 # ---- terminals -----------------------------------------------------------
 def tailnet_host():
     global _host
@@ -200,7 +222,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *a):
-        if "/api/write" in self.path or "/api/press" in self.path:
+        if "/api/write" in self.path or "/api/press" in self.path or "/api/inject" in self.path:
             super().log_message(fmt, *a)
 
     def send(self, code, body, ctype="application/json"):
@@ -254,6 +276,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(*write(b.get("path"), b.get("op"), b.get("data"), b.get("if_version")))
             if self.path == "/api/press":
                 return self.send(*press(b.get("text"), b.get("key")))
+            if self.path == "/api/inject":
+                return self.send(*inject(b.get("win"), b.get("text")))
             return self.send(404, {"error": "not found"})
         except (ValueError, TypeError) as e:
             return self.send(400, {"error": str(e)})

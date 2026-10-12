@@ -532,6 +532,10 @@
   #pv-chat .shipc .act { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; }
   #pv-chat .shipc .go:disabled { background: var(--surface-2); color: var(--ink-3); cursor: default; }
   #pv-chat .shipc .why { font-size: 13px; color: var(--ink-3); }
+  #pv-chat .row2 { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  #pv-chat .row2 .phase { flex: 1; min-width: 0; }
+  #pv-chat .nextgo { flex: none; min-height: 36px; padding: 0 14px; border-radius: 9px; background: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 14px; white-space: nowrap; }
+  #pv-chat .nextgo:disabled { background: var(--surface-2); color: var(--ink-3); cursor: default; }
   #pv-chat .chat.tty-full a.ttyl { flex: 1; min-height: 0; min-width: 0; display: flex; color: inherit; text-decoration: none; -webkit-user-drag: none; }
   #pv-chat .chat.tty-full pre.tty { flex: 1; min-height: 0; min-width: 0; margin: 0; overflow-y: auto; overflow-x: auto; padding: 4px 3px 6px; background: #0d1211; color: #d6e0dc; font: 12px/1.4 var(--mono); white-space: pre; -webkit-overflow-scrolling: touch; }
 
@@ -664,7 +668,7 @@
       <span class="pv-switch" role="group" aria-label="View"><button type="button" data-pv="chat" aria-pressed="true">Chat</button><button type="button" data-pv="classic" aria-pressed="false">Classic</button></span>
       <a class="termbtn" id="termbtn" href="#" target="_blank" rel="noopener">Terminal</a>
     </div>
-    <div class="phase" id="phase" aria-label="Phase"></div>
+    <div class="row2"><div class="phase" id="phase" aria-label="Phase"></div><button type="button" class="nextgo" id="nextgo" hidden></button></div>
   </header>
   <div class="term" id="term" hidden></div>
   <main class="chat" id="chat" aria-live="polite"></main>
@@ -1801,17 +1805,64 @@ window.PV = (function () {
         + `<div class="act"><button type="button" class="go" data-shipprod="${esc(c.id)}" ${s.ok && canEdit !== false ? "" : "disabled"}>Ship to prod</button>${s.ok ? "" : `<span class="why">${esc(s.why)}</span>`}</div></section>`;
     }).join("")}</div>`;
   }
+  // The one "next phase" press for the view: {label, win, text} to type into that terminal, or
+  // {label, disabled, why} when the next phase can't start from here, or null (busy / nothing next).
+  function promote(v) {
+    if (v === "ship") return null;
+    const c = cyc(v);
+    if (!c) {
+      const it = (board && board.intake) || {};
+      if (busy(it.status)) return null;
+      const n = nextNumber();
+      return { win: "board", label: "Run triage", text: `START triage — then plan cycle ${n} (typed from the board's next-phase button): run the transitnav-pipeline skill for stage "triage", update pipeline/board.intake, then open cycles/c${n} with the rows triage opened or touched and run stage "plan" on it.` };
+    }
+    if (c.retiredAt || ORDER.some((k) => busy(stat(c, k)))) return null;
+    const n = c.number, win = "c" + n, via = "(typed from the board's next-phase button — write the fields the board's press would have written, then act)";
+    if (stat(c, "plan") === "draft") return { win, label: "Approve plan · build it", text: `approve the plan — build it, cycle ${n} ${via}` };
+    for (const k of ORDER) if (stat(c, k) === "blocked") return { win, label: `Resume ${LABEL[k].toLowerCase()}`, text: `START ${k} — cycle ${n}, resume ${via}: run the transitnav-pipeline skill for stage "${k}" on cycles/${c.id}.` };
+    const k = nextStep(c); if (!k) return null;
+    if (unanswered(c).length) return { label: "Answer questions first", disabled: true };
+    if (k === "verify") return { label: "Verify · needs a dev ride", disabled: true };
+    if (k === "ship-prod") { const s = shipState(c); return s.ok ? { win, label: "Ship to prod", text: `ship to prod — cycle ${n} ${via}` } : { label: "Ship to prod", disabled: true, why: s.why }; }
+    const lbl = { plan: "Plan it", build: "Build it", "ship-dev": "Ship to dev" }[k] || LABEL[k];
+    return { win, label: lbl, text: `START ${k} — cycle ${n} ${via}: run the transitnav-pipeline skill for stage "${k}" on cycles/${c.id}.` };
+  }
+  function renderNextGo(v) {
+    const b = $("nextgo"), p = promote(v);
+    ui.promote = p;
+    b.hidden = !p;
+    if (!p) return;
+    b.textContent = p.label;
+    b.disabled = !!p.disabled || canEdit === false || !!(p.win && !TERMINALS[p.win]);
+    b.title = p.why || (p.win && !TERMINALS[p.win] ? "No terminal for this agent" : p.text || "");
+  }
+  async function pressNextGo() {
+    const p = ui.promote, b = $("nextgo");
+    if (!p || p.disabled || !p.win) return;
+    b.disabled = true; b.textContent = "Sent";
+    try {
+      const r = await fetch("/api/inject", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ win: p.win, text: p.text }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "http " + r.status);
+      // show it landing: on Triage, flip to the router's terminal
+      if (p.win === "board") { try { localStorage.setItem("pipeline-triage-sub", "terminal"); } catch (_) {} }
+    } catch (err) { toast("Couldn't type into the terminal (" + (err && err.message || "error") + ")."); }
+    setTimeout(() => render(true), 4000);
+  }
+  document.getElementById("nextgo").addEventListener("click", pressNextGo);
   const triSub = () => { try { return localStorage.getItem("pipeline-triage-sub") === "terminal" ? "terminal" : "inbox"; } catch (_) { return "inbox"; } };
   function renderHeader(v) {
     const ts = triageState();
     $("chips").innerHTML = `<button class="chip" data-view="triage" aria-current="${v === "triage"}"><span class="dot" data-s="${ts.s}"></span>Triage</button>`
       + liveCycles().map((c) => `<button class="chip" data-view="${esc(c.id)}" aria-current="${v === c.id}" aria-label="Cycle ${esc(c.number)}"><span class="dot" data-s="${where(c).s}"></span><b>${esc(c.number)}</b></button>`).join("");
     $("chips").insertAdjacentHTML("beforeend", `<button class="chip" data-view="ship" aria-current="${v === "ship"}"><span class="dot" data-s="${liveCycles().some((x) => shipState(x).ok) ? "ready" : ""}"></span>Ship</button>`);
+    renderNextGo(v);
     if (v === "ship") { $("phase").innerHTML = `<span class="p" data-cur="true" data-s="ready">Ship to production · one press per cycle</span>`; return; }
     const c = cyc(v);
     if (!c) { const s = triSub(); $("phase").innerHTML = `<span class="p" data-cur="true" data-s="${ts.s}">Triage · ${esc(ts.text)}</span><span class="pv-switch tri-sub" role="group" aria-label="Triage view"><button type="button" data-trisub="inbox" aria-pressed="${s === "inbox"}">Inbox</button><button type="button" data-trisub="terminal" aria-pressed="${s === "terminal"}">Terminal</button></span>`; return; }
     const w = where(c); const ci = ORDER.indexOf(w.k);
     $("phase").innerHTML = ORDER.map((k, i) => `${i ? '<span class="sep" aria-hidden="true">›</span>' : ""}<span class="p" data-cur="${i === ci}" data-done="${stat(c, k) === "done"}" data-s="${i === ci ? w.s : ""}">${LABEL[k]}</span>`).join("");
+    { const ph = $("phase"), cur = ph.querySelector('[data-cur="true"]'); if (cur) ph.scrollLeft = Math.max(0, cur.offsetLeft + cur.offsetWidth - ph.clientWidth + 8); }
   }
 
   function renderChat(v, keepScroll) {

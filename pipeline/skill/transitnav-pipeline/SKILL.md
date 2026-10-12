@@ -1,6 +1,6 @@
 ---
 name: transitnav-pipeline
-description: Run one action of the TransitNav delivery pipeline — triage (intake), or a cycle step (plan, build, ship-dev, verify, ship-prod), or record answers — as kicked off from the self-hosted Pipeline board (https://rwtpc4.tail9d6464.ts.net:9600/, store read and written with ~/bin/pipeline-db) or by hand (/transitnav-pipeline <action> [cycle]). Use whenever a pipeline inbox Monitor emits an "INBOX #K …" press line (START, ANSWERS, MESSAGE, PLAN APPROVED), or the user asks to run/check a pipeline step or "the pipeline board".
+description: Run one action of the TransitNav delivery pipeline — triage (intake), or a cycle step (plan, build, ship-dev, verify, ship-prod), or record answers — as kicked off from the self-hosted Pipeline board (https://rwtpc4.tail9d6464.ts.net:9600/, store read and written with ~/bin/pipeline-db) or by hand (/transitnav-pipeline <action> [cycle]). Use whenever a thread's waiter (~/bin/pipeline-wait.sh) exits with an "INBOX #K …" press line (START, ANSWERS, MESSAGE, PLAN APPROVED), a RIDE line or a CHECK line, or the user asks to run/check a pipeline step or "the pipeline board".
 ---
 
 # TransitNav pipeline — one action per invocation
@@ -146,9 +146,10 @@ keeps one Claude session named "pipeline board" (no Remote Control since 2026-10
 the `transitnav` tmux session (`tmux attach -t transitnav`; the claude-monitor board
 shows it under its TransitNav tab; stop it for good with
 `touch ~/.claude/pipeline-worker-stop` then `/exit`; moved there from its own
-`tmux -L pipeline` server on 2026-09-22). Since 2026-10-09 its kickoff arms a
-Monitor on `~/bin/pipeline-board-watch.sh` (its own inbox) instead of watching
-the Artifact's comments — no session watches comments any more. (Before 09-21 a
+`tmux -L pipeline` server on 2026-09-22). Since 2026-10-09 it follows its own inbox
+instead of watching the Artifact's comments — no session watches comments any
+more — and since 2026-10-10 through the one-shot waiter
+`~/bin/pipeline-wait.sh board` (*How a thread is woken*, below). (Before 09-21 a
 press woke whichever session had last published the board: "who is hijacking
 this session".)
 
@@ -160,19 +161,20 @@ reached the worker: it saw "both notifications", a tool-less auto-reply said
 "I can't run Verify from this session", and the page still recorded
 `wake.ok: true` (that flag means the comment was *sent*, not *delivered*).
 Nothing re-checked the db, so six cycles sat at `requested`. Since
-2026-10-08 each cycle's thread re-checks its own doc every 30 minutes (the
-*self-check*), which replaced the router's sweep.
+2026-10-08 each cycle's thread runs a *self-check* on its own doc, which
+replaced the router's sweep; since 2026-10-10 its rules are evaluated by the
+thread's waiter (`pipeline-check.py`), which wakes the thread only when one
+fires.
 
 ## Routing — the router's brief (`pipeline-worker.sh`, window `board`)
 
-The router does two things and nothing else: (a) it runs **Triage** and the
-15-minute `scan`; (b) it **opens a new cycle** (on `then plan cycle N`). Since
+The router does two things and nothing else: (a) it runs **Triage** (the 15-minute `scan` runs in
+its waiter, with no agent); (b) it **opens a new cycle** (on `then plan cycle N`). Since
 2026-10-09 it forwards nothing — the board's server routes every press that
 names a cycle straight into that cycle's inbox. It does not sweep cycles, does
 not stop or retire threads, and makes no decision about any cycle — each
-cycle's own thread does all of that. Its Monitor,
-`~/bin/pipeline-board-watch.sh` (re-armed every 15 min, which is also its scan
-tick), emits `INBOX #K key=… thread=- text=<path> :: <first line>` for each
+cycle's own thread does all of that. Its waiter,
+`~/bin/pipeline-wait.sh board`, exits with `INBOX #K key=… thread=- text=<path> :: <first line>` for each
 press in `~/.claude/pipeline/board/inbox.log`; read the `text=` file, act,
 then append K to `~/.claude/pipeline/board/handled`:
 
@@ -185,8 +187,10 @@ then append K to `~/.claude/pipeline/board/handled`:
 (mechanical; it will not start a cycle that has retired — the press is still
 written to the inbox, and the script says so).
 
-**Every 15 minutes** (self-paced loop): `scan` (silent), and
-`intake.status: requested` with no `startedAt` → run triage. Nothing about
+**No clock.** The waiter runs `pipeline-scan-apply.py` (the `scan` below)
+every 15 minutes itself and never wakes the router for it. It prints `CHECK
+triage-requested:<requestedAt> :: …` when `intake.status` is `requested` with
+no `startedAt` for 5 minutes → run triage. Nothing about
 cycles: a press whose comment never reached the router is picked up by its
 own cycle's self-check from the db.
 
@@ -195,9 +199,9 @@ own cycle's self-check from the db.
 A cycle thread is a Claude session named "cycle N" (no Remote Control since 2026-10-09, the rider) that owns
 `cycles/cN` from plan to retirement and keeps its story in one context: every
 revision, answer, branch report and ride verdict of that cycle. It never
-watches the board's comments. It follows ONE Monitor,
-`~/bin/pipeline-cycle-watch.sh N` (timeout 30 min), which emits two kinds
-of line:
+watches the board's comments. It is woken by ONE one-shot waiter,
+`~/bin/pipeline-wait.sh N` (*How a thread is woken*, below), which exits with
+three kinds of line:
 
 - `INBOX #K key=… thread=… text=<path> :: <first line>` — a press the router
   forwarded. Read the `text=` file and run that one action on **cycle N
@@ -217,8 +221,28 @@ of line:
   `ride_watch.py` `_write_report_request(trip) if n > 0` — but every ended
   trip updates `state.json` `lastTrip`, and the watcher reads both).
 
-**When the Monitor expires** (every 30 min), run the **self-check** and
-re-arm the same command. Also run it once at startup, before anything else.
+- `CHECK <key> :: <what>` — a self-check rule fired (`pipeline-check.py`
+  evaluates rules 1, 2 and 4 once a minute; each key is printed once, so a
+  condition you looked at and chose to leave does not wake you again). Act on
+  it as the rule says.
+
+Run the full **self-check** once at startup, before starting the waiter (rules
+3 and 5 only arise across a relaunch). There is no periodic self-check any
+more.
+
+### How a thread is woken (since 2026-10-10)
+
+Start `~/bin/pipeline-wait.sh <N|board>` with the **Bash tool,
+`run_in_background: true`**. It prints nothing and keeps running — for hours
+if need be — until there is work, then prints the batch and exits, and the
+session is notified. Read its output, handle every line, start it again. Never
+the Monitor tool, never a poll, never a timer. (Why, the rider: "such a
+needless waste of context" — a Monitor dies after 30 minutes, so an idle thread
+was woken 48 times a day by "Monitor expired … no events", ran a self-check and
+re-armed; cycle 15's thread had 30 such wake-ups out of 33.) Cursor: the
+waiter records each press it printed in `delivered`; the thread wrapper empties
+that file at every launch, so a relaunched session gets every press its
+predecessor never marked `handled`.
 
 ### The self-check — this cycle only
 
@@ -294,8 +318,8 @@ happened to that ride.
    trip ended after ship-dev — a ride before the code shipped is not
    recorded at all).
 2. **Wait for the mirror.** `~/otp-debug-logs` is an rsync mirror of the
-   Linode and can lag ~30 min: before scoring, the agent waits (Monitor with
-   an until-loop, at most 35 min) until `~/otp-debug-logs/debug-YYYY-MM-DD.jsonl`
+   Linode and can lag ~30 min: before scoring, the agent waits (a background
+   Bash until-loop, at most 35 min) until `~/otp-debug-logs/debug-YYYY-MM-DD.jsonl`
    holds records of this session at or after `end`. Timed out → score what is
    there and say so.
 3. **Which app and bundle ran** come from the Linode's check logs, never from
@@ -347,7 +371,7 @@ board's Chat view, or in tmux window `transitnav:cN` (there is no Remote
 Control session to open in the Claude app since 2026-10-09). The board only shows `feedback[]`, so after every such turn
 append the gist — one or two plain sentences each — as `{t, by: "rider",
 text}` and `{t, by: "claude", text}` to `cycles/cN.feedback[]`
-(read-modify-write, pin `if_version`). Monitor events, the kickoff and the
+(read-modify-write, pin `if_version`). Waiter output, the kickoff and the
 self-check are not the rider and are never mirrored. A direct instruction
 from the rider is their own consent, within cycle N.
 
@@ -357,6 +381,19 @@ cycle's Chat view is its terminal, with no dock, no message box and no
 buttons; Ship to prod is one central **Ship** tab for all cycles. (Classic
 still has every control and writes the same fields.) So when the rider types
 it, write exactly what the page's button would have written, then act:
+
+**Since 2026-10-12 the phase line has ONE "next phase" button** (rider: "one
+button to promote the agents to next phase. it can just inject text"). It
+types a single line into this terminal (server `POST /api/inject`, tmux
+send-keys + Enter) — nothing goes through the inbox, so there is no K to mark
+handled. The line names the press and ends with "(typed from the board's
+next-phase button — write the fields the board's press would have written,
+then act)": Triage → `START triage — then plan cycle N` (router); a draft
+plan → `approve the plan — build it`; a blocked step → `START <step> — cycle
+N, resume`; plan/build/ship-dev not yet requested → `START <step> — cycle N`;
+ship-prod → `ship to prod`. Treat it exactly as the rider typing it: set the
+step's `status: "requested"`, `requestedAt`, `requestedBy: "rider"` (and, for
+triage, `intake.status`) before running it, as below.
 
 - **"approve the plan" / "build it"** → `steps.plan.status = "done"`,
   `plan.approvedAt`, `plan.approvedBy: "rider"`, `steps.build = {status:
@@ -386,7 +423,7 @@ it, write exactly what the page's button would have written, then act:
 - **The thread is a manager (Opus since 2026-10-09 — on Fable the threads kept failing their turns on the Fable limit); every piece of
   WORK is an Opus agent** (rider, 2026-10-08: "use opus!! all agents doing
   work should. fable only for decision or manager agents"). The thread's own
-  tools are limited to: its Monitor; reading the inbox line and its text
+  tools are limited to: its waiter; reading the inbox line and its text
   file; reading and writing `cycles/cN` and the board log; `Agent` with
   `model: "opus"`; reading an agent's report and spot-checking a claim with
   one short read-only command (`git log -1`, `git diff --stat`, `ls`). It
@@ -400,14 +437,14 @@ it, write exactly what the page's button would have written, then act:
   restart and a Linode deploy happen only inside `mkdir
   ~/.claude/pipeline/ship.lock && echo "cN $(date +%s)" >
   ~/.claude/pipeline/ship.lock/owner` … `rm -rf ~/.claude/pipeline/ship.lock`.
-  If the mkdir fails, another cycle is shipping: wait (Monitor with an
+  If the mkdir fails, another cycle is shipping: wait (a background Bash
   until-loop on the directory), and treat a lock older than 2 h as stale only
   after checking that its owner's window is idle. The backlog and record files
   are shared too: re-read right before each edit, keep edits small, never
   rewrite the file wholesale.
 - A cycle thread ends itself when its cycle retires (*Closing the thread*).
-  If the rider `/exit`s it, it relaunches, re-arms from `handled` and runs
-  the self-check.
+  If the rider `/exit`s it, it relaunches, runs the self-check and starts
+  its waiter, which resumes from `handled`.
 
 ## What a button sends
 
@@ -537,7 +574,7 @@ than padding one in."*
 This narration is **in addition to**, not instead of, the thread's own
 end-of-step `summary`/`detail`/`rows[]` write (*On every invocation* above) —
 the agent's entries are the play-by-play, the thread's is still the record.
-A self-check or router action that runs no agent (a doc read, a re-arm) writes
+A self-check or router action that runs no agent (a doc read, restarting the waiter) writes
 nothing to `feedback[]`, same as before.
 
 ### The literal terminal, embedded in the board — live ttyd
@@ -580,7 +617,12 @@ entries (rider notes from the day files, reports by mtime, the newest nightly)
 with `became` unset. Keep ≤ 80 entries; drop entries older than 14 days whose
 `became` is set.
 
-### `scan` — register, never evaluate (every 15 min in the router)
+### `scan` — register, never evaluate (every 15 min, inside the router's waiter)
+
+Since 2026-10-10 this runs as `~/bin/pipeline-scan-apply.py` from
+`pipeline-wait.sh board` (logged to `~/.claude/pipeline/board/scan.log`); the
+router never runs it on a clock. Triage still runs it first, by hand, so the
+ledger is complete. What it does:
 
 `python3 ~/.claude/skills/transitnav-pipeline/scan.py --since <max inputs[].at>`,
 merge by `id` (skip ids already present), set `seenAt`, `became: null`, and a

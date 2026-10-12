@@ -177,7 +177,7 @@ assert "td.became { white-space: normal; min-width: 150px; }" in page
 
 # 13. no "Verify now" anywhere (rider, 2026-10-09 ~19:20: "automate the verification — it should be
 #     able to tell when verify can run from a user run; then get rid of the [Verify now] button"). The
-#     cycle thread's watcher fires on every trip that ends (pipeline-cycle-watch.sh); nothing to press.
+#     cycle thread's watcher fires on every trip that ends (pipeline-wait.sh); nothing to press.
 def one(old, new):
     global page
     assert page.count(old) == 1, (page.count(old), old[:80])
@@ -293,6 +293,74 @@ one('''    if (b.dataset.trisub) {''', '''    if (b.dataset.shipprod) { b.disabl
 # 16. no Remote Control since 2026-10-09 (rider): a cycle's session is reached through its terminal on
 #     the Chat view (or tmux), not the Claude app
 one('Talk to it: the <b>cycle ${esc(c.number)}</b> session in the Claude app', 'Talk to it: its terminal in the Chat view (<b>cycle ${esc(c.number)}</b> · Terminal)')
+
+# 17. one "next phase" button on the Chat view's phase line (rider, 2026-10-12: "i still liked the run
+#     triage buttons and plan etc. lets have one button to promote the agents to next phase. it can just
+#     inject text"). It types one line into the agent's own terminal (POST /api/inject -> tmux send-keys
+#     on transitnav:cN or :board) and the thread acts on it as typed instructions, writing the fields
+#     the old press wrote (skill: "The rider talking to this session directly"). Nothing goes through
+#     the inbox, so the rider sees the instruction land in the terminal. Hidden while the agent is busy.
+one('''    <div class="phase" id="phase" aria-label="Phase"></div>
+  </header>''', '''    <div class="row2"><div class="phase" id="phase" aria-label="Phase"></div><button type="button" class="nextgo" id="nextgo" hidden></button></div>
+  </header>''')
+one("  #pv-chat .chat.tty-full a.ttyl {", """  #pv-chat .row2 { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  #pv-chat .row2 .phase { flex: 1; min-width: 0; }
+  #pv-chat .nextgo { flex: none; min-height: 36px; padding: 0 14px; border-radius: 9px; background: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 14px; white-space: nowrap; }
+  #pv-chat .nextgo:disabled { background: var(--surface-2); color: var(--ink-3); cursor: default; }
+  #pv-chat .chat.tty-full a.ttyl {""")
+one("""  const triSub = () =>""", r"""  // The one "next phase" press for the view: {label, win, text} to type into that terminal, or
+  // {label, disabled, why} when the next phase can't start from here, or null (busy / nothing next).
+  function promote(v) {
+    if (v === "ship") return null;
+    const c = cyc(v);
+    if (!c) {
+      const it = (board && board.intake) || {};
+      if (busy(it.status)) return null;
+      const n = nextNumber();
+      return { win: "board", label: "Run triage", text: `START triage — then plan cycle ${n} (typed from the board's next-phase button): run the transitnav-pipeline skill for stage "triage", update pipeline/board.intake, then open cycles/c${n} with the rows triage opened or touched and run stage "plan" on it.` };
+    }
+    if (c.retiredAt || ORDER.some((k) => busy(stat(c, k)))) return null;
+    const n = c.number, win = "c" + n, via = "(typed from the board's next-phase button — write the fields the board's press would have written, then act)";
+    if (stat(c, "plan") === "draft") return { win, label: "Approve plan · build it", text: `approve the plan — build it, cycle ${n} ${via}` };
+    for (const k of ORDER) if (stat(c, k) === "blocked") return { win, label: `Resume ${LABEL[k].toLowerCase()}`, text: `START ${k} — cycle ${n}, resume ${via}: run the transitnav-pipeline skill for stage "${k}" on cycles/${c.id}.` };
+    const k = nextStep(c); if (!k) return null;
+    if (unanswered(c).length) return { label: "Answer questions first", disabled: true };
+    if (k === "verify") return { label: "Verify · needs a dev ride", disabled: true };
+    if (k === "ship-prod") { const s = shipState(c); return s.ok ? { win, label: "Ship to prod", text: `ship to prod — cycle ${n} ${via}` } : { label: "Ship to prod", disabled: true, why: s.why }; }
+    const lbl = { plan: "Plan it", build: "Build it", "ship-dev": "Ship to dev" }[k] || LABEL[k];
+    return { win, label: lbl, text: `START ${k} — cycle ${n} ${via}: run the transitnav-pipeline skill for stage "${k}" on cycles/${c.id}.` };
+  }
+  function renderNextGo(v) {
+    const b = $("nextgo"), p = promote(v);
+    ui.promote = p;
+    b.hidden = !p;
+    if (!p) return;
+    b.textContent = p.label;
+    b.disabled = !!p.disabled || canEdit === false || !!(p.win && !TERMINALS[p.win]);
+    b.title = p.why || (p.win && !TERMINALS[p.win] ? "No terminal for this agent" : p.text || "");
+  }
+  async function pressNextGo() {
+    const p = ui.promote, b = $("nextgo");
+    if (!p || p.disabled || !p.win) return;
+    b.disabled = true; b.textContent = "Sent";
+    try {
+      const r = await fetch("/api/inject", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ win: p.win, text: p.text }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "http " + r.status);
+      // show it landing: on Triage, flip to the router's terminal
+      if (p.win === "board") { try { localStorage.setItem("pipeline-triage-sub", "terminal"); } catch (_) {} }
+    } catch (err) { toast("Couldn't type into the terminal (" + (err && err.message || "error") + ")."); }
+    setTimeout(() => render(true), 4000);
+  }
+  document.getElementById("nextgo").addEventListener("click", pressNextGo);
+  const triSub = () =>""")
+one('''    if (v === "ship") { $("phase").innerHTML = `<span class="p" data-cur="true" data-s="ready">Ship to production · one press per cycle</span>`; return; }''',
+    '''    renderNextGo(v);
+    if (v === "ship") { $("phase").innerHTML = `<span class="p" data-cur="true" data-s="ready">Ship to production · one press per cycle</span>`; return; }''')
+# the phase line now shares its row with the button: keep the current phase in view on a phone
+one('''data-s="${i === ci ? w.s : ""}">${LABEL[k]}</span>`).join("");''',
+    '''data-s="${i === ci ? w.s : ""}">${LABEL[k]}</span>`).join("");
+    { const ph = $("phase"), cur = ph.querySelector('[data-cur="true"]'); if (cur) ph.scrollLeft = Math.max(0, cur.offsetLeft + cur.offsetWidth - ph.clientWidth + 8); }''')
 
 open("index.html", "w").write(page)
 print("index.html", len(page), "bytes")
