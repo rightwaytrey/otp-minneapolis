@@ -1601,6 +1601,84 @@ def one_line(text, limit=THREAD_LINE_MAX):
     return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
+# -- rows this ride can test (47.3) ------------------------------------------
+#
+# At trip start the ride thread names the backlog rows this ride could
+# exercise. It cannot read the pipeline board itself (`pipeline-db` is not in
+# its allow-list), so the daemon asks the board's own HTTP API once per trip
+# and writes the answer into the digest. A board that is down costs one line.
+BOARD_CYCLES_URL = "http://127.0.0.1:8098/api/list?path=cycles"
+BOARD_TIMEOUT_S = 2
+TESTABLE_ROWS_CAP = 12
+BACKLOG_PATH = os.path.expanduser(
+    "~/.claude/plans/please-make-a-centralized-sharded-petal.md")
+
+
+def fetch_board_cycles(url=BOARD_CYCLES_URL, timeout=BOARD_TIMEOUT_S):
+    """The board's cycle docs (`[{id, version, data}, ...]`), or None on any
+    failure. Never raises: a ride must not wait on, or break for, the board."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            docs = json.loads(resp.read().decode("utf-8")).get("docs")
+        return docs if isinstance(docs, list) else None
+    except Exception:
+        return None
+
+
+def bundle_key(version):
+    """`2026.1012.2` -> (2026, 1012, 2); None when it is not that shape."""
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)$", str(version or "").strip())
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def testable_rows(docs, device_bundle, cap=TESTABLE_ROWS_CAP):
+    """Rows a phone on `device_bundle` can exercise, newest cycle first.
+
+    A row qualifies when its status is `on-dev` or `in-prod` and its cycle's
+    `bundle.dev` is at or below the phone's bundle. A cycle with no usable dev
+    bundle (or a phone whose bundle is unknown) keeps only `in-prod` rows.
+    """
+    have = bundle_key(device_bundle)
+    cycles = []
+    for doc in docs or []:
+        data = (doc or {}).get("data") or {}
+        n = data.get("number")
+        if not isinstance(n, int):
+            m = re.match(r"^c(\d+)$", str((doc or {}).get("id") or ""))
+            n = int(m.group(1)) if m else -1
+        cycles.append((n, doc.get("id"), data))
+    out = []
+    for n, cid, data in sorted(cycles, key=lambda c: -c[0]):
+        dev = bundle_key((data.get("bundle") or {}).get("dev"))
+        dev_ok = dev is not None and have is not None and dev <= have
+        for row in data.get("rows") or []:
+            status = row.get("status")
+            if status == "in-prod" or (status == "on-dev" and dev_ok):
+                out.append({"num": row.get("num"), "title": row.get("title"),
+                            "status": status, "cycle": cid})
+                if len(out) >= cap:
+                    return out
+    return out
+
+
+def testable_rows_lines(docs, device_bundle, leg_modes, cap=TESTABLE_ROWS_CAP):
+    """The digest's `## Rows this ride can test` block, as lines."""
+    L = ["## Rows this ride can test", ""]
+    L.append("- Phone bundle: %s. Backlog (read the named rows there): %s"
+             % (device_bundle or "unknown", BACKLOG_PATH))
+    L.append("- This ride's legs: %s" % (", ".join(leg_modes) or "(unknown)"))
+    if docs is None:
+        L.append("- (board unreachable)")
+        return L
+    rows = testable_rows(docs, device_bundle, cap)
+    if not rows:
+        L.append("- (none)")
+    for r in rows:
+        L.append("- %s [%s, %s] %s" % (r["num"], r["status"], r["cycle"],
+                                       one_line(r["title"] or "", 120)))
+    return L
+
+
 def thread_kickoff_prompt(name, display, events_path, digest_path, session):
     """The ride thread's first message, handed to it on the command line.
 
@@ -1622,7 +1700,9 @@ def thread_kickoff_prompt(name, display, events_path, digest_path, session):
         "is the wrap-up). After each batch, start it again the same way with "
         "`%s %s M` where M is one past the highest #N you have seen, so "
         "nothing is replayed or skipped. Never use the Monitor tool and do not "
-        "poll the file by hand. Reply to this message with one line saying the "
+        "poll the file by hand. The digest's `## Rows this ride can test` "
+        "block lists the backlog rows this ride could exercise; your brief "
+        "says what to do with it on the trip-start milestone. Reply to this message with one line saying the "
         "waiter is running."
         % (session, display, events_path, digest_path, RIDE_WAIT, events_path,
            RIDE_WAIT, events_path))
@@ -2323,6 +2403,7 @@ class RideWatch:
         # of its own. Persisted, because a phone reports its bundle once per
         # app start and this daemon restarts more often than that.
         self.device_bundles = {}
+        self.board_fetch = fetch_board_cycles     # tests swap this (47.3)
         # device -> ms of the last boot-crash / withheld-verdict page. The
         # budget these pages are charged to, separate from any trip's.
         self.device_boot_page_ms = {}
@@ -9334,6 +9415,21 @@ class RideWatch:
     def _digest_path(self, trip):
         return os.path.join(self.watch_dir, "%s.digest.md" % trip.session)
 
+    def _testable_rows_block(self, trip):
+        """47.3: fetched once per trip (the first digest), then cached."""
+        if not hasattr(trip, "board_docs"):
+            trip.board_docs = self.board_fetch()
+        modes = []
+        for leg in (trip.itinerary or {}).get("legs") or []:
+            m = (leg.get("mode") or "?").upper()
+            if leg.get("route"):
+                m += " " + str(leg["route"])
+            modes.append(m)
+        info = self.device_bundles.get(trip.device) if trip.device else None
+        return testable_rows_lines(
+            trip.board_docs, trip.bundle or (info or {}).get("version"),
+            modes)
+
     def _write_digest(self, trip):
         """The whole ride so far, rewritten before every push.
 
@@ -9356,6 +9452,8 @@ class RideWatch:
         if trip.end_ms:
             L.append("- **Ended: %s (%s)**" % (fmt_hms(trip.end_ms),
                                                trip.end_reason))
+        L.append("")
+        L.extend(self._testable_rows_block(trip))
         L.append("")
         L.append("## Where the evidence is")
         L.append("")

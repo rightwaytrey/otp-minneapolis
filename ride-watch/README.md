@@ -658,6 +658,17 @@ ask what the digest already says. Hard prohibitions while the trip is live —
 the phone the rider is navigating by) and **never send a notification** (paging
 is the daemon's job).
 
+**Rows this ride can test (47.3).** The first digest of a trip carries a
+`## Rows this ride can test` block: the daemon asks the pipeline board
+(`http://127.0.0.1:8098/api/list?path=cycles`, 2 s timeout, once per trip) for
+rows with status `on-dev` or `in-prod`, keeps those whose cycle's `bundle.dev`
+is at or below the phone's bundle (a cycle with no dev bundle, or an unknown
+phone bundle, keeps `in-prod` only), newest cycle first, capped at 12, and
+lists them with the ride's leg modes. A dead board yields `(board unreachable)`
+and nothing else changes. On the trip-start milestone the thread adds one line
+naming the rows this itinerary can exercise and at which leg; there are no
+per-leg prompts and never a page.
+
 On the trip-end ping it writes the report to the `reportPath` the daemon put in
 the request file — `~/obsidian-vault/Claude/ride-watch/<date>-<session-short>.md`
 for the session's first ride, `…-ride2.md`, `…-ride3.md` for the ones after it.
@@ -1289,7 +1300,7 @@ states the convention outright.
 python3 ride-watch/test_ride_watch.py
 ```
 
-621 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
+743 tests, stdlib `unittest`, no installs. Synthetic streams cover every rule
 (both the firing case and the case that must stay quiet), the state machine, and
 page ranking (supersession inside the window, tie-breaking, flush on a quiet log,
 flush on trip end).
