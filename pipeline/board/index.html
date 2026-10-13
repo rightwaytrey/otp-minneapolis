@@ -1172,7 +1172,7 @@ window.PV = (function () {
       noteId: "note-intake", notePh: "Anything to look at first (optional)", ready: true,
       why: busy(s) ? "" : n ? `${n} new input${n === 1 ? "" : "s"} waiting: ${inputCounts(pend)}.` : "Nothing new since the last run.",
       dataAttrs: `data-start-intake="1"`, cancelAttrs: `data-cancel-intake="1"`,
-      extra: `<label class="opt-row"><input type="checkbox" id="intake-then-plan" ${ui.thenPlan !== false ? "checked" : ""}> Then open cycle ${nextNumber()} with what it finds and plan it <span class="muted">— Build still waits for your press</span></label>`,
+      extra: `<p class="muted">Triage stops when it is done; you approve its rows (Plan these · cycle ${nextNumber()}) before a plan starts.</p>`,
     });
     const lastRun = it.summary || it.detail ? `<details class="lastrun"><summary>What the last run said${it.lastTriageAt ? " · " + esc(when(it.lastTriageAt)) : ""}</summary>${report({ summary: it.summary, detail: it.detail, status: "done" }, "")}</details>` : "";
     return `<div class="head only-desk"><h3>Triage</h3><p class="lead">Every comment, ride report and nightly, what it became, and where that is now. Continuous, not part of any cycle.</p></div>
@@ -1450,12 +1450,12 @@ window.PV = (function () {
     const note = (drafts["note-intake"] || "").trim(); const now = Date.now(); btn.disabled = true;
     try {
       const { ref, data } = await readDoc(BOARD); const b = data || {};
-      b.intake = Object.assign({}, b.intake || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null, thenPlan: ui.thenPlan !== false });
-      appendLog(b, { t: now, stage: "triage", event: "requested", text: (note ? note + " · " : "") + (ui.thenPlan !== false ? "then plan cycle " + nextNumber() : "triage only") }); b.updatedAt = now; await ref.set(b); drafts["note-intake"] = "";
+      b.intake = Object.assign({}, b.intake || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null, thenPlan: false });
+      appendLog(b, { t: now, stage: "triage", event: "requested", text: (note ? note + " · " : "") + (false ? "then plan cycle " + nextNumber() : "triage only") }); b.updatedAt = now; await ref.set(b); drafts["note-intake"] = "";
     } catch (err) { btn.disabled = false; return toast("Couldn't write the request (" + (err && err.code || "error") + "). Nothing was queued."); }
-    const r = await wake($("main"), `START triage` + (ui.thenPlan !== false ? ` — then plan cycle ${nextNumber()}` : "") + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "triage", update pipeline/board.intake` + (ui.thenPlan !== false ? `, then open cycles/c${nextNumber()} with the rows triage opened or touched and run stage "plan" on it` : "") + `, and reply here when it is done.`);
+    const r = await wake($("main"), `START triage` + (false ? ` — then plan cycle ${nextNumber()}` : "") + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "triage", update pipeline/board.intake` + (false ? `, then open cycles/c${nextNumber()} with the rows triage opened or touched and run stage "plan" on it` : "") + `, and reply here when it is done.`);
     try { const { ref, data } = await readDoc(BOARD); if (data && data.intake) { data.intake.wake = { ok: r.ok, at: Date.now(), why: r.why || "" }; await ref.set(data); } } catch (_) {}
-    toast(r.ok ? (ui.thenPlan !== false ? "Sent to Claude. Triage is queued; a plan follows." : "Sent to Claude. Triage is queued.") : `Queued on the board, but ${r.why}.`, r.ok ? 4000 : 7000);
+    toast(r.ok ? (false ? "Sent to Claude. Triage is queued; a plan follows." : "Sent to Claude. Triage is queued.") : `Queued on the board, but ${r.why}.`, r.ok ? 4000 : 7000);
   }
   async function cancelIntake() {
     if (!db) return noDb(); const now = Date.now();
@@ -1814,7 +1814,9 @@ window.PV = (function () {
       const it = (board && board.intake) || {};
       if (busy(it.status)) return null;
       const n = nextNumber();
-      return { win: "board", label: "Run triage", text: `START triage — then plan cycle ${n} (typed from the board's next-phase button): run the transitnav-pipeline skill for stage "triage", update pipeline/board.intake, then open cycles/c${n} with the rows triage opened or touched and run stage "plan" on it.` };
+      const pc = it.planCandidates, rows = (pc && !pc.approvedAt && Array.isArray(pc.rows)) ? pc.rows : [];
+      if (rows.length) return { win: "board", label: `Plan these ${rows.length} · cycle ${n}`, text: `approve triage — plan cycle ${n} (typed from the board's next-phase button): the rider approved what the last triage collected; open cycles/c${n} with intake.planCandidates and run stage "plan" on it.` };
+      return { win: "board", label: "Run triage", text: `START triage (typed from the board's next-phase button): run the transitnav-pipeline skill for stage "triage" and update pipeline/board.intake. Do not open a cycle or plan; leave the rows for the rider to approve.` };
     }
     if (c.retiredAt || ORDER.some((k) => busy(stat(c, k)))) return null;
     const n = c.number, win = "c" + n, via = "(typed from the board's next-phase button — write the fields the board's press would have written, then act)";
@@ -2032,12 +2034,12 @@ window.PV = (function () {
     note = (note || "").trim(); const now = Date.now(); const n = nextNumber();
     try {
       const { ref, data } = await readDoc(BOARD); const b = data || {};
-      b.intake = Object.assign({}, b.intake || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null, thenPlan: true });
-      appendLog(b, { t: now, stage: "triage", event: "requested", text: (note ? note + " · " : "") + "then plan cycle " + n }); b.updatedAt = now; await ref.set(b);
+      b.intake = Object.assign({}, b.intake || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null, thenPlan: false });
+      appendLog(b, { t: now, stage: "triage", event: "requested", text: (note ? note + " · " : "") + "triage only" }); b.updatedAt = now; await ref.set(b);
     } catch (err) { render(true); toast("Couldn't write the request (" + (err && err.code || "error") + "). Nothing was queued."); return false; }
-    const r = await wake(`START triage — then plan cycle ${n}` + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "triage", update pipeline/board.intake, then open cycles/c${n} with the rows triage opened or touched and run stage "plan" on it, and reply here when it is done.`);
+    const r = await wake(`START triage` + (note ? `\n\n${note}` : "") + `\n\nRun the transitnav-pipeline skill for stage "triage" and update pipeline/board.intake. Do not open a cycle or plan; leave the rows for the rider to approve.`);
     try { const { ref, data } = await readDoc(BOARD); if (data && data.intake) { data.intake.wake = { ok: r.ok, at: Date.now(), why: r.why || "" }; await ref.set(data); } } catch (_) {}
-    toast(sentMsg(r, "Sent. Triage is queued; a plan follows."));
+    toast(sentMsg(r, "Sent. Triage is queued; you approve its rows before any plan."));
     return true;
   }
 

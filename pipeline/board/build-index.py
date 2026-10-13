@@ -362,5 +362,27 @@ one('''data-s="${i === ci ? w.s : ""}">${LABEL[k]}</span>`).join("");''',
     '''data-s="${i === ci ? w.s : ""}">${LABEL[k]}</span>`).join("");
     { const ph = $("phase"), cur = ph.querySelector('[data-cur="true"]'); if (cur) ph.scrollLeft = Math.max(0, cur.offsetLeft + cur.offsetWidth - ph.clientWidth + 8); }''')
 
+# 18. triage never chains into a plan (rider, 2026-10-13: "the last cycle started the plan without
+#     letting me approve what the triage had collected"). Triage stops and leaves its rows in
+#     board.intake.planCandidates; the next-phase button then reads "Plan these N · cycle n" and
+#     types "approve triage — plan cycle n" into the router. Every "then plan" path is cut: the
+#     next-phase button, the Chat view's triage press and the Classic checkbox (which defaulted on).
+one('''      return { win: "board", label: "Run triage", text: `START triage — then plan cycle ${n} (typed from the board's next-phase button): run the transitnav-pipeline skill for stage "triage", update pipeline/board.intake, then open cycles/c${n} with the rows triage opened or touched and run stage "plan" on it.` };''',
+    '''      const pc = it.planCandidates, rows = (pc && !pc.approvedAt && Array.isArray(pc.rows)) ? pc.rows : [];
+      if (rows.length) return { win: "board", label: `Plan these ${rows.length} · cycle ${n}`, text: `approve triage — plan cycle ${n} (typed from the board's next-phase button): the rider approved what the last triage collected; open cycles/c${n} with intake.planCandidates and run stage "plan" on it.` };
+      return { win: "board", label: "Run triage", text: `START triage (typed from the board's next-phase button): run the transitnav-pipeline skill for stage "triage" and update pipeline/board.intake. Do not open a cycle or plan; leave the rows for the rider to approve.` };''')
+one('''      b.intake = Object.assign({}, b.intake || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null, thenPlan: true });
+      appendLog(b, { t: now, stage: "triage", event: "requested", text: (note ? note + " · " : "") + "then plan cycle " + n }); b.updatedAt = now; await ref.set(b);''',
+    '''      b.intake = Object.assign({}, b.intake || {}, { status: "requested", requestedAt: now, startedAt: null, finishedAt: null, note, requestedBy: uid || null, wake: null, thenPlan: false });
+      appendLog(b, { t: now, stage: "triage", event: "requested", text: (note ? note + " · " : "") + "triage only" }); b.updatedAt = now; await ref.set(b);''')
+one('''    const r = await wake(`START triage — then plan cycle ${n}` + (note ? `\\n\\n${note}` : "") + `\\n\\nRun the transitnav-pipeline skill for stage "triage", update pipeline/board.intake, then open cycles/c${n} with the rows triage opened or touched and run stage "plan" on it, and reply here when it is done.`);''',
+    '''    const r = await wake(`START triage` + (note ? `\\n\\n${note}` : "") + `\\n\\nRun the transitnav-pipeline skill for stage "triage" and update pipeline/board.intake. Do not open a cycle or plan; leave the rows for the rider to approve.`);''')
+one('''    toast(sentMsg(r, "Sent. Triage is queued; a plan follows."));''',
+    '''    toast(sentMsg(r, "Sent. Triage is queued; you approve its rows before any plan."));''')
+one('''      extra: `<label class="opt-row"><input type="checkbox" id="intake-then-plan" ${ui.thenPlan !== false ? "checked" : ""}> Then open cycle ${nextNumber()} with what it finds and plan it <span class="muted">— Build still waits for your press</span></label>`,''',
+    '''      extra: `<p class="muted">Triage stops when it is done; you approve its rows (Plan these · cycle ${nextNumber()}) before a plan starts.</p>`,''')
+assert page.count("ui.thenPlan !== false") == 5, page.count("ui.thenPlan !== false")
+page = page.replace("ui.thenPlan !== false", "false")
+
 open("index.html", "w").write(page)
 print("index.html", len(page), "bytes")

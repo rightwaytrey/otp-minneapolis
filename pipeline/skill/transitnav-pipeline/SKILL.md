@@ -169,7 +169,7 @@ fires.
 ## Routing — the router's brief (`pipeline-worker.sh`, window `board`)
 
 The router does two things and nothing else: (a) it runs **Triage** (the 15-minute `scan` runs in
-its waiter, with no agent); (b) it **opens a new cycle** (on `then plan cycle N`). Since
+its waiter, with no agent); (b) it **opens a new cycle** (only on the rider's `approve triage — plan cycle N`). Since
 2026-10-09 it forwards nothing — the board's server routes every press that
 names a cycle straight into that cycle's inbox. It does not sweep cycles, does
 not stop or retire threads, and makes no decision about any cycle — each
@@ -180,7 +180,8 @@ then append K to `~/.claude/pipeline/board/handled`:
 
 | Press | Router does |
 |---|---|
-| `START triage` (± `then plan cycle N`) | runs **triage** itself (below). On "then plan", creates `cycles/cN` as described under *What a button sends*, then routes `START plan — cycle N` (text: the rows triage opened) with `~/bin/pipeline-route.sh N --thread - --key plan:<requestedAt>` (text on stdin). The triage summary says the plan is with cycle N's thread; the thread writes the draft. |
+| `START triage` | runs **triage** itself (below) and STOPS: it never opens a cycle or starts a plan, even if the text still says "then plan cycle N" (an old page or a hand-typed press). It leaves the qualifying rows in `intake.planCandidates` for the rider to approve. |
+| `approve triage — plan cycle N` | the rider approved what triage collected. Creates `cycles/cN` from `intake.planCandidates` (minus any rows the rider dropped in the same message) as described under *What a button sends*, sets `planCandidates.approvedAt` and `.cycle`, then routes `START plan — cycle N` (text: those rows) with `~/bin/pipeline-route.sh N --thread - --key plan:<requestedAt>` (text on stdin). The thread writes the draft. |
 | anything else (a press that named no cycle) | if it does name a cycle after all, route it verbatim with `pipeline-route.sh N --thread - --key <its key>`; otherwise answer it in one board `log` line. |
 
 `pipeline-route.sh` starts the cycle's thread if its window is not there
@@ -459,7 +460,8 @@ types a single line into this terminal (server `POST /api/inject`, tmux
 send-keys + Enter) — nothing goes through the inbox, so there is no K to mark
 handled. The line names the press and ends with "(typed from the board's
 next-phase button — write the fields the board's press would have written,
-then act)": Triage → `START triage — then plan cycle N` (router); a draft
+then act)": Triage → `START triage` (router), or, once triage has left rows
+waiting, `approve triage — plan cycle N` (router); a draft
 plan → `approve the plan — build it`; a blocked step → `START <step> — cycle
 N, resume`; plan/build/ship-dev not yet requested → `START <step> — cycle N`;
 ship-prod → `ship to prod`. Treat it exactly as the rider typing it: set the
@@ -523,10 +525,18 @@ The page writes the request into the db first, then sends a press, which
 the server writes into the owning inbox (*The board's store and presses*).
 One action per press:
 
-- `START triage` — intake. `START triage — then plan cycle N` means the rider
-  ticked "then open cycle N with what it finds and plan it": finish triage as
-  below, then, ONLY if triage opened or touched at least one row that is not
-  already in a live cycle, create `cycles/cN` yourself in the page's shape
+- `START triage` — intake, and nothing else. **Triage never chains into a
+  plan** (rider, 2026-10-13: "the last cycle started the plan without letting
+  me approve what the triage had collected" — cycle 20 opened at 09:33 off a
+  09:13 triage with no press in between). A "— then plan cycle N" suffix from
+  an old page or a hand-typed press is ignored. Finish triage as below; if it
+  opened or touched at least one row that is not already in a live cycle,
+  write `intake.planCandidates = {rows: [{n, why}], at, cycle: N}` (N = next
+  cycle number; `why` in plain words, and say which are new rows vs mere
+  sightings) and end the summary with "Waiting for you: press Plan these ·
+  cycle N, or tell me which to drop." Otherwise clear it (`null`).
+- `approve triage — plan cycle N` — the rider's approval of
+  `intake.planCandidates`. Drop any rows the rider named, create `cycles/cN` yourself in the page's shape
   (`{id, number, createdAt, title, rows: [], questions: [], branches: [],
   bundle: {}, steps: {plan: {status: "running", requestedAt, startedAt,
   requestedBy: "triage"}}}`, N = highest existing number + 1 — re-read the
@@ -535,8 +545,9 @@ One action per press:
   Rows already `on-dev`, `built` or planned in a live cycle stay there; a new
   sighting on such a row is a note on it, not a second plan. If nothing
   qualifies, open no cycle and say so in the triage reply. The thread gets ONE
-  reply covering both (triage counts, then the plan's row list), and Build
-  still waits for the rider's press.
+  reply naming the cycle and its rows, and Build still waits for the
+  rider's press. Set `intake.planCandidates.approvedAt` and `.cycle` so the
+  board's button goes back to "Run triage".
 - `START plan — cycle N` — the page has already created `cycles/cN` with
   `steps.plan.status = requested`. **Plan is iterative (since 2026-09-22
   evening, the rider: "it absolutely has to be an iterative process with
@@ -761,7 +772,7 @@ Finish: `intake.triagedThroughMs`, `intake.lastTriageAt`, `intake.inputs`
 show, else ""), `facts.openRows`. The `summary` is the paragraph behind the
 card's "What the last run said"; the ledger is what the rider reads.
 
-If the request said "then plan cycle N", continue into the plan step as described under *What a button sends*; the plan's rows are the ledger entries whose `became.rows` this run set, minus rows in a live cycle.
+Never continue into the plan step from here. Write `intake.planCandidates` (the ledger entries whose `became.rows` this run set, minus rows in a live cycle) and stop; the plan starts only on the rider's `approve triage — plan cycle N` (*What a button sends*).
 
 ## `plan` — choose a cycle's rows and write the close-out
 
