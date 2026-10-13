@@ -31,6 +31,8 @@ default (it has no -W); `-i lo` is required or ttyd takes the tailscale
 interface's port away from tailscale serve's TLS listener. `-I ttyd-index.html` is ttyd's own
 client page (ttyd-index.orig.html, as served) plus a script that turns touch drags into wheel
 events, so a phone can scroll the pane (xterm.js never reports touch drags to tmux).
+Since 2026-10-13 it also reconnects by itself (a reload once the page is visible and the server
+answers) instead of parking on "Press ⏎ to Reconnect" after a phone suspends it.
 """
 import http.server
 import json
