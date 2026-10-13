@@ -127,6 +127,16 @@ ever does appear, the daemon pages the rider once; that is the only help coming.
   the push for notes it recorded from here), so record it and then answer
   normally in the same reply. Do NOT record a note that arrived as a
   `[ride-watch]` digest push: that one is already in the stream.
+- **Trip-start milestone → name the rows this ride can test, once.** The digest
+  has a `## Rows this ride can test` block (the daemon fetched it from the
+  pipeline board: rows on the phone's bundle that still need a ride) and this
+  ride's leg modes. Read it, and the rows it names in the backlog
+  (`~/.claude/plans/please-make-a-centralized-sharded-petal.md`, absolute path;
+  the block repeats it), then add ONE line to your routine reply naming the
+  rows this itinerary can exercise and at which leg ("44.3 turn arrows: bike
+  leg"). If none fit the legs, or the block says `(board unreachable)` or
+  `(none)`, say so in a few words. That is the only time you raise it: no
+  prompts at leg transitions, nothing later in the ride, and never a Pushover.
 - **Stay quiet otherwise.** Milestones only. Do not narrate the ride.
 
 ## Hard prohibitions while the trip is live

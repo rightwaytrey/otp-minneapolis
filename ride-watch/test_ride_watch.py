@@ -63,6 +63,7 @@ def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
                       thread_enabled=thread_enabled, report_dir=reports,
                       kill_thread=kill_thread)
     watch.stream_path = os.path.join(watch_dir, "stream.jsonl")
+    watch.board_fetch = lambda: None      # never touch the live board (47.3)
     watch.plan_paths = [os.path.join(watch_dir, "backlog.md"),
                         os.path.join(watch_dir, "record.md")]
     return watch
@@ -10938,6 +10939,86 @@ class TestMultiStopPause(RuleTestCase):
         trip = watch.trips[SESSION]
         self.assertTrue(trip.round_trip)
         self.assertIsNone(trip.stop_pause)
+
+
+def _board_cycles():
+    def row(num, status, title="t"):
+        return {"num": num, "status": status, "title": title}
+    return [
+        {"id": "c1", "data": {"number": 1, "bundle": {"dev": "2026.0921.1"},
+                              "rows": [row("1.1", "in-prod"),
+                                       row("1.2", "closed"),
+                                       row("1.3", "measured"),
+                                       row("1.4", "fail")]}},
+        {"id": "c19", "data": {"number": 19, "bundle": {"dev": "2026.1012.2"},
+                               "rows": [row("19.1", "on-dev"),
+                                        row("19.2", "in-prod")]}},
+        {"id": "c20", "data": {"number": 20,
+                               "rows": [row("20.1", "on-dev"),
+                                        row("20.2", "in-prod")]}},
+    ]
+
+
+class TestRowsThisRideCanTest(RuleTestCase):
+    """47.3: the digest lists the board rows a ride can exercise."""
+
+    def nums(self, bundle, docs=None):
+        return [r["num"] for r in ride_watch.testable_rows(
+            docs or _board_cycles(), bundle)]
+
+    def test_listed_when_phone_bundle_is_at_or_above_the_cycles(self):
+        self.assertEqual(self.nums("2026.1012.2"),
+                         ["20.2", "19.1", "19.2", "1.1"])
+        self.assertIn("19.1", self.nums("2026.1013.1"))
+
+    def test_dropped_when_phone_bundle_is_older(self):
+        self.assertEqual(self.nums("2026.1012.1"), ["20.2", "19.2", "1.1"])
+        self.assertEqual(self.nums(None), ["20.2", "19.2", "1.1"])
+
+    def test_closed_measured_fail_are_excluded(self):
+        for n in ("1.2", "1.3", "1.4"):
+            self.assertNotIn(n, self.nums("2026.1012.2"))
+
+    def test_cap_of_twelve_holds_newest_cycle_first(self):
+        rows = [{"num": "5.%d" % i, "status": "in-prod", "title": "x"}
+                for i in range(30)]
+        docs = _board_cycles() + [{"id": "c5", "data": {"number": 5,
+                                                         "rows": rows}}]
+        got = ride_watch.testable_rows(docs, "2026.1012.2")
+        self.assertEqual(len(got), 12)
+        self.assertEqual(got[0]["cycle"], "c20")
+
+    def test_board_unreachable_is_one_line_and_never_raises(self):
+        self.assertIsNone(ride_watch.fetch_board_cycles(
+            url="http://127.0.0.1:1/api/list?path=cycles", timeout=0.5))
+        lines = ride_watch.testable_rows_lines(None, "2026.1012.2", ["WALK"])
+        self.assertEqual([l for l in lines if "unreachable" in l],
+                         ["- (board unreachable)"])
+
+    def test_digest_has_the_block_and_fetches_once_per_trip(self):
+        watch = quiet_watch(self.tmp)
+        calls = []
+        watch.board_fetch = lambda: calls.append(1) or _board_cycles()
+        trip = ride_watch.Trip("s1", T0, {"legs": [
+            {"mode": "BICYCLE"}, {"mode": "BUS", "route": "5"}]})
+        trip.bundle = "2026.1012.2"
+        text = read_text(watch._write_digest(trip))
+        watch._write_digest(trip)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("## Rows this ride can test", text)
+        self.assertIn("BICYCLE, BUS 5", text)
+        self.assertIn("- 19.1 [on-dev, c19]", text)
+        self.assertIn("please-make-a-centralized-sharded-petal.md", text)
+
+    def test_digest_survives_a_dead_board(self):
+        watch = quiet_watch(self.tmp)
+        trip = ride_watch.Trip("s2", T0, None)
+        self.assertIn("(board unreachable)",
+                      read_text(watch._write_digest(trip)))
+
+    def test_kickoff_prompt_names_the_block(self):
+        p = ride_watch.thread_kickoff_prompt("r", "d", "/x/e", "/x/d.md", "s")
+        self.assertIn("## Rows this ride can test", p)
 
 
 if __name__ == "__main__":
