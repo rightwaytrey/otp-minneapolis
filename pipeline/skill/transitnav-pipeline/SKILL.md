@@ -395,6 +395,26 @@ Next         build finishes → ship-dev runs by itself
 - Retired cycle: `── Cycle N · retired ──` and only `Shipping` (prod bundle
   + rows) and `Waiting`.
 
+**Plain words, everywhere the rider reads** (rider, 2026-10-13: "make sure
+all outputs at the end are in plain words, just like cycle 19"). This covers
+the whole end-of-turn reply, not only the block, and every `summary`,
+`feedback[]` line and question too. Write what happened and what it means
+for the rider, the way cycle 19 did ("a leftover file blocks it → type
+'move it'"; "I've got Q1 = C — keep today's 'Off route' push, at medium
+priority"):
+- **No internals:** no shas, branch names, file paths, db field names
+  (`steps.ship-dev`, `keep: false`, `decision`), status codes (`blocked`,
+  `requested`), exit codes, tool or script names, test-file names. Say
+  "the build", "the dev app", "a leftover test file", "the tests passed
+  (42 of 42)".
+- **Real numbers are fine**: counts, minutes, metres, bundle numbers.
+- **Name the effect, not the mechanism:** "the bus banner shows the right
+  stop now", not "`nearestPoint` re-anchored after the itinerary swap".
+- **Echo the rider's answer back in words** ("Q2 = C: one list at trip
+  start, no prompts after"), never only the letter.
+- **Short sentences, no jargon.** If a technical detail matters, it goes to
+  the backlog row, not the reply.
+
 The router's turns end with the same idea for Triage:
 
 ```

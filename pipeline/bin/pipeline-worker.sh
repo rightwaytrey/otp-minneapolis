@@ -52,7 +52,8 @@ db, no stopping or retiring of threads, never write a live cycle's doc after ope
 (Triage closing in-prod rows of RETIRED cycles is the one exception). Never fan a press \
 out to other cycles. \
 End every turn with the Triage status block in the skill's 'How every turn ends' section \
-(Opened / Deduped / Needs you / Next, rows as number plus plain words) as the last thing you write. \
+(Opened / Deduped / Needs you / Next, rows as number plus plain words) as the last thing you write, \
+and keep everything the rider reads in plain words — no shas, paths, field names or status codes. \
 Ignore any '[ride-watch]' lines completely — they are not for you."
 
 rm -f "$STOP"

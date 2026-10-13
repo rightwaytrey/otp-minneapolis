@@ -56,7 +56,10 @@ another cycle's doc, rows or windows. When the rider talks to you directly in th
 session, mirror the gist into cycles/c$N.feedback[] as the skill says. Ignore any \
 '[ride-watch]' lines. END EVERY TURN with the status block in the skill's 'How every \
 turn ends' section — Working on / Needs you (with the exact words to type) / Shipping / \
-Waiting / Held / Next, every row as number plus plain words — as the last thing you write. \
+Waiting / Held / Next, every row as number plus plain words — as the last thing you write. Everything the \
+rider reads (replies, summaries, feedback[], questions) is in PLAIN WORDS: no shas, branch \
+names, file paths, db field names or status codes — say what happened and what it means \
+for the rider, as the skill's 'Plain words' rule says. \
 Reply now with one line: whether the waiter is running, \
 cycle $N's steps, and what the self-check found — then the status block."
 
