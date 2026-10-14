@@ -429,7 +429,11 @@ Next         next scan in ≤ 15 min
 ### Closing the thread
 
 After ship-prod finishes (or a self-check finds `retiredAt`): write the
-final summary and `feedback[]` line as usual, then `touch ~/.claude/pipeline/cN/retired
+final summary and `feedback[]` line as usual; remove the worktrees of this
+cycle's remaining branches — measure-only (`shippable: false`) and held —
+under ship-dev step 5's rules, **keeping the branches themselves** (the
+backlog cites a measure branch's sha; a held one may ship in a later cycle);
+then `touch ~/.claude/pipeline/cN/retired
 ~/.claude/pipeline/cN/stop` and `tmux kill-window -t transitnav:cN` — that
 ends this session and its window; the stop file keeps the wrapper from
 relaunching, and `retired` keeps `pipeline-route.sh` from starting it again.
@@ -907,6 +911,16 @@ the start — decisions made during Build count, the comment's lists do not.
    rows stay open, `status: on-dev`; add rehearsal moves to the backlog's
    table if the cycle added any. `facts.devBundle`, `facts.otprrMain`,
    `facts.daemon`. No hold (zero users on dev).
+5. **Clean up what shipped** (rider, 2026-10-13: "we need to modify our
+   pipeline if there is no process for merging in branches" — merging always
+   worked; nothing ever removed a merged branch's worktree, and 171 piled
+   up across otprr and otp-minneapolis, ~33 GB). For each branch merged in
+   steps 1 and 3: `git worktree remove` its worktree, then `git branch -d`
+   the branch (never `-D`: `-d` refuses anything unmerged). `--force` only
+   when the sole untracked files are replay fixtures identical to the main
+   checkout's copies (`cmp`); any other change keeps the worktree and goes in
+   the summary. Held branches keep their worktree and branch. Only this
+   cycle's branches; remote branches are left alone.
 
 ## `verify` — score one ride, this cycle only
 
