@@ -364,19 +364,47 @@ a RIDE or CHECK line, a MESSAGE, or the rider typing. It is the last thing
 in the reply; nothing comes after it. Fill it from `cycles/cN` as it stands
 after your writes, not from memory.
 
+**Written for a phone.** The rider reads this terminal on a phone, about
+**50 columns wide** (rider, 2026-10-13: "formatting still really bad on
+agents… make it readable on phone"). Never pad text into columns: at that
+width a value wraps back under its label and the block turns to soup. Each
+label is a bold line of its own, and every item is a `-` bullet beneath it.
+The terminal wraps a bullet with a hanging indent, so long items stay
+readable. Each answer choice is a nested bullet of its own:
+
 ```
-── Cycle N · <current step + status, e.g. "build running"> ──
-Working on   18.3 aboard match · 18.5 ETA freeze          (build: 2 agents)
-Needs you    Q2 (18.4) keep the 3-min auto-end? → type "Q2: yes" / "Q2: no"
-             plan rev 2 ready → type "approve the plan"
-Shipping     dev 2026.1012.1 — 18.1 stop-tap fix · 18.2 board banner
-Waiting      18.1 · 18.2 on dev, need a ride to verify
-Held         18.6 (you held it) — type "ship <branch>" to release
-Next         build finishes → ship-dev runs by itself
+── Cycle N · build running ──
+
+**Working on**
+- 18.3 aboard match
+- 18.5 ETA freeze (2 agents building)
+
+**Needs you**
+- Q2 (18.4) keep the 3-min auto-end?
+  - A: keep it
+  - B: drop it
+  - type "Q2: A" or "Q2: B"
+- plan rev 2 is ready → type "approve the plan"
+
+**Shipping** dev 2026.1012.1
+- 18.1 stop-tap fix
+- 18.2 board banner
+
+**Waiting** — nothing
+
+**Held**
+- 18.6 (you held it) → type "ship 18.6" to release
+
+**Next** build finishes, then dev ships by itself
 ```
 
-- **All seven lines, every time**, in this order. A line with nothing in it
-  says `—`; never drop it, so the rider always reads the same shape.
+- **All seven labels, every time**, in this order, so the rider always reads
+  the same shape. A label with nothing under it is one line,
+  `**Held** — nothing`. Never drop it. Leave a **blank line between labels**,
+  or the terminal joins neighbouring lines into one paragraph.
+- **Keep the header short** (`── Cycle N · <step + status> ──`) so it fits on one
+  line. Keep each bullet to one idea. Put the options on their own nested
+  bullets, never `A / B / C` strung along one line.
 - **Every row by number AND a few plain words** (`18.3 aboard match`), never a
   number alone, a branch name alone, or a sha.
 - **Working on** = rows an agent is on *right now* (the step running).
@@ -386,15 +414,15 @@ Next         build finishes → ship-dev runs by itself
   `keep: false`.
 - **Needs you** is the only line with work for the rider: each entry names
   what is waiting (question, plan revision, ship-to-prod) and the **exact
-  words to type** here. If nothing needs the rider, it says `— nothing, I'll
-  carry on` — that sentence is the point of the line.
+  words to type** here. If nothing needs the rider, it says
+  `**Needs you** — nothing, I'll carry on`. That sentence is the point of the line.
 - **Next** = what happens without the rider (auto-advance), or `waits for
   you` when it doesn't.
 - Rows that failed verify go on **Needs you** with the failure in plain words
   only if the rider must decide; otherwise under **Working on** if an agent is
   fixing them.
-- Retired cycle: `── Cycle N · retired ──` and only `Shipping` (prod bundle
-  + rows) and `Waiting`.
+- Retired cycle: `── Cycle N · retired ──` and only **Shipping** (prod bundle
+  + rows) and **Waiting**.
 
 **Plain words, everywhere the rider reads** (rider, 2026-10-13: "make sure
 all outputs at the end are in plain words, just like cycle 19"). This covers
@@ -415,16 +443,30 @@ priority"):
   start, no prompts after"), never only the letter.
 - **Short sentences, no jargon.** If a technical detail matters, it goes to
   the backlog row, not the reply.
+- **Phone width (about 50 columns) for the whole reply**: short paragraphs and
+  `-` bullets. No tables, no space-padded columns, no rule lines wider than
+  the header, no line art. Put a list of choices on separate bullets.
 
 The router's turns end with the same idea for Triage:
 
 ```
-── Triage · <done / running> ──
-Opened       21.4 kerb snap · 21.5 late push
-Deduped      18.3 (now 3rd sighting)
-Needs you    — nothing  /  plan these as cycle N? → press the next-phase button
-Next         next scan in ≤ 15 min
+── Triage · done ──
+
+**Opened**
+- 21.4 kerb snap
+- 21.5 late push
+
+**Deduped**
+- 18.3 (now 3rd sighting)
+
+**Needs you**
+- approve these rows → press the next-phase button
+
+**Next** next scan in 15 min or less
 ```
+
+Same phone rules: a bold label on its own line, `-` bullets under it,
+`**Deduped** — nothing` when empty.
 
 ### Closing the thread
 
