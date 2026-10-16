@@ -181,7 +181,7 @@ then append K to `~/.claude/pipeline/board/handled`:
 | Press | Router does |
 |---|---|
 | `START triage` | runs **triage** itself (below) and STOPS: it never opens a cycle or starts a plan, even if the text still says "then plan cycle N" (an old page or a hand-typed press). It leaves the qualifying rows in `intake.planCandidates` for the rider to approve. |
-| `approve triage — plan cycle N` | the rider approved what triage collected. Creates `cycles/cN` from `intake.planCandidates` (minus any rows the rider dropped in the same message) as described under *What a button sends*, sets `planCandidates.approvedAt` and `.cycle`, then routes `START plan — cycle N` (text: those rows) with `~/bin/pipeline-route.sh N --thread - --key plan:<requestedAt>` (text on stdin). The thread writes the draft. |
+| `approve triage — plan cycle N` | the rider approved what triage collected. Creates `cycles/cN` from `intake.planCandidates` — only the rows the rider approved (`keep: true`, set row by row on the board's Approve card; the press text names them), minus any the rider dropped in the same message as described under *What a button sends*, sets `planCandidates.approvedAt` and `.cycle`, then routes `START plan — cycle N` (text: those rows) with `~/bin/pipeline-route.sh N --thread - --key plan:<requestedAt>` (text on stdin). The thread writes the draft. |
 | anything else (a press that named no cycle) | if it does name a cycle after all, route it verbatim with `pipeline-route.sh N --thread - --key <its key>`; otherwise answer it in one board `log` line. |
 
 `pipeline-route.sh` starts the cycle's thread if its window is not there
@@ -579,10 +579,17 @@ One action per press:
   opened or touched at least one row that is not already in a live cycle,
   write `intake.planCandidates = {rows: [{n, why}], at, cycle: N}` (N = next
   cycle number; `why` in plain words, and say which are new rows vs mere
-  sightings) and end the summary with "Waiting for you: press Plan these ·
-  cycle N, or tell me which to drop." Otherwise clear it (`null`).
+  sightings) — a fresh object, with **no `approvedAt`** (a leftover one older
+  than `at` is ignored by the board, but don't carry it); keep a row's `keep`
+  when the same row is still a candidate from the last unapproved list. End
+  the summary with "Waiting for you: approve or drop each row on the board's
+  Triage Inbox, then press Plan." Otherwise clear it (`null`).
 - `approve triage — plan cycle N` — the rider's approval of
-  `intake.planCandidates`. Drop any rows the rider named, create `cycles/cN` yourself in the page's shape
+  `intake.planCandidates`. Since 2026-10-16 the rider approves row by row
+  (`rows[i].keep`: `true` approved, `false` dropped, absent undecided); plan
+  ONLY the approved rows — the press text lists them; if it doesn't (a
+  hand-typed press), treat every row as approved unless the rider named
+  drops. Drop any rows the rider named, create `cycles/cN` yourself in the page's shape
   (`{id, number, createdAt, title, rows: [], questions: [], branches: [],
   bundle: {}, steps: {plan: {status: "running", requestedAt, startedAt,
   requestedBy: "triage"}}}`, N = highest existing number + 1 — re-read the

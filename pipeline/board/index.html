@@ -390,6 +390,26 @@
   :is(#pv-classic, #pv-chat .tri) .ledger .cyc { font: 12px var(--mono); color: var(--ink-3); }
   :is(#pv-classic, #pv-chat .tri) .ledger tr[data-new="true"] td { background: var(--requested-soft); }
   :is(#pv-classic, #pv-chat .tri) .ledger tr[data-new="true"] td:first-child { box-shadow: inset 3px 0 0 var(--requested); }
+  :is(#pv-classic, #pv-chat .tri) .appr { border: 1px solid var(--line-2); border-left: 3px solid var(--requested); border-radius: 10px; padding: 12px 14px; margin: 0 0 16px; background: var(--surface); }
+  :is(#pv-classic, #pv-chat .tri) .appr-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  :is(#pv-classic, #pv-chat .tri) .appr h4 { margin: 0; font-size: 15px; }
+  :is(#pv-classic, #pv-chat .tri) .appr .sub { margin: 4px 0 6px; font-size: 13px; color: var(--ink-3); }
+  :is(#pv-classic, #pv-chat .tri) .appr ul { list-style: none; margin: 0; padding: 0; }
+  :is(#pv-classic, #pv-chat .tri) .appr li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); }
+  :is(#pv-classic, #pv-chat .tri) .appr li .w { font-size: 14px; overflow-wrap: anywhere; }
+  :is(#pv-classic, #pv-chat .tri) .appr li .n { font: 600 13px var(--mono); color: var(--accent); margin-right: 6px; }
+  :is(#pv-classic, #pv-chat .tri) .appr li[data-k="0"] .w { color: var(--ink-3); text-decoration: line-through; }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk { display: inline-flex; border: 1px solid var(--line-2); border-radius: 8px; overflow: hidden; }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk button { min-height: 40px; padding: 0 12px; font-size: 13px; color: var(--ink-2); border-radius: 0; }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk button + button { border-left: 1px solid var(--line-2); }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk button[aria-pressed="true"][data-pckeep="1"] { background: var(--done); color: #fff; }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk button[aria-pressed="true"][data-pckeep="0"] { background: var(--ink-3); color: #fff; }
+  :is(#pv-classic, #pv-chat .tri) .appr .sent { flex: 1 1 200px; font-size: 14px; color: var(--ink-2); }
+  :is(#pv-classic, #pv-chat .tri) .appr .allbtn { min-height: 40px; padding: 0 12px; border: 1px solid var(--line-2); border-radius: 8px; font-size: 13px; color: var(--ink-2); }
+  :is(#pv-classic, #pv-chat .tri) .appr .plango { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 10px; border-top: 1px solid var(--line); }
+  :is(#pv-classic, #pv-chat .tri) .appr .plango button.go { min-height: 44px; padding: 0 18px; border-radius: 10px; background: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 15px; }
+  :is(#pv-classic, #pv-chat .tri) .appr .plango button.go:disabled { background: var(--surface-2); color: var(--ink-3); cursor: default; }
+  @media (max-width: 520px) { :is(#pv-classic, #pv-chat .tri) .appr li { grid-template-columns: minmax(0, 1fr); } :is(#pv-classic, #pv-chat .tri) .appr li .pk { justify-self: end; } }
   :is(#pv-classic, #pv-chat .tri) .ledger tr.day td { padding: 12px 0 4px; border-bottom: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--ink-3); background: none !important; box-shadow: none !important; }
   :is(#pv-classic, #pv-chat .tri) .kind { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 6px; font: 500 10.5px var(--mono); flex: none; }
   :is(#pv-classic, #pv-chat .tri) .kind[data-k="comment"] { background: var(--accent-soft); color: var(--accent); }
@@ -730,7 +750,7 @@ window.PV = (function () {
     apply(); window.scrollTo(0, 0);
     if (views[v]) views[v]();
   }
-  document.addEventListener("click", (e) => { const b = e.target.closest("[data-pv]"); if (b) show(b.dataset.pv); });
+  document.addEventListener("click", (e) => { const b = e.target.closest("button[data-pv]"); if (b && b.dataset.pv !== active) show(b.dataset.pv); });
     apply();
   return {
     shown: (v) => v === active,
@@ -1146,7 +1166,7 @@ window.PV = (function () {
     const all = inputs(); const pend = pendingInputs();
     const f = ui.tfilter || "all";
     const F = [["all", "All", all.length, ""], ["new", "Not looked at", pend.length, "you"], ["comment", "Comments", all.filter((e) => e.kind === "comment").length, ""], ["report", "Reports", all.filter((e) => e.kind === "report").length, ""], ["nightly", "Nightly", all.filter((e) => e.kind === "nightly").length, ""]];
-    const chips = `<div class="filters tchips">${F.map(([k, l, n, t]) => `<button class="chip" aria-pressed="${f === k}" data-tfilter="${k}" ${t ? `data-t="${t}"` : ""}>${l}<span class="n">${n}</span></button>`).join("")}</div>`;
+    const chips = approvalCard() + `<div class="filters tchips">${F.map(([k, l, n, t]) => `<button class="chip" aria-pressed="${f === k}" data-tfilter="${k}" ${t ? `data-t="${t}"` : ""}>${l}<span class="n">${n}</span></button>`).join("")}</div>`;
     const shown = all.filter((e) => f === "all" ? true : f === "new" ? !e.became : e.kind === f).slice(0, 80);
     if (!all.length) return chips + `<p class="empty">No inputs registered yet. The next scan or Triage run lists every comment, ride report and nightly here.</p>`;
     if (!shown.length) return chips + `<p class="empty">${f === "new" ? "Everything has been looked at." : "Nothing of that kind."}</p>`;
@@ -1159,7 +1179,60 @@ window.PV = (function () {
     return chips + `<div class="tbl ledger"><table><thead><tr><th>When</th><th>Input</th><th>Became</th><th>Where now</th></tr></thead><tbody>${body.join("")}</tbody></table></div>`;
   }
 
-  window.PV_TRIAGE = { html: () => ledger(), setFilter: (k) => { ui.tfilter = k; saveUi(); }, openItem: (key) => { ui.sec = "flow"; ui.item = key; saveUi(); } };
+  // Rows the last triage collected for the next plan, each approved or dropped by the rider. Pending
+  // while no approval postdates the triage that wrote them.
+  function candidates() {
+    const pc = board && board.intake && board.intake.planCandidates;
+    if (!pc || !Array.isArray(pc.rows) || !pc.rows.length) return null;
+    if (pc.approvedAt && !(pc.at > pc.approvedAt)) return null;
+    return pc;
+  }
+  function planText() {
+    const pc = candidates(); if (!pc) return "";
+    const n = nextNumber(), ok = pc.rows.filter((r) => r.keep === true).map((r) => r.n), rest = pc.rows.filter((r) => r.keep !== true).map((r) => r.n);
+    return `approve triage — plan cycle ${n} (typed from the board's Approve card): the rider approved ${ok.join(", ")}${rest.length ? `; not approved: ${rest.join(", ")} (they stay in the backlog)` : ""}. Open cycles/c${n} with only the approved rows of intake.planCandidates and run stage "plan" on it.`;
+  }
+  function approvalCard() {
+    const pc = candidates(); if (!pc) return "";
+    const rows = pc.rows, ok = rows.filter((r) => r.keep === true).length, no = rows.filter((r) => r.keep === false).length, open = rows.length - ok - no;
+    const sent = pc.sentAt && pc.sentAt > (pc.at || 0) ? pc.sentAt : 0;
+    const dis = canEdit === false || sent ? "disabled" : "";
+    const li = rows.map((r) => `<li data-k="${r.keep === true ? 1 : r.keep === false ? 0 : ""}"><span class="w"><span class="n">${esc(r.n)}</span>${esc(r.why || "")}</span><span class="pk" role="group" aria-label="Approve ${esc(r.n)}"><button type="button" data-pckeep="1" data-pcrow="${esc(r.n)}" aria-pressed="${r.keep === true}" ${dis}>Approve</button><button type="button" data-pckeep="0" data-pcrow="${esc(r.n)}" aria-pressed="${r.keep === false}" ${dis}>Drop</button></span></li>`).join("");
+    const n = nextNumber();
+    return `<section class="appr"><div class="appr-head"><h4>Approve for cycle ${n}</h4>${open ? `<button type="button" class="allbtn" data-pcall="1" ${dis}>Approve ${ok + no ? "the other" : "all"} ${open}</button>` : ""}</div>
+      <p class="sub">${ok} approved · ${no} dropped · ${open} undecided. The plan takes only approved rows; the rest stay in the backlog.</p><ul>${li}</ul>
+      <div class="plango">${sent ? `<span class="sent">Sent ${esc(clock(sent))} · waiting for cycle ${n} to open</span>${Date.now() - sent > 180000 ? `<button type="button" class="allbtn" data-pcplan="1" ${canEdit === false ? "disabled" : ""}>Send again</button>` : ""}` : `<button type="button" class="go" data-pcplan="1" ${ok && canEdit !== false ? "" : "disabled"}>Plan ${ok} approved · cycle ${n}</button>`}</div></section>`;
+  }
+  // keep: true / false for one row; n === "*" approves every undecided row. Resolves to an error message or "".
+  async function setCandidate(n, keep) {
+    if (!db) return "No board connection.";
+    try {
+      const { ref, data } = await readDoc(BOARD); const b = data || {}; const pc = b.intake && b.intake.planCandidates;
+      if (!pc || !Array.isArray(pc.rows)) return "Those rows are gone; triage has moved on.";
+      pc.rows = pc.rows.map((r) => n === "*" ? (r.keep === true || r.keep === false ? r : Object.assign({}, r, { keep: true })) : r.n === n ? Object.assign({}, r, { keep }) : r);
+      b.updatedAt = Date.now(); await ref.set(b); return "";
+    } catch (err) { return "Couldn't save that (" + (err && err.code || "error") + ")."; }
+  }
+  async function planApproved() {
+    const text = planText(); if (!text) return "Nothing to plan.";
+    const mark = async (v) => { const { ref, data } = await readDoc(BOARD); const b = data || {}; const pc = b.intake && b.intake.planCandidates; if (!pc) return; pc.sentAt = v; b.updatedAt = Date.now(); await ref.set(b); };
+    try { await mark(Date.now()); } catch (_) {}
+    try {
+      const r = await fetch("/api/inject", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ win: "board", text }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "http " + r.status);
+      try { localStorage.setItem("pipeline-triage-sub", "terminal"); } catch (_) {}
+      return "";
+    } catch (err) { try { await mark(null); } catch (_) {} return "Couldn't type into the terminal (" + (err && err.message || "error") + ")."; }
+  }
+  // one handler for both views' Inbox buttons; true when the click was one of these
+  function candidateClick(t, say) {
+    if (t.dataset.pcrow) { t.disabled = true; setCandidate(t.dataset.pcrow, t.dataset.pckeep === "1").then((m) => { t.disabled = false; if (m) say(m); }); return true; }
+    if (t.dataset.pcall) { t.disabled = true; setCandidate("*").then((m) => { t.disabled = false; if (m) say(m); }); return true; }
+    if (t.dataset.pcplan) { t.disabled = true; t.textContent = "Sent"; planApproved().then((m) => { if (m) { t.disabled = false; say(m); } else say("Sent to the board terminal. The plan starts with the approved rows."); }); return true; }
+    return false;
+  }
+  window.PV_TRIAGE = { html: () => ledger(), candidates, planText, candidateClick, planApproved, setFilter: (k) => { ui.tfilter = k; saveUi(); }, openItem: (key) => { ui.sec = "flow"; ui.item = key; saveUi(); } };
   function renderTriage() {
     const b = board || {}; const it = Object.assign({ status: "idle" }, b.intake || {});
     const s = STATUS_LABEL[it.status] ? it.status : "idle";
@@ -1172,7 +1245,7 @@ window.PV = (function () {
       noteId: "note-intake", notePh: "Anything to look at first (optional)", ready: true,
       why: busy(s) ? "" : n ? `${n} new input${n === 1 ? "" : "s"} waiting: ${inputCounts(pend)}.` : "Nothing new since the last run.",
       dataAttrs: `data-start-intake="1"`, cancelAttrs: `data-cancel-intake="1"`,
-      extra: `<p class="muted">Triage stops when it is done; you approve its rows (Plan these · cycle ${nextNumber()}) before a plan starts.</p>`,
+      extra: `<p class="muted">Triage stops when it is done; you approve its rows one by one below before a plan starts.</p>`,
     });
     const lastRun = it.summary || it.detail ? `<details class="lastrun"><summary>What the last run said${it.lastTriageAt ? " · " + esc(when(it.lastTriageAt)) : ""}</summary>${report({ summary: it.summary, detail: it.detail, status: "done" }, "")}</details>` : "";
     return `<div class="head only-desk"><h3>Triage</h3><p class="lead">Every comment, ride report and nightly, what it became, and where that is now. Continuous, not part of any cycle.</p></div>
@@ -1416,6 +1489,7 @@ window.PV = (function () {
     if (t.dataset.planfb) return sendPlanFeedback(t.dataset.planfb, t);
     if (t.dataset.planapprove) return approvePlan(t.dataset.planapprove, t);
     if (t.dataset.sec) return goto(t.dataset.sec, t.dataset.cycle, t.dataset.stage);
+    if (candidateClick(t, toast)) return;
     if (t.dataset.tfilter) { ui.tfilter = t.dataset.tfilter; saveUi(); return render(); }
     if (t.dataset.filter) { ui.filter = t.dataset.filter; ui.sec = "flow"; saveUi(); return render(); }
     if (t.dataset.item) { ui.item = t.dataset.item; saveUi(); return renderDrawer(); }
@@ -1814,8 +1888,9 @@ window.PV = (function () {
       const it = (board && board.intake) || {};
       if (busy(it.status)) return null;
       const n = nextNumber();
-      const pc = it.planCandidates, rows = (pc && !pc.approvedAt && Array.isArray(pc.rows)) ? pc.rows : [];
-      if (rows.length) return { win: "board", label: `Plan these ${rows.length} · cycle ${n}`, text: `approve triage — plan cycle ${n} (typed from the board's next-phase button): the rider approved what the last triage collected; open cycles/c${n} with intake.planCandidates and run stage "plan" on it.` };
+      const pc = window.PV_TRIAGE && window.PV_TRIAGE.candidates();
+      if (pc && pc.sentAt > (pc.at || 0)) return { label: "Plan sent", disabled: true, why: "Waiting for the board thread to open the cycle" };
+      if (pc) { const ok = pc.rows.filter((r) => r.keep === true).length; return ok ? { win: "board", label: `Plan ${ok} approved · cycle ${n}`, text: window.PV_TRIAGE.planText(), plan: true } : { label: "Approve rows", disabled: true, why: "Approve or drop each row in the Inbox first" }; }
       return { win: "board", label: "Run triage", text: `START triage (typed from the board's next-phase button): run the transitnav-pipeline skill for stage "triage" and update pipeline/board.intake. Do not open a cycle or plan; leave the rows for the rider to approve.` };
     }
     if (c.retiredAt || ORDER.some((k) => busy(stat(c, k)))) return null;
@@ -1842,6 +1917,7 @@ window.PV = (function () {
     const p = ui.promote, b = $("nextgo");
     if (!p || p.disabled || !p.win) return;
     b.disabled = true; b.textContent = "Sent";
+    if (p.plan && window.PV_TRIAGE) { const m = await window.PV_TRIAGE.planApproved(); if (m) { toast(m); b.disabled = false; b.textContent = p.label; } return; }
     try {
       const r = await fetch("/api/inject", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ win: p.win, text: p.text }) });
       const j = await r.json().catch(() => ({}));
@@ -1978,6 +2054,7 @@ window.PV = (function () {
     const b = e.target.closest("button"); if (!b) return;
     if (b.dataset.shipprod) { b.disabled = true; return requestStep(b.dataset.shipprod, "ship-prod").then(() => render(true)); }
     if (b.dataset.trisub) { try { localStorage.setItem("pipeline-triage-sub", b.dataset.trisub); } catch (_) {} return render(false); }
+    if (window.PV_TRIAGE && window.PV_TRIAGE.candidateClick(b, toast)) return;
     if (b.dataset.tfilter && window.PV_TRIAGE) { window.PV_TRIAGE.setFilter(b.dataset.tfilter); return render(true); }
     if (b.dataset.item && window.PV_TRIAGE) { window.PV_TRIAGE.openItem(b.dataset.item); const sw = document.querySelector('[data-pv="classic"]'); if (sw) sw.click(); return; }
     if (b.dataset.view) { drafts[current()] = box.value; ui.view = b.dataset.view; try { localStorage.setItem("pipeline-simple-view", ui.view); } catch (_) {} render(false); box.value = drafts[current()] || ""; grow(); return; }

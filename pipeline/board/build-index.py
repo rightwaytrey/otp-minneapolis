@@ -384,5 +384,136 @@ one('''      extra: `<label class="opt-row"><input type="checkbox" id="intake-th
 assert page.count("ui.thenPlan !== false") == 5, page.count("ui.thenPlan !== false")
 page = page.replace("ui.thenPlan !== false", "false")
 
+# 19. approve triage's rows one by one (rider, 2026-10-16: "theres no buttons for individually
+#     approving items"). The Inbox (Classic and Chat) opens with an "Approve for cycle N" card: each
+#     row in intake.planCandidates gets Approve / Drop (rows[i].keep = true / false, written to the
+#     board), plus "Approve the other N" and a Plan press that types only the approved rows into the
+#     router. The Chat top-bar button counts approved rows and waits until there is one. Pending now
+#     means no approval postdates the triage that wrote the list (approvedAt < at): the 10-15 22:07
+#     triage refilled rows under the 16:10 approvedAt, and the button hid all nine.
+one("  :is(#pv-classic, #pv-chat .tri) .ledger tr.day td {", """  :is(#pv-classic, #pv-chat .tri) .appr { border: 1px solid var(--line-2); border-left: 3px solid var(--requested); border-radius: 10px; padding: 12px 14px; margin: 0 0 16px; background: var(--surface); }
+  :is(#pv-classic, #pv-chat .tri) .appr-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  :is(#pv-classic, #pv-chat .tri) .appr h4 { margin: 0; font-size: 15px; }
+  :is(#pv-classic, #pv-chat .tri) .appr .sub { margin: 4px 0 6px; font-size: 13px; color: var(--ink-3); }
+  :is(#pv-classic, #pv-chat .tri) .appr ul { list-style: none; margin: 0; padding: 0; }
+  :is(#pv-classic, #pv-chat .tri) .appr li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); }
+  :is(#pv-classic, #pv-chat .tri) .appr li .w { font-size: 14px; overflow-wrap: anywhere; }
+  :is(#pv-classic, #pv-chat .tri) .appr li .n { font: 600 13px var(--mono); color: var(--accent); margin-right: 6px; }
+  :is(#pv-classic, #pv-chat .tri) .appr li[data-k="0"] .w { color: var(--ink-3); text-decoration: line-through; }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk { display: inline-flex; border: 1px solid var(--line-2); border-radius: 8px; overflow: hidden; }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk button { min-height: 40px; padding: 0 12px; font-size: 13px; color: var(--ink-2); border-radius: 0; }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk button + button { border-left: 1px solid var(--line-2); }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk button[aria-pressed="true"][data-pckeep="1"] { background: var(--done); color: #fff; }
+  :is(#pv-classic, #pv-chat .tri) .appr .pk button[aria-pressed="true"][data-pckeep="0"] { background: var(--ink-3); color: #fff; }
+  :is(#pv-classic, #pv-chat .tri) .appr .allbtn { min-height: 40px; padding: 0 12px; border: 1px solid var(--line-2); border-radius: 8px; font-size: 13px; color: var(--ink-2); }
+  :is(#pv-classic, #pv-chat .tri) .appr .plango { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 10px; border-top: 1px solid var(--line); }
+  :is(#pv-classic, #pv-chat .tri) .appr .plango button.go { min-height: 44px; padding: 0 18px; border-radius: 10px; background: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 15px; }
+  :is(#pv-classic, #pv-chat .tri) .appr .plango button.go:disabled { background: var(--surface-2); color: var(--ink-3); cursor: default; }
+  @media (max-width: 520px) { :is(#pv-classic, #pv-chat .tri) .appr li { grid-template-columns: minmax(0, 1fr); } :is(#pv-classic, #pv-chat .tri) .appr li .pk { justify-self: end; } }
+  :is(#pv-classic, #pv-chat .tri) .ledger tr.day td {""")
+one("""  window.PV_TRIAGE = { html: () => ledger(), setFilter""", r"""  // Rows the last triage collected for the next plan, each approved or dropped by the rider. Pending
+  // while no approval postdates the triage that wrote them.
+  function candidates() {
+    const pc = board && board.intake && board.intake.planCandidates;
+    if (!pc || !Array.isArray(pc.rows) || !pc.rows.length) return null;
+    if (pc.approvedAt && !(pc.at > pc.approvedAt)) return null;
+    return pc;
+  }
+  function planText() {
+    const pc = candidates(); if (!pc) return "";
+    const n = nextNumber(), ok = pc.rows.filter((r) => r.keep === true).map((r) => r.n), rest = pc.rows.filter((r) => r.keep !== true).map((r) => r.n);
+    return `approve triage — plan cycle ${n} (typed from the board's Approve card): the rider approved ${ok.join(", ")}${rest.length ? `; not approved: ${rest.join(", ")} (they stay in the backlog)` : ""}. Open cycles/c${n} with only the approved rows of intake.planCandidates and run stage "plan" on it.`;
+  }
+  function approvalCard() {
+    const pc = candidates(); if (!pc) return "";
+    const rows = pc.rows, ok = rows.filter((r) => r.keep === true).length, no = rows.filter((r) => r.keep === false).length, open = rows.length - ok - no;
+    const dis = canEdit === false ? "disabled" : "";
+    const li = rows.map((r) => `<li data-k="${r.keep === true ? 1 : r.keep === false ? 0 : ""}"><span class="w"><span class="n">${esc(r.n)}</span>${esc(r.why || "")}</span><span class="pk" role="group" aria-label="Approve ${esc(r.n)}"><button type="button" data-pckeep="1" data-pcrow="${esc(r.n)}" aria-pressed="${r.keep === true}" ${dis}>Approve</button><button type="button" data-pckeep="0" data-pcrow="${esc(r.n)}" aria-pressed="${r.keep === false}" ${dis}>Drop</button></span></li>`).join("");
+    const n = nextNumber();
+    return `<section class="appr"><div class="appr-head"><h4>Approve for cycle ${n}</h4>${open ? `<button type="button" class="allbtn" data-pcall="1" ${dis}>Approve ${ok + no ? "the other" : "all"} ${open}</button>` : ""}</div>
+      <p class="sub">${ok} approved · ${no} dropped · ${open} undecided. The plan takes only approved rows; the rest stay in the backlog.</p><ul>${li}</ul>
+      <div class="plango"><button type="button" class="go" data-pcplan="1" ${ok && canEdit !== false ? "" : "disabled"}>Plan ${ok} approved · cycle ${n}</button></div></section>`;
+  }
+  // keep: true / false for one row; n === "*" approves every undecided row. Resolves to an error message or "".
+  async function setCandidate(n, keep) {
+    if (!db) return "No board connection.";
+    try {
+      const { ref, data } = await readDoc(BOARD); const b = data || {}; const pc = b.intake && b.intake.planCandidates;
+      if (!pc || !Array.isArray(pc.rows)) return "Those rows are gone; triage has moved on.";
+      pc.rows = pc.rows.map((r) => n === "*" ? (r.keep === true || r.keep === false ? r : Object.assign({}, r, { keep: true })) : r.n === n ? Object.assign({}, r, { keep }) : r);
+      b.updatedAt = Date.now(); await ref.set(b); return "";
+    } catch (err) { return "Couldn't save that (" + (err && err.code || "error") + ")."; }
+  }
+  async function planApproved() {
+    const text = planText(); if (!text) return "Nothing to plan.";
+    try {
+      const r = await fetch("/api/inject", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ win: "board", text }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || "http " + r.status);
+      try { localStorage.setItem("pipeline-triage-sub", "terminal"); } catch (_) {}
+      return "";
+    } catch (err) { return "Couldn't type into the terminal (" + (err && err.message || "error") + ")."; }
+  }
+  // one handler for both views' Inbox buttons; true when the click was one of these
+  function candidateClick(t, say) {
+    if (t.dataset.pcrow) { t.disabled = true; setCandidate(t.dataset.pcrow, t.dataset.pckeep === "1").then((m) => { t.disabled = false; if (m) say(m); }); return true; }
+    if (t.dataset.pcall) { t.disabled = true; setCandidate("*").then((m) => { t.disabled = false; if (m) say(m); }); return true; }
+    if (t.dataset.pcplan) { t.disabled = true; t.textContent = "Sent"; planApproved().then((m) => { if (m) { t.disabled = false; say(m); } else say("Sent to the board terminal. The plan starts with the approved rows."); }); return true; }
+    return false;
+  }
+  window.PV_TRIAGE = { html: () => ledger(), candidates, planText, candidateClick, setFilter""")
+one("""    const chips = `<div class="filters tchips">""", """    const chips = approvalCard() + `<div class="filters tchips">""")
+one("""    if (t.dataset.tfilter) { ui.tfilter = t.dataset.tfilter; saveUi(); return render(); }""",
+    """    if (candidateClick(t, toast)) return;
+    if (t.dataset.tfilter) { ui.tfilter = t.dataset.tfilter; saveUi(); return render(); }""")
+one("""    if (b.dataset.tfilter && window.PV_TRIAGE) {""", """    if (window.PV_TRIAGE && window.PV_TRIAGE.candidateClick(b, toast)) return;
+    if (b.dataset.tfilter && window.PV_TRIAGE) {""")
+one('''      const pc = it.planCandidates, rows = (pc && !pc.approvedAt && Array.isArray(pc.rows)) ? pc.rows : [];
+      if (rows.length) return { win: "board", label: `Plan these ${rows.length} · cycle ${n}`, text: `approve triage — plan cycle ${n} (typed from the board's next-phase button): the rider approved what the last triage collected; open cycles/c${n} with intake.planCandidates and run stage "plan" on it.` };''',
+    '''      const pc = window.PV_TRIAGE && window.PV_TRIAGE.candidates();
+      if (pc) { const ok = pc.rows.filter((r) => r.keep === true).length; return ok ? { win: "board", label: `Plan ${ok} approved · cycle ${n}`, text: window.PV_TRIAGE.planText() } : { label: "Approve rows", disabled: true, why: "Approve or drop each row in the Inbox first" }; }''')
+one('''      extra: `<p class="muted">Triage stops when it is done; you approve its rows (Plan these · cycle ${nextNumber()}) before a plan starts.</p>`,''',
+    '''      extra: `<p class="muted">Triage stops when it is done; you approve its rows one by one below before a plan starts.</p>`,''')
+
+# 20. any click scrolled the page to the top (rider, 2026-10-16: "hitting approve moves the page").
+#     The view switch's listener took closest("[data-pv]"), and apply() stamps data-pv on <body>, so
+#     every click re-showed the current view: window.scrollTo(0, 0) and a render from the top.
+#     Only the switch's own buttons switch, and re-pressing the current view leaves the page alone.
+one("""  document.addEventListener("click", (e) => { const b = e.target.closest("[data-pv]"); if (b) show(b.dataset.pv); });""",
+    """  document.addEventListener("click", (e) => { const b = e.target.closest("button[data-pv]"); if (b && b.dataset.pv !== active) show(b.dataset.pv); });""")
+
+# 21. the Plan press stays pressed (rider, 2026-10-16: "the plan buttons dont go away after i press
+#     them, or show as pressed"). "Sent" lived only on the button, so the next snapshot redrew
+#     "Plan 9 approved" until the router set approvedAt; the rider pressed twice (router deduped).
+#     A press now writes planCandidates.sentAt first: the card swaps its Plan button for "Sent ·
+#     waiting for cycle N to open" and locks Approve/Drop, the top-bar button reads "Plan sent", both
+#     views and every device agree. "Send again" appears after 3 minutes in case the router missed it.
+one("""    const dis = canEdit === false ? "disabled" : "";
+    const li = rows.map((r) => `<li data-k=""", """    const sent = pc.sentAt && pc.sentAt > (pc.at || 0) ? pc.sentAt : 0;
+    const dis = canEdit === false || sent ? "disabled" : "";
+    const li = rows.map((r) => `<li data-k=""")
+one("""      <div class="plango"><button type="button" class="go" data-pcplan="1" ${ok && canEdit !== false ? "" : "disabled"}>Plan ${ok} approved · cycle ${n}</button></div></section>`;""",
+    """      <div class="plango">${sent ? `<span class="sent">Sent ${esc(clock(sent))} · waiting for cycle ${n} to open</span>${Date.now() - sent > 180000 ? `<button type="button" class="allbtn" data-pcplan="1" ${canEdit === false ? "disabled" : ""}>Send again</button>` : ""}` : `<button type="button" class="go" data-pcplan="1" ${ok && canEdit !== false ? "" : "disabled"}>Plan ${ok} approved · cycle ${n}</button>`}</div></section>`;""")
+one("""    const text = planText(); if (!text) return "Nothing to plan.";
+    try {""", """    const text = planText(); if (!text) return "Nothing to plan.";
+    const mark = async (v) => { const { ref, data } = await readDoc(BOARD); const b = data || {}; const pc = b.intake && b.intake.planCandidates; if (!pc) return; pc.sentAt = v; b.updatedAt = Date.now(); await ref.set(b); };
+    try { await mark(Date.now()); } catch (_) {}
+    try {""")
+one("""    } catch (err) { return "Couldn't type into the terminal (" + (err && err.message || "error") + ")."; }
+  }""", """    } catch (err) { try { await mark(null); } catch (_) {} return "Couldn't type into the terminal (" + (err && err.message || "error") + ")."; }
+  }""")
+one("""  window.PV_TRIAGE = { html: () => ledger(), candidates, planText, candidateClick,""",
+    """  window.PV_TRIAGE = { html: () => ledger(), candidates, planText, candidateClick, planApproved,""")
+one("""      if (pc) { const ok = pc.rows.filter((r) => r.keep === true).length; return ok ?""",
+    """      if (pc && pc.sentAt > (pc.at || 0)) return { label: "Plan sent", disabled: true, why: "Waiting for the board thread to open the cycle" };
+      if (pc) { const ok = pc.rows.filter((r) => r.keep === true).length; return ok ?""")
+one("""    if (!p || p.disabled || !p.win) return;
+    b.disabled = true; b.textContent = "Sent";""", """    if (!p || p.disabled || !p.win) return;
+    b.disabled = true; b.textContent = "Sent";
+    if (p.plan && window.PV_TRIAGE) { const m = await window.PV_TRIAGE.planApproved(); if (m) { toast(m); b.disabled = false; b.textContent = p.label; } return; }""")
+one("""text: window.PV_TRIAGE.planText() } :""", """text: window.PV_TRIAGE.planText(), plan: true } :""")
+one("  :is(#pv-classic, #pv-chat .tri) .appr .allbtn {", """  :is(#pv-classic, #pv-chat .tri) .appr .sent { flex: 1 1 200px; font-size: 14px; color: var(--ink-2); }
+  :is(#pv-classic, #pv-chat .tri) .appr .allbtn {""")
+
 open("index.html", "w").write(page)
 print("index.html", len(page), "bytes")
