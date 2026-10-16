@@ -31,7 +31,7 @@ under `~/.claude/pipeline/db/`, read and written only through `~/bin/pipeline-db
   below), `log[]` (keep ≤ 60), `updatedAt`.
 - `cycles/<id>` — one doc per cycle (`c1`, `c2`, …): `number`, `createdAt`,
   `title`, `rows[] {num, title, kind: build|measure|daemon|blocked,
-  branch, status}`, `questions[] {id, text, rows[], answer, answeredAt}`,
+  branch, status}`, `questions[] {id, text, rows[], options[] {k, text}, default, answer, answeredAt, pick}` (see *Asking the rider*),
   `branches[] {name, label, sha, kind: build|measure|daemon, rows[],
   shippable, decision: approve|hold|null, decidedAt, summary, measured,
   tests, files, screenshots[], risks, vehicle}` — ONE OBJECT PER AGENT'S
@@ -414,7 +414,9 @@ readable. Each answer choice is a nested bullet of its own:
   `keep: false`.
 - **Needs you** is the only line with work for the rider: each entry names
   what is waiting (question, plan revision, ship-to-prod) and the **exact
-  words to type** here. If nothing needs the rider, it says
+  words to type** here. Every question on that line must also be on the
+  cycle's `questions[]` (*Asking the rider*) — the rider answers it by
+  tapping on the board; the typed words are the fallback. If nothing needs the rider, it says
   `**Needs you** — nothing, I'll carry on`. That sentence is the point of the line.
 - **Next** = what happens without the rider (auto-advance), or `waits for
   you` when it doesn't.
@@ -524,7 +526,10 @@ triage, `intake.status`) before running it, as below.
   while ship-dev is `running`: say so); a released Hold goes out under
   self-check rule 4.
 - **an answer to Qn** → `questions[].answer` (verbatim) and `answeredAt` on
-  that question, then run `answers` as for an `ANSWERS — cycle N` press.
+  that question, then run `answers` as for an `ANSWERS — cycle N` press. A
+  one-line `ANSWERS — cycle N (typed from the board's Questions panel …)`
+  is the board's Send: the answers are already stored (and a draft plan is
+  already set to revise); act on them, don't re-ask.
 - **plan notes while the plan is a `draft`** → append `{by: "rider"}` to
   `feedback[]`, set `steps.plan.status = "requested"`, `mode: "revise"`, and
   post the next revision as for a `· revise` press.
@@ -865,6 +870,25 @@ draft in the db plus "approve the plan" is the gate.
   branches → tests → vehicle, Sequencing, what is measure-first), fill
   `rows[]`, `branches[]`, `questions[]` on the cycle doc, and put the
   rider-facing list in `steps.plan.summary`.
+
+**Asking the rider** (since 2026-10-16, rider: "why cant we have agents go
+through the question ui for questions they are waiting on?"). Anything a
+thread waits on the rider to *decide* — a plan design call, a blocked step's
+question, an opt-in ("ship to prod now, or wait for the ride?", "should the
+detour push your phone?") — goes on the cycle's `questions[]`, never only in
+the terminal or `feedback[]`. Shape: `{id: "Q4", text: <the question
+only, plain words, with its visual link if it has one>, rows: [...],
+options: [{k: "A", text: "..."}, {k: "B", text: "..."}], default: "A" |
+null, answer: null, answeredAt: null}`. Keep each option's text short and
+self-contained (it is a button on a phone); never put the choices inside
+`text`. Ids keep counting up within a cycle. The board shows them as tap
+targets plus "Other…", saves the rider's choice as `pick` while they decide,
+and on Send writes `answer` (`"B — <option text>"` or their own words),
+`answeredAt`, and types `ANSWERS — cycle N (typed from the board's Questions
+panel …): Q1 (55.1): B — … ; Q2 …` into this terminal. A `pick` without an
+`answer` is not an answer yet. Things that already have their own board
+press — approving the plan, ship-prod, Hold/Approve on a branch — are not
+questions.
 - **Finish as a draft, not done:** `steps.plan.status = "draft"`,
   `plan = {revision: 1, revisedAt, changes: ""}`, `feedback: [one {by:
   "claude"} line]` — that line is the reply: it says this is revision 1 and

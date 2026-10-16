@@ -515,5 +515,186 @@ one("""text: window.PV_TRIAGE.planText() } :""", """text: window.PV_TRIAGE.planT
 one("  :is(#pv-classic, #pv-chat .tri) .appr .allbtn {", """  :is(#pv-classic, #pv-chat .tri) .appr .sent { flex: 1 1 200px; font-size: 14px; color: var(--ink-2); }
   :is(#pv-classic, #pv-chat .tri) .appr .allbtn {""")
 
+# 22. questions are answered on the board, by tapping (rider, 2026-10-16: "why cant we have agents go
+#     through the question ui for questions they are waiting on?"). Agents already wrote questions[],
+#     but the Chat view hid the answer box behind the terminal and the choices were prose, so the
+#     terminal's "type Q2: B" was the only way. Now: each question shows its choices as buttons
+#     (q.options [{k, text}] + q.default, or A) B) C) parsed out of older text) plus "Other…"; a tap
+#     saves q.pick on the cycle doc (both views, every device, changeable until sent); "Send N
+#     answers" writes answer/answeredAt (and puts a draft plan into revise, as the old press did)
+#     and types one ANSWERS line into the cycle's terminal. Chat: a "N questions for you" strip over
+#     the terminal opens the panel; it opens by itself when new questions arrive. Classic: the same
+#     block replaces the textareas. The top-bar button reads "Answer N questions" and opens it.
+one("  :is(#pv-classic, #pv-chat .tri) .appr {", """  :is(#pv-classic, #pv-chat) .qx { display: grid; gap: 14px; }
+  :is(#pv-classic, #pv-chat) .qx-q { border: 1px solid var(--line-2); border-left: 3px solid var(--you, var(--requested)); border-radius: 10px; padding: 12px 14px; background: var(--surface); display: grid; gap: 8px; }
+  :is(#pv-classic, #pv-chat) .qx-q[data-done="true"] { border-left-color: var(--line-2); }
+  :is(#pv-classic, #pv-chat) .qx-h { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--ink-3); }
+  :is(#pv-classic, #pv-chat) .qx-h b { font: 600 14px var(--mono); color: var(--ink); }
+  :is(#pv-classic, #pv-chat) .qx-p { margin: 0; font-size: 15px; line-height: 1.45; color: var(--ink); overflow-wrap: anywhere; white-space: pre-wrap; }
+  :is(#pv-classic, #pv-chat) .qx-o { display: grid; gap: 6px; }
+  :is(#pv-classic, #pv-chat) .qx-o button { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 8px; align-items: start; text-align: left; min-height: 44px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--surface); color: var(--ink); font-size: 14px; line-height: 1.4; }
+  :is(#pv-classic, #pv-chat) .qx-o button .k { font: 600 14px var(--mono); color: var(--accent); }
+  :is(#pv-classic, #pv-chat) .qx-o button .t { overflow-wrap: anywhere; font-weight: 400; }
+  :is(#pv-classic, #pv-chat) .qx-o button .def { display: inline-block; margin-left: 6px; font-size: 12px; color: var(--ink-3); }
+  :is(#pv-classic, #pv-chat) .qx-o button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+  :is(#pv-classic, #pv-chat) .qx-o button[aria-pressed="true"] .k, :is(#pv-classic, #pv-chat) .qx-o button[aria-pressed="true"] .def { color: var(--accent-ink); }
+  :is(#pv-classic, #pv-chat) .qx-q textarea { width: 100%; box-sizing: border-box; min-height: 64px; padding: 8px 10px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--surface); color: var(--ink); font: 14px/1.4 inherit; resize: vertical; }
+  :is(#pv-classic, #pv-chat) .qx-a { font-size: 14px; color: var(--ink-2); }
+  :is(#pv-classic, #pv-chat) .qx-send { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  :is(#pv-classic, #pv-chat) .qx-send button.go { min-height: 44px; padding: 0 18px; border-radius: 10px; background: var(--accent); color: var(--accent-ink); font-weight: 600; font-size: 15px; }
+  :is(#pv-classic, #pv-chat) .qx-send button.go:disabled { background: var(--surface-2); color: var(--ink-3); cursor: default; }
+  :is(#pv-classic, #pv-chat) .qx-send .why { flex: 1 1 180px; font-size: 13px; color: var(--ink-3); }
+  #pv-chat .chat.tty-full { position: relative; }
+  #pv-chat .qwrap { flex: none; }
+  /* over the terminal, not instead of it: a display:none ttyd boots with no size and breaks */
+  #pv-chat .qwrap[data-mode="questions"] { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; background: var(--bg); }
+  #pv-chat .qwrap .qstrip { display: block; width: 100%; min-height: 44px; padding: 0 16px; background: var(--you-soft); color: var(--you); font-weight: 600; font-size: 14px; text-align: left; border-radius: 0; }
+  #pv-chat .qwrap .qbar { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 16px; border-bottom: 1px solid var(--line); font-weight: 600; font-size: 14px; color: var(--ink); }
+  #pv-chat .qwrap .qbar button { min-height: 40px; padding: 0 12px; border: 1px solid var(--line-2); border-radius: 10px; color: var(--ink-2); font-weight: 500; }
+  #pv-chat .qwrap .qpanel { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 24px; -webkit-overflow-scrolling: touch; }
+  :is(#pv-classic, #pv-chat .tri) .appr {""")
+
+one("""  function questionsBlock(c) {""", r"""  // ---- questions: tap a choice, send the answers (2026-10-16) ----
+  // Choices come from q.options [{k, text}] (+ q.default), or are parsed from older prose "A) … B) …".
+  function qParse(q) {
+    const t = String(q.text || "");
+    if (Array.isArray(q.options) && q.options.length) {
+      const opts = q.options.map((o, i) => ({ k: String(o.k || o.key || String.fromCharCode(65 + i)).toUpperCase(), text: String(o.text || o.label || "") }));
+      const d = q.default || (q.options.find((o) => o.default) || {}).k;
+      return { prompt: t, opts, def: d ? String(d).toUpperCase() : null };
+    }
+    const re = /(^|\s)\(?([A-F])[).:]\s+/g, hits = []; let m, want = 65;
+    while ((m = re.exec(t))) { if (m[2].charCodeAt(0) === want) { hits.push({ k: m[2], at: m.index + m[1].length, body: m.index + m[0].length }); want++; } }
+    if (hits.length < 2) return { prompt: t, opts: [], def: null };
+    let def = null;
+    const opts = hits.map((h, i) => {
+      let s = t.slice(h.body, i + 1 < hits.length ? hits[i + 1].at : t.length).trim();
+      if (/\((?:default[^)]*|used if you don'?t answer[^)]*)\)/i.test(s)) { def = h.k; s = s.replace(/\s*\((?:default[^)]*|used if you don'?t answer[^)]*)\)/i, ""); }
+      return { k: h.k, text: s.replace(/[\s;,]+$/, "") };
+    });
+    return { prompt: t.slice(0, hits[0].at).trim(), opts, def };
+  }
+  const qDrafts = {};
+  const qOther = {};
+  const qKey = (cid, qid) => cid + "|" + qid;
+  function qState(c) {
+    const open = unanswered(c);
+    return { open: open.length, picked: open.filter((q) => q.pick && (q.pick.k || (q.pick.text || "").trim())).length, sig: open.map((q) => q.id).join(",") };
+  }
+  function qAnswerText(q) {
+    const p = q.pick || {}; if (p.k) { const o = qParse(q).opts.find((x) => x.k === p.k); return p.k + (o ? " — " + o.text : ""); }
+    return (p.text || "").trim();
+  }
+  function qBlock(c, openOnly) {
+    const qs = (c.questions || []).filter((q) => q && (!openOnly || !q.answer));
+    if (!qs.length) return `<p class="sub muted">No questions on this cycle.</p>`;
+    const dis = canEdit === false ? "disabled" : "";
+    const body = qs.map((q) => {
+      const P = qParse(q), id = esc(q.id), cid = esc(c.id), k = qKey(c.id, q.id), pick = q.pick || {};
+      const head = `<div class="qx-h"><b>${esc(String(q.id).toUpperCase())}</b>${q.rows && q.rows.length ? `<span>holds ${esc(q.rows.join(", "))}</span>` : ""}${q.answeredAt ? `<span>answered ${esc(when(q.answeredAt))}</span>` : ""}</div>`;
+      if (q.answer) return `<div class="qx-q" data-done="true">${head}<p class="qx-p">${esc(P.prompt || q.text)}</p><div class="qx-a"><b>You:</b> ${esc(q.answer)}</div></div>`;
+      const other = qOther[k] || (!pick.k && (pick.text || "").trim());
+      const btns = P.opts.map((o) => `<button type="button" data-qcyc="${cid}" data-qid="${id}" data-qk="${esc(o.k)}" aria-pressed="${pick.k === o.k}" ${dis}><span class="k">${esc(o.k)}</span><span class="t">${esc(o.text)}${P.def === o.k ? `<span class="def">default</span>` : ""}</span></button>`).join("");
+      const ta = `<textarea id="qt-${cid}-${id}" data-qtext="1" data-qcyc="${cid}" data-qid="${id}" placeholder="${P.opts.length ? "Your own answer" : "Your answer — one word is enough"}" ${dis}>${esc(qDrafts[k] != null ? qDrafts[k] : (pick.k ? "" : pick.text || ""))}</textarea>`;
+      const otherBtn = P.opts.length ? `<button type="button" data-qcyc="${cid}" data-qid="${id}" data-qother="1" aria-pressed="${!!other}" ${dis}><span class="k">…</span><span class="t">Other</span></button>` : "";
+      return `<div class="qx-q">${head}<p class="qx-p">${esc(P.prompt || q.text)}</p>${P.opts.length ? `<div class="qx-o">${btns}${otherBtn}</div>` : ""}${!P.opts.length || other ? ta : ""}</div>`;
+    }).join("");
+    const st = qState(c);
+    const send = st.open ? `<div class="qx-send"><button type="button" class="go" data-qsend="${esc(c.id)}" ${st.picked && canEdit !== false ? "" : "disabled"}>Send ${st.picked || ""} answer${st.picked === 1 ? "" : "s"}</button><span class="why">${st.picked < st.open ? `${st.open - st.picked} still open. ` : ""}Your choices are saved as you tap; Send hands them to the cycle.</span></div>` : "";
+    return `<div class="qx">${body}${send}</div>`;
+  }
+  async function qWrite(cid, fn) {
+    if (!db) return "No board connection.";
+    try { const { ref, data } = await readDoc("cycles/" + cid); if (!data) return "That cycle is gone."; const r = fn(data); if (r === false) return ""; await ref.set(data); return ""; }
+    catch (err) { return "Couldn't save that (" + (err && err.code || "error") + ")."; }
+  }
+  const qPick = (cid, qid, pick) => qWrite(cid, (d) => { d.questions = (d.questions || []).map((q) => q && q.id === qid && !q.answer ? Object.assign({}, q, { pick, pickedAt: Date.now() }) : q); });
+  async function qSend(cid) {
+    const now = Date.now(); let sent = [], inReview = false, number = cid;
+    const err = await qWrite(cid, (d) => {
+      number = d.number || cid;
+      d.questions = (d.questions || []).map((q) => { if (!q || q.answer) return q; const a = qAnswerText(q); if (!a) return q; sent.push({ q, a }); return Object.assign({}, q, { answer: a, answeredAt: now, answeredBy: "rider" }); });
+      if (!sent.length) return false;
+      if (((d.steps || {}).plan || {}).status === "draft") { inReview = true; d.steps.plan = Object.assign({}, d.steps.plan, { status: "requested", mode: "revise", requestedAt: now, startedAt: null, finishedAt: null, requestedBy: uid || "rider", wake: null }); }
+    });
+    if (err) return err;
+    if (!sent.length) return "Pick an answer first.";
+    try { await logBoard({ t: now, stage: "cycle " + number, event: "answers", text: sent.map((x) => String(x.q.id).toUpperCase() + ": " + x.a).join(" · ") }); } catch (_) {}
+    const line = `ANSWERS — cycle ${number} (typed from the board's Questions panel; the answers are already stored on questions[]${inReview ? " and the draft plan is set to revise" : ""}): ` + sent.map((x) => `${String(x.q.id).toUpperCase()}${x.q.rows && x.q.rows.length ? " (" + x.q.rows.join(", ") + ")" : ""}: ${x.a.replace(/\s+/g, " ")}`).join(" ; ") + (inReview ? ". Record them on their rows and post the next plan revision." : ". Record them on the rows they affect; if Build is running, add the unblocked rows to it.");
+    try {
+      const r = await fetch("/api/inject", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ win: "c" + number, text: line }) });
+      if (!r.ok) throw new Error("http " + r.status);
+    } catch (e) { return `Answers saved on the board, but they couldn't be typed into cycle ${number}'s terminal; the thread reads them at its next step.`; }
+    return "";
+  }
+  function qClick(t, say) {
+    const cid = t.dataset.qcyc, qid = t.dataset.qid;
+    if (t.dataset.qsend) { t.disabled = true; t.textContent = "Sent"; qSend(t.dataset.qsend).then((m) => { if (m) { t.disabled = false; say(m); } else say("Answers sent to the cycle."); }); return true; }
+    if (!cid || !qid || t.tagName !== "BUTTON") return false;
+    const k = qKey(cid, qid);
+    if (t.dataset.qother) { qOther[k] = !qOther[k]; if (!qOther[k]) { delete qDrafts[k]; qPick(cid, qid, null).then((m) => m && say(m)); } render(); if (window.PV_CHAT_RENDER) window.PV_CHAT_RENDER(); if (qOther[k]) setTimeout(() => { const ta = document.querySelectorAll(`[data-qtext][data-qcyc="${CSS.escape(cid)}"][data-qid="${CSS.escape(qid)}"]`); ta.forEach((x) => x.offsetParent && x.focus()); }, 30); return true; }
+    if (t.dataset.qk) { const was = t.getAttribute("aria-pressed") === "true"; qOther[k] = false; delete qDrafts[k]; t.setAttribute("aria-pressed", String(!was)); qPick(cid, qid, was ? null : { k: t.dataset.qk }).then((m) => m && say(m)); return true; }
+    return false;
+  }
+  document.addEventListener("input", (e) => { const el = e.target; if (el.dataset && el.dataset.qtext) qDrafts[qKey(el.dataset.qcyc, el.dataset.qid)] = el.value; });
+  document.addEventListener("change", (e) => {
+    const el = e.target; if (!el.dataset || !el.dataset.qtext) return;
+    const v = el.value.trim(), k = qKey(el.dataset.qcyc, el.dataset.qid);
+    qPick(el.dataset.qcyc, el.dataset.qid, v ? { text: v } : null).then((m) => { if (!m) delete qDrafts[k]; });
+  });
+  document.addEventListener("click", (e) => {
+    const t = e.target.closest("button"); if (!t || !(t.dataset.qsend || t.dataset.qcyc)) return;
+    qClick(t, (m) => (PV.shown("classic") ? toast(m) : (window.PV_CHAT_TOAST || toast)(m)));
+  });
+  window.PV_Q = { html: (c) => qBlock(c, true), state: qState };
+
+  function questionsBlock(c) { return qBlock(c, false); }
+  function questionsBlockOld(c) {""")
+
+# Chat: strip / panel over the cycle's terminal; the iframe stays mounted so nothing reconnects
+one("""    if (src) {
+      el.classList.add("tty-full");
+      const cur = el.querySelector("iframe.tty");
+      if (!cur || cur.dataset.w !== win) el.innerHTML = `<iframe class="tty" data-w="${esc(win)}" src="${esc(src)}" title="Terminal ${esc(win)}" allow="clipboard-write"></iframe>`;
+      return;
+    }""", """    if (src) {
+      el.classList.add("tty-full");
+      let cur = el.querySelector("iframe.tty");
+      if (!cur || cur.dataset.w !== win) { el.innerHTML = `<div class="qwrap"></div><iframe class="tty" data-w="${esc(win)}" src="${esc(src)}" title="Terminal ${esc(win)}" allow="clipboard-write"></iframe>`; cur = el.querySelector("iframe.tty"); }
+      let qw = el.querySelector(".qwrap"); if (!qw) { qw = document.createElement("div"); qw.className = "qwrap"; el.prepend(qw); }
+      const qs = c && window.PV_Q ? window.PV_Q.state(c) : { open: 0 };
+      const mode = qs.open ? cycSub(c, qs) : "none";
+      cur.setAttribute("aria-hidden", String(mode === "questions"));
+      qw.dataset.mode = mode;
+      if (mode === "questions") {
+        const ae = document.activeElement;
+        if (!(ae && ae.tagName === "TEXTAREA" && qw.contains(ae))) {
+          const p0 = qw.querySelector(".qpanel"), top = p0 ? p0.scrollTop : 0;
+          qw.innerHTML = `<div class="qbar"><span>${qs.open} question${qs.open === 1 ? "" : "s"} for you</span><button type="button" data-csub="terminal">Terminal</button></div><div class="qpanel">${window.PV_Q.html(c)}</div>`;
+          const p1 = qw.querySelector(".qpanel"); if (p1) p1.scrollTop = top;
+        }
+      } else qw.innerHTML = mode === "terminal" ? `<button type="button" class="qstrip" data-csub="questions">${qs.open} question${qs.open === 1 ? "" : "s"} for you · answer</button>` : "";
+      return;
+    }""")
+one("""  function renderChat(v, keepScroll) {""", """  // Questions panel or terminal for a cycle with open questions: the rider's last choice, until a new
+  // set of questions arrives (then the panel opens by itself).
+  function cycSub(c, qs) {
+    let s = null; try { s = JSON.parse(localStorage.getItem("pipeline-csub:" + c.id) || "null"); } catch (_) {}
+    return s && s.sig === qs.sig ? s.m : "questions";
+  }
+  function setCycSub(c, m) { const qs = window.PV_Q ? window.PV_Q.state(c) : { sig: "" }; try { localStorage.setItem("pipeline-csub:" + c.id, JSON.stringify({ m, sig: qs.sig })); } catch (_) {} }
+  function renderChat(v, keepScroll) {""")
+one("""    if (b.dataset.trisub) {""", """    if (b.dataset.csub) { const c = cyc(current()); if (c) setCycSub(c, b.dataset.csub); return render(true); }
+    if (b.dataset.trisub) {""")
+one("""  function toast(msg, ms) { if (!msg) return; const t = $("chat-toast");""", """  window.PV_CHAT_TOAST = (m) => toast(m);
+  window.PV_CHAT_RENDER = () => render(true);
+  function toast(msg, ms) { if (!msg) return; const t = $("chat-toast");""")
+one("""    if (unanswered(c).length) return { label: "Answer questions first", disabled: true };""",
+    """    if (unanswered(c).length) { const nq = unanswered(c).length; return { label: `Answer ${nq} question${nq === 1 ? "" : "s"}`, questions: c }; }""")
+one("""    if (!p || p.disabled || !p.win) return;
+    b.disabled = true; b.textContent = "Sent";""", """    if (p && p.questions) { setCycSub(p.questions, "questions"); return render(true); }
+    if (!p || p.disabled || !p.win) return;
+    b.disabled = true; b.textContent = "Sent";""")
+
 open("index.html", "w").write(page)
 print("index.html", len(page), "bytes")
