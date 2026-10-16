@@ -10114,6 +10114,69 @@ def board_live(b, board_ms, realtime=True, floor=False, leg=1):
         "alightEpoch": board_ms + 600000, "realtime": True}})
 
 
+class TestBoardArrivalBusNotHere(RuleTestCase):
+    """54.3: "Bus here - 539" at 21:39:31 with the live board at 21:53:00."""
+
+    def run_bus_here(self, ahead_ms, realtime=True, floor=False,
+                     stale_ms=0):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=40.0)
+        b.advance(1000)
+        board_live(b, b.t + ahead_ms, realtime=realtime, floor=floor)
+        b.advance(stale_ms or 1000)
+        bus_here(b)
+        return self.run_stream(b)
+
+    def test_thirteen_minutes_ahead_is_a_warning(self):
+        watch = self.run_bus_here(13 * 60000 + 30000)
+        found = self.find(watch, "board-arrival-bus-not-here")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "warn")
+        self.assertAlmostEqual(found[0]["context"]["aheadSec"], 808, delta=3)
+        self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
+
+    def test_sixty_seconds_ahead_is_quiet(self):
+        watch = self.run_bus_here(61000)
+        self.assertEqual(self.find(watch, "board-arrival-bus-not-here"), [])
+
+    def test_a_scheduled_or_floor_or_stale_board_is_not_trusted(self):
+        for kw in ({"realtime": False}, {"floor": True},
+                   {"stale_ms": 120000}):
+            watch = self.run_bus_here(13 * 60000, **kw)
+            self.assertEqual(
+                self.find(watch, "board-arrival-bus-not-here"), [], kw)
+
+    def test_once_per_trip_and_stop(self):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=40.0)
+        b.advance(1000)
+        board_live(b, b.t + 13 * 60000)
+        b.advance(1000)
+        bus_here(b)
+        b.advance(30000)
+        board_live(b, b.t + 12 * 60000)
+        bus_here(b)
+        watch = self.run_stream(b)
+        self.assertEqual(
+            len(self.find(watch, "board-arrival-bus-not-here")), 1)
+
+    REAL_LOG_1016 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                                 "debug-2026-10-16.jsonl")
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_1016),
+                         "debug-2026-10-16.jsonl not present")
+    def test_the_real_1015_layover_is_flagged(self):
+        # 2026-10-16T02:39:31Z (21:39:31 local), board 21:53:00.
+        watch = replay_real_window(self, self.REAL_LOG_1016,
+                                   (1792118000000, 1792118600000),
+                                   types=RIDE_TYPES_0922)
+        found = hits_of(watch, "board-arrival-bus-not-here")
+        self.assertEqual([f["tsMs"] for f in found], [1792118371084],
+                         [(f["time"], f["summary"]) for f in found])
+        self.assertAlmostEqual(found[0]["context"]["aheadSec"], 808.9,
+                               delta=2)
+
+
 class TestReplanRefusedWithLiveSlack(RuleTestCase):
     """29.2: 2026-09-23 15:49:33 refused a bike leg ending 15:54:00 as
     missing a bus the card showed at 15:57:22 (planned 15:53:42)."""
