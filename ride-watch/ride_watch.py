@@ -641,6 +641,8 @@ ROUTE_POLL_KEEP = 32
 # explain the gap.
 BOARD_ARRIVAL_FAR_BASE_M = 400.0
 BOARD_ARRIVAL_FAR_SPEED_MPS = 15.0
+# 54.3: a "Bus here" with the live board this far ahead is a bus laying over.
+BOARD_ARRIVAL_EARLY_MS = 2 * 60 * 1000
 #
 # replan-refused-with-live-slack (29.2). The app's access-misses-board gate
 # (otprr replan-acceptance.ts accessBoardOverrunMs, slack
@@ -2159,6 +2161,7 @@ class Trip:
         self.live_board_times = {}
         self.missed_bus_still_paged = False        # one page per ride
         self.board_far_fired = set()               # (tripId, stopId)
+        self.board_early_fired = set()             # (tripId, stopId), 54.3
         # 29.2: the newest SET_LIVE_LEG_TIMES entry per leg key ("1"), with
         # the flags the app's own board-time trust reads, and when it came.
         self.live_board_latest = {}
@@ -7251,6 +7254,7 @@ class RideWatch:
         if (nid.startswith("BOARD_BUS_ARRIVING")
                 or p.get("type") == "BOARD_BUS_ARRIVING"):
             self._rule_board_arrival_vehicle_far(trip, t, p)
+            self._rule_board_arrival_bus_not_here(trip, t, p)
         if (nid.startswith("DESTINATION_UNREACHABLE")
                 or p.get("type") == "DESTINATION_UNREACHABLE"):
             self._on_destination_unreachable(trip, t, p)
@@ -7426,6 +7430,77 @@ class RideWatch:
             self._finding(trip, t, "missed-bus-still-coming", "warn",
                           summary, ctx)
 
+    @staticmethod
+    def _board_arrival_leg(trip, nid):
+        """(legIndex, leg, tripId, stopId) a BOARD_BUS_ARRIVING id names, or None.
+
+        Ids are `BOARD_BUS_ARRIVING_<stopId>_<tripId>_arriving_<Date.now()>`;
+        stop and trip ids both contain ':' and the trip id is matched against
+        the itinerary's legs first, so the split is not guessed.
+        """
+        rest = nid[len("BOARD_BUS_ARRIVING_"):] if nid.startswith(
+            "BOARD_BUS_ARRIVING_") else ""
+        rest = rest.split("_arriving_")[0]
+        legs = (trip.itinerary or {}).get("legs") or []
+        leg = idx = None
+        for i, cand in enumerate(legs):
+            tid = cand.get("tripId")
+            if cand.get("transit") and tid and rest.endswith("_" + tid):
+                leg, idx = cand, i
+                break
+        if leg is not None:
+            trip_id = leg["tripId"]
+            stop_id = rest[:-(len(trip_id) + 1)] or leg.get("fromStopId")
+        else:
+            stop_id, _, trip_id = rest.partition("_")
+            for i, cand in enumerate(legs):
+                if cand.get("transit") and cand.get("fromStopId") == stop_id:
+                    leg, idx = cand, i
+                    break
+        if not trip_id or not stop_id or leg is None:
+            return None
+        return idx, leg, trip_id, stop_id
+
+    def _rule_board_arrival_bus_not_here(self, trip, t, p):
+        """"Bus here" while the app's own live board is minutes away (54.3).
+
+        2026-10-15 21:39:31 (session mva4fpf5-hhg1cf): "Bus here - 539" with
+        the live board for that leg at 21:53:00, 13.5 min ahead -- a bus
+        laying over at the stop's terminal, not arriving. The app's
+        `BOARD_BUS_ARRIVING` trusts the vehicle's position; the board it shows
+        says otherwise. Warn, never a page (same reasoning as
+        board-arrival-vehicle-far); once per (trip, stop) a ride. Reads the
+        newest SET_LIVE_LEG_TIMES reading for that leg, realtime, not a
+        floor, taken on this trip and within REPLAN_LIVE_BOARD_MAX_AGE_MS.
+        """
+        resolved = self._board_arrival_leg(trip, p.get("id") or "")
+        if resolved is None:
+            return
+        idx, leg, trip_id, stop_id = resolved
+        key = (trip_id, stop_id)
+        if key in trip.board_early_fired:
+            return
+        live = trip.live_board_latest.get(str(idx))
+        if (live is None or not live.get("realtime") or live.get("isFloor")
+                or live.get("tripId") != trip_id
+                or t - live["tMs"] > REPLAN_LIVE_BOARD_MAX_AGE_MS):
+            return
+        ahead = live["boardEpoch"] - t
+        if ahead <= BOARD_ARRIVAL_EARLY_MS:
+            return
+        trip.board_early_fired.add(key)
+        stop = leg.get("from") or stop_id
+        self._finding(
+            trip, t, "board-arrival-bus-not-here", "warn",
+            "\"Bus here\" at %s but the live board for trip %s is %.1f min"
+            " away (source %s)" % (stop, trip_id, ahead / 60000.0,
+                                   live.get("source")),
+            {"notificationId": p.get("id"), "tripId": trip_id,
+             "stopId": stop_id, "stop": leg.get("from"),
+             "liveBoardEpoch": live["boardEpoch"], "aheadSec": round(ahead / 1000.0, 1),
+             "readingAgeSec": round((t - live["tMs"]) / 1000.0, 1),
+             "boardSource": live.get("source")})
+
     def _rule_board_arrival_vehicle_far(self, trip, t, p):
         """"Bus here" with the trip's own bus kilometres away (26.7).
 
@@ -7438,25 +7513,10 @@ class RideWatch:
         for is the report. Once per (trip, stop) a ride.
         """
         nid = p.get("id") or ""
-        rest = nid[len("BOARD_BUS_ARRIVING_"):] if nid.startswith(
-            "BOARD_BUS_ARRIVING_") else ""
-        rest = rest.split("_arriving_")[0]
-        legs = (trip.itinerary or {}).get("legs") or []
-        leg = None
-        for cand in legs:
-            tid = cand.get("tripId")
-            if cand.get("transit") and tid and rest.endswith("_" + tid):
-                leg = cand
-                break
-        if leg is not None:
-            trip_id = leg["tripId"]
-            stop_id = rest[:-(len(trip_id) + 1)] or leg.get("fromStopId")
-        else:
-            stop_id, _, trip_id = rest.partition("_")
-            leg = next((c for c in legs if c.get("transit")
-                        and c.get("fromStopId") == stop_id), None)
-        if not trip_id or not stop_id or leg is None:
+        resolved = self._board_arrival_leg(trip, nid)
+        if resolved is None:
             return
+        _idx, leg, trip_id, stop_id = resolved
         if leg.get("fromLat") is None or leg.get("fromLon") is None:
             return
         key = (trip_id, stop_id)
