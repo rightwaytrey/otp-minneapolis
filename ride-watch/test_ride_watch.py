@@ -11084,5 +11084,120 @@ class TestRowsThisRideCanTest(RuleTestCase):
         self.assertIn("## Rows this ride can test", p)
 
 
+class TestFasterRouteOffers(RuleTestCase):
+    """56.1: the offer section, faster-route-storm, and the 56.2 cadence."""
+
+    def offer(self, b, outcome="offered", kind="faster", saving=6.0,
+              push="none", why=None, route="14"):
+        return b.action("FASTER_ROUTE_OFFER", {
+            "addedBikeKm": 0.0, "bikeSavedKm": 1.2, "kind": kind,
+            "laterMin": 0.0, "offerId": "o1", "offers": 1,
+            "outcome": outcome, "push": push if outcome == "offered" else None,
+            "pushes": 0, "route": route, "routeSet": "14",
+            "savingMin": saving, "source": "ordinary", "tMs": b.t,
+            "why": why})
+
+    def base(self):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=40.0)
+        return b
+
+    def storm(self, watch):
+        return self.find(watch, "faster-route-storm")
+
+    def test_section_lists_each_offer_with_outcome_and_push(self):
+        b = self.base()
+        b.advance(60000)
+        self.offer(b, push="sent", kind="lessBike", saving=0.0)
+        b.advance(30000)
+        self.offer(b, "kept")
+        b.advance(300000)
+        self.offer(b, "offered", kind="aboard", push="replaced")
+        b.advance(60000)
+        self.offer(b, "expired", why="board-time")
+        watch = self.run_stream(b, finalize=False)
+        text = "\n".join(watch.faster_route_lines(watch.trips[SESSION]))
+        self.assertIn("## Faster-route offers (2)", text)
+        self.assertIn("lessBike 1.2 km less biking, offered, push sent", text)
+        self.assertIn("Keep mine", text)
+        self.assertIn("aboard 6.0 min, offered, push replaced", text)
+        self.assertIn("expired (board-time)", text)
+
+    def test_no_offers_says_none(self):
+        watch = self.run_stream(self.base(), finalize=False)
+        text = "\n".join(watch.faster_route_lines(watch.trips[SESSION]))
+        self.assertIn("- (none)", text)
+        self.assertEqual(self.storm(watch), [])
+
+    def test_three_offers_in_ten_minutes_is_a_storm(self):
+        b = self.base()
+        for _ in range(3):
+            b.advance(120000)
+            self.offer(b)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.storm(watch)), 1, self.rules(watch))
+        self.assertEqual(self.storm(watch)[0]["severity"], "warn")
+
+    def test_two_offers_or_spread_out_offers_are_not(self):
+        b = self.base()
+        for _ in range(3):
+            b.advance(400000)
+            self.offer(b)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.storm(watch), [])
+
+    def test_three_pushes_in_a_ride_is_a_storm(self):
+        b = self.base()
+        for push in ("sent", "replaced", "replaced"):
+            b.advance(900000)
+            self.offer(b, push=push)
+        watch = self.run_stream(b, finalize=False)
+        found = self.storm(watch)
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["context"]["pushes"], 3)
+
+    def switched_ride(self, arrive_after_ms):
+        b = self.base()
+        b.advance(60000)
+        self.offer(b, "switched", saving=5.0)
+        b.advance(arrive_after_ms)
+        b.action("SET_ARRIVED", 1)
+        return self.run_stream(b)
+
+    def test_switch_that_arrives_later_than_offered_is_a_storm(self):
+        # plan ended T0+3600000; 5 min saving promises T0+3300000
+        watch = self.switched_ride(3600000 - 61000 - 1000 + 60000)
+        found = self.storm(watch)
+        self.assertEqual(len(found), 1, self.rules(watch))
+        c = found[0]["context"]
+        self.assertEqual(c["offeredArrivalMs"], T0 + 3600000 - 300000)
+        self.assertEqual(c["lateMin"], round(
+            (c["arrivedMs"] - c["offeredArrivalMs"]) / 60000.0, 1))
+        self.assertGreater(c["lateMin"], 2.0)
+
+    def test_switch_that_arrives_on_time_is_quiet(self):
+        watch = self.switched_ride(3300000 - 62000)
+        self.assertEqual(self.storm(watch), [])
+
+    def test_cadence_is_the_median_aboard_spacing(self):
+        b = self.base()
+        snap = {"reason": "periodic", "request": {}, "response": {}}
+        b.advance(1000)
+        b.action("REROUTE_SNAPSHOT", snap)          # before boarding
+        b.advance(1000).riding()
+        for gap in (360000, 360000, 120000, 360000):
+            b.advance(gap)
+            b.action("REROUTE_SNAPSHOT", snap)
+        watch = self.run_stream(b, finalize=False)
+        text = ride_watch.RideWatch.snapshot_cadence_text(watch.trips[SESSION])
+        self.assertIn("median spacing of REROUTE_SNAPSHOTs while aboard: 360 s"
+                      " over 3 gaps", text)
+
+    def test_cadence_with_no_aboard_snapshots(self):
+        watch = self.run_stream(self.base(), finalize=False)
+        text = ride_watch.RideWatch.snapshot_cadence_text(watch.trips[SESSION])
+        self.assertIn("no two REROUTE_SNAPSHOTs while aboard", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

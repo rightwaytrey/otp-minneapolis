@@ -179,6 +179,11 @@ cross-referenced here in one line>
 **Evidence:** <action types + timestamps you read>
 **Fix:** <category> — <one or two sentences> · `<file>` (real-bug only)
 
+## Faster-route offers
+<paste the request's `fasterRouteSection` lines verbatim (each offer: time, kind,
+min/km, Switch / Keep mine / expired, push; then the aboard recorder cadence
+median — about 360 s once the settled-aboard cadence works, 90 s if not)>
+
 ## Rule tuning
 <any rule that misfired, and the threshold or guard that would stop it; plus
 any rule that *should exist* because a note caught something no rule did>
