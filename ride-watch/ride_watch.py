@@ -641,6 +641,14 @@ ROUTE_POLL_KEEP = 32
 # explain the gap.
 BOARD_ARRIVAL_FAR_BASE_M = 400.0
 BOARD_ARRIVAL_FAR_SPEED_MPS = 15.0
+# faster-route-storm (56.1): the app caps itself at 3 offers and 2 pushes a ride
+# (faster-route.ts MAX_FASTER_ROUTE_*); "more than 2 offers in 10 min" and "more
+# than 2 pushes" are the daemon's own tighter reading of the same thing.
+FASTER_ROUTE_STORM_WINDOW_MS = 10 * 60 * 1000
+FASTER_ROUTE_STORM_OFFERS = 2
+FASTER_ROUTE_STORM_PUSHES = 2
+# A switch that arrives this much after the time the offer promised is a miss.
+FASTER_ROUTE_LATE_TOL_MS = 2 * 60 * 1000
 # 54.3: a "Bus here" with the live board this far ahead is a bus laying over.
 BOARD_ARRIVAL_EARLY_MS = 2 * 60 * 1000
 #
@@ -2162,6 +2170,13 @@ class Trip:
         self.missed_bus_still_paged = False        # one page per ride
         self.board_far_fired = set()               # (tripId, stopId)
         self.board_early_fired = set()             # (tripId, stopId), 54.3
+        # 56.1: every FASTER_ROUTE_OFFER entry [{"tMs", ...payload}], the
+        # storm rule's fired flags, and what a Switch promised.
+        self.faster_entries = []
+        self.faster_storm_fired = set()
+        self.faster_switch_expect = None           # {"tMs","expectedEndMs",...}
+        # 56.2: every REROUTE_SNAPSHOT as (tMs, aboard) for the cadence line.
+        self.snapshot_marks = []
         # 29.2: the newest SET_LIVE_LEG_TIMES entry per leg key ("1"), with
         # the flags the app's own board-time trust reads, and when it came.
         self.live_board_latest = {}
@@ -2843,6 +2858,8 @@ class RideWatch:
                 self._on_auto_replan(trip, t, obj.get("payload") or {})
             elif typ == "REROUTE_SNAPSHOT":
                 self._on_reroute_snapshot(trip, t, obj.get("payload") or {})
+            elif typ == "FASTER_ROUTE_OFFER":
+                self._on_faster_route_offer(trip, t, obj.get("payload") or {})
             elif typ in ("REMEMBER_SEARCH", "ROUTING_REQUEST"):
                 self._note_search(trip, t, typ, obj.get("payload"))
             elif typ == "ROUTING_RESPONSE":
@@ -5006,6 +5023,7 @@ class RideWatch:
         # (18.3b); in replay this is usually the path that fires, because the
         # clock only advances on events.
         self._rule_arrived_never_ended(trip, t, ending=reason)
+        self._rule_faster_route_late(trip, t)
         # ...and a refusal burst still inside its quiet window: the ride ending
         # is the end of that launch by definition.
         self._flush_wake_lock(trip, t, force=True)
@@ -8103,6 +8121,143 @@ class RideWatch:
         trip.dest_replans_since_gain += 1
         self._rule_replan_not_converging(trip, t, why)
 
+    def _on_faster_route_offer(self, trip, t, p):
+        """One step in a faster-route offer's life (56.1), recorded and judged.
+
+        The app dispatches FASTER_ROUTE_OFFER (scalar payload, recording only)
+        on offered / switched / kept / expired: kind faster|lessBike|aboard,
+        savingMin, bikeSavedKm, addedBikeKm, laterMin, route, source, push
+        (sent|replaced|none, on `offered`), why (on `expired`), running
+        offers/pushes totals. Never a re-plan; touches no re-plan counter.
+        """
+        if not isinstance(p, dict) or p.get("__summary"):
+            return
+        entry = dict(p)
+        entry["tMs"] = t
+        trip.faster_entries.append(entry)
+        outcome = p.get("outcome")
+        if outcome == "switched":
+            # Dispatched before the new START_GO_MODE, so trip.itinerary is
+            # still the rider's old route: what the offer promised is that
+            # route's planned end minus the saving.
+            end = (trip.itinerary or {}).get("endTime")
+            saving = p.get("savingMin")
+            if isinstance(end, (int, float)) and isinstance(saving, (int, float)):
+                trip.faster_switch_expect = {
+                    "tMs": t, "kind": p.get("kind"), "route": p.get("route"),
+                    "savingMin": saving,
+                    "expectedEndMs": int(end - saving * 60000)}
+        elif outcome == "offered":
+            self._rule_faster_route_storm(trip, t)
+
+    def _rule_faster_route_storm(self, trip, t):
+        """faster-route-storm: the offer card nagging instead of helping (56.1).
+
+        Warn, once per cause a ride: more than 2 offers inside 10 min, or more
+        than 2 pushes in the ride. (The Switch-that-arrived-late cause is
+        judged at the end of the ride, _rule_faster_route_late.)
+        """
+        offered = [e for e in trip.faster_entries
+                   if e.get("outcome") == "offered"]
+        recent = [e for e in offered
+                  if t - e["tMs"] <= FASTER_ROUTE_STORM_WINDOW_MS]
+        pushes = [e for e in offered if e.get("push") in ("sent", "replaced")]
+        ctx = {"offers": len(offered), "pushes": len(pushes),
+               "offerTimes": [fmt_hms(e["tMs"]) for e in offered]}
+        if (len(recent) > FASTER_ROUTE_STORM_OFFERS
+                and "offers" not in trip.faster_storm_fired):
+            trip.faster_storm_fired.add("offers")
+            self._finding(
+                trip, t, "faster-route-storm", "warn",
+                "%d faster-route offers within %d min (%s)" % (
+                    len(recent), FASTER_ROUTE_STORM_WINDOW_MS // 60000,
+                    ", ".join(fmt_hms(e["tMs"]) for e in recent)), ctx)
+        if (len(pushes) > FASTER_ROUTE_STORM_PUSHES
+                and "pushes" not in trip.faster_storm_fired):
+            trip.faster_storm_fired.add("pushes")
+            self._finding(
+                trip, t, "faster-route-storm", "warn",
+                "%d faster-route pushes in one ride" % len(pushes), ctx)
+
+    def _rule_faster_route_late(self, trip, t):
+        """A Switch whose new route then arrived later than the offer said.
+
+        At the end of the ride: the arrival the app latched (trip.arrived_ms)
+        against the old route's planned end minus the saving the card quoted.
+        Silent when the ride never arrived or the plan had no end time.
+        """
+        exp = trip.faster_switch_expect
+        if (not exp or trip.arrived_ms is None
+                or "late" in trip.faster_storm_fired):
+            return
+        late = trip.arrived_ms - exp["expectedEndMs"]
+        if late <= FASTER_ROUTE_LATE_TOL_MS:
+            return
+        trip.faster_storm_fired.add("late")
+        self._finding(
+            trip, t, "faster-route-storm", "warn",
+            "Switched at %s to a route offered as %.1f min faster, then"
+            " arrived %.1f min after the time the offer implied" % (
+                fmt_hms(exp["tMs"]), exp["savingMin"], late / 60000.0),
+            {"switchedAtMs": exp["tMs"], "route": exp.get("route"),
+             "savingMin": exp["savingMin"],
+             "offeredArrivalMs": exp["expectedEndMs"],
+             "arrivedMs": trip.arrived_ms,
+             "lateMin": round(late / 60000.0, 1)})
+
+    def faster_route_lines(self, trip):
+        """Report section: each offer of the ride, and the aboard cadence."""
+        L = ["## Faster-route offers (%d)" % sum(
+            1 for e in trip.faster_entries if e.get("outcome") == "offered"),
+            ""]
+        if not trip.faster_entries:
+            L.append("- (none)")
+        for e in trip.faster_entries:
+            amount = "%s min" % e.get("savingMin")
+            if e.get("kind") == "lessBike":
+                amount = "%s km less biking" % e.get("bikeSavedKm")
+                if e.get("laterMin"):
+                    amount += ", %s min later" % e.get("laterMin")
+            outcome = e.get("outcome")
+            label = {"switched": "Switch", "kept": "Keep mine",
+                     "expired": "expired", "offered": "offered"}.get(
+                         outcome, str(outcome))
+            extra = ""
+            if outcome == "offered":
+                extra = ", push %s" % (e.get("push") or "none")
+            elif e.get("why"):
+                extra = " (%s)" % e["why"]
+            L.append("- %s %s %s, %s%s [%s, %s]" % (
+                fmt_hms(e["tMs"]), e.get("kind"), amount, label, extra,
+                e.get("route"), e.get("source")))
+        L.append("")
+        L.append("## Aboard recorder cadence")
+        L.append("")
+        L.append("- " + self.snapshot_cadence_text(trip))
+        L.append("")
+        return L
+
+    @staticmethod
+    def snapshot_cadence_text(trip):
+        """Median spacing of REROUTE_SNAPSHOTs while aboard (56.2).
+
+        Only gaps between two consecutive snapshots that were both taken while
+        aboard count; the app's settled-aboard cadence is meant to be ~360 s
+        (it was ~90 s on the 2026-10-17 ride).
+        """
+        marks = trip.snapshot_marks
+        gaps = [(b[0] - a[0]) / 1000.0 for a, b in zip(marks, marks[1:])
+                if a[1] and b[1]]
+        if not gaps:
+            return ("no two REROUTE_SNAPSHOTs while aboard (%d snapshots in"
+                    " all)" % len(marks))
+        gaps.sort()
+        n = len(gaps)
+        med = gaps[n // 2] if n % 2 else (gaps[n // 2 - 1] + gaps[n // 2]) / 2.0
+        return ("median spacing of REROUTE_SNAPSHOTs while aboard: %.0f s"
+                " over %d gaps (min %.0f s, max %.0f s; %d snapshots in all)"
+                % (med, n, gaps[0], gaps[-1], len(marks)))
+
     def _on_reroute_snapshot(self, trip, t, p):
         """Fold in the periodic "alternatives to finish the trip" capture.
 
@@ -8129,6 +8284,7 @@ class RideWatch:
         """
         if not isinstance(p, dict) or p.get("__summary"):
             return
+        trip.snapshot_marks.append((t, trip.riding is not None))
         reason = p.get("reason")
         if reason not in (None, "periodic") and not trip.snapshot_reason_logged:
             trip.snapshot_reason_logged = True
@@ -9123,6 +9279,9 @@ class RideWatch:
             "riderNotes": trip.notes,
             "pagesSent": trip.pages_sent,
             "endReason": trip.end_reason,
+            # 56.1/56.2: the report's faster-route section and the aboard
+            # recorder cadence, ready to paste.
+            "fasterRouteSection": self.faster_route_lines(trip),
         }
         path = self._report_request_path(trip)
         with open(path, "w") as f:
@@ -9515,6 +9674,7 @@ class RideWatch:
         L.append("")
         L.extend(self._testable_rows_block(trip))
         L.append("")
+        L.extend(self.faster_route_lines(trip))
         L.append("## Where the evidence is")
         L.append("")
         L.append("- Raw telemetry: %s (filter on session `%s`)"
