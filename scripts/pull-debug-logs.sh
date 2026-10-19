@@ -23,7 +23,23 @@ SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=
 
 mkdir -p "$LOCAL_DIR"
 fails=0
+n=0
 while true; do
+  # Once a minute: a local day file LARGER than the server's cannot come from
+  # the mirror. A local writer (the retired house probe, backlog 16.7) diverged
+  # it, and --append-verify will rewrite it in place under the ride-watch
+  # follower. Say so loudly.
+  if [ $((n % 12)) = 0 ]; then
+    day="debug-$(date -u +%F).jsonl"
+    if [ -f "${LOCAL_DIR%/}/$day" ]; then
+      lsz=$(stat -c %s "${LOCAL_DIR%/}/$day" 2>/dev/null || echo 0)
+      rsz=$(ssh $SSH_OPTS "$REMOTE" "stat -c %s '${REMOTE_DIR%/}/$day'" 2>/dev/null || echo "")
+      if [ -n "$rsz" ] && [ "$lsz" -gt "$rsz" ]; then
+        echo "WARN: local $day ($lsz bytes) is larger than the server's ($rsz); rsync will rewrite it in place" >&2
+      fi
+    fi
+  fi
+  n=$((n + 1))
   # --append-verify suits append-only JSONL: it ships only the new tail and
   # re-checks the overlap, so a rotated or rewritten file still transfers whole.
   if rsync -az --append-verify --timeout=30 -e "ssh $SSH_OPTS" \

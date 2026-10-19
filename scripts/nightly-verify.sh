@@ -153,7 +153,12 @@ STATIC_CHECKS=(
   # this proves the transform still does, without needing a deploy to find out.
   "server-env-transform|bash $(dirname "$0")/../deployment/test-server-env.sh"
   "debug-log-payload-prod|python3 $(dirname "$0")/check-debug-log-payload.py --target prod"
-  "debug-log-payload-house|python3 $(dirname "$0")/check-debug-log-payload.py --target house"
+  # debug-log-payload-house is RETIRED (backlog 16.7): it appends a 900 KB probe
+  # into ~/otp-debug-logs/debug-<day>.jsonl on this box through the house sink,
+  # and that directory is the rsync mirror's own (pull-debug-logs.sh,
+  # --append-verify). The mirror then rewrote the day file in place under the
+  # ride-watch Tailer and a stretch of a live ride was never read. The prod
+  # check above still grades the real record path.
   # Asks the running OTP a real routing question, because the answer depends on
   # two artefacts that ship by different steps: router-config.json (--only
   # graph) and the jar built from the patched fork (--only jar otp). Either one
