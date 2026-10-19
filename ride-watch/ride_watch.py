@@ -651,6 +651,15 @@ FASTER_ROUTE_STORM_PUSHES = 2
 FASTER_ROUTE_LATE_TOL_MS = 2 * 60 * 1000
 # 54.3: a "Bus here" with the live board this far ahead is a bus laying over.
 BOARD_ARRIVAL_EARLY_MS = 2 * 60 * 1000
+# render-error-burst (59.1): MapLibre's TaskQueue.run has no try/finally, so one
+# throw leaves `_currentlyRunning` set and every later `_render` fails with
+# "Attempting to run(), but is already running" — 306 times in 7.5 min on
+# 2026-10-19 (08:47:38-08:55:07, ride mvfb1a71-x3jjwm), the map frozen under a
+# live Go Mode. The same message at least this many times inside the window,
+# with `_render` or "already running" in the message or stack, is that state.
+RENDER_ERROR_BURST_COUNT = 5
+RENDER_ERROR_BURST_WINDOW_MS = 60 * 1000
+RENDER_ERROR_MARKERS = ("_render", "already running")
 #
 # replan-refused-with-live-slack (29.2). The app's access-misses-board gate
 # (otprr replan-acceptance.ts accessBoardOverrunMs, slack
@@ -1405,6 +1414,9 @@ PAGE_RANK = {
     #                           ends at the door came back seconds ago. "Ask
     #                           again" is an instruction, and it expires.
     "unreachable-but-routable": 37,
+    # render-error-burst  the map has stopped drawing under a live Go Mode;
+    #                     force-quitting the app is the one thing that fixes it
+    "render-error-burst": 36,
     "notification-repeat": 35,
     "aboard-swap": 30,
     # session-restart-while-aboard  the app relaunched under a seated rider,
@@ -2243,6 +2255,8 @@ class Trip:
         self.searches = collections.OrderedDict()
         self.bike_egress_fired = set()            # searchIds already reported
         self.console_seen = set()
+        self.render_errors = {}                   # message -> recent tMs (59.1)
+        self.render_error_fired = False           # one finding+page a ride
         # The open wake-lock refusal burst, or None. One launch's ladder of
         # denials is one finding, so the warns are accumulated here and the
         # finding is emitted once the burst goes quiet (or the ride ends) —
@@ -2792,6 +2806,9 @@ class RideWatch:
             self._note_query_param(session, t, obj)
         elif typ == "@@router/LOCATION_CHANGE":
             self._rule_panel_torn_down(session, t, obj, trip)
+        elif kind == "error":
+            if trip is not None:
+                self._rule_render_error_burst(trip, t, obj)
         elif trip is not None:
             if kind == "console":
                 self._rule_console(trip, t, obj)
@@ -3988,6 +4005,7 @@ class RideWatch:
         "last_thread_push_ms", "notes", "report_path", "console_seen",
         "searches", "last_rider_action_ms", "wake_lock_bursts",
         "restart_aboard_count", "restart_in_trip_count", "teleport_paged",
+        "render_errors", "render_error_fired",
         "multi_stop", "segments_started",
     ))
 
@@ -8615,6 +8633,36 @@ class RideWatch:
             return
         self._finding(trip, t, "console-error", "info",
                       "console.error: %s" % msg[:120], {"message": msg})
+
+    def _rule_render_error_burst(self, trip, t, obj):
+        """render-error-burst: the map's render loop is dead (59.1).
+
+        >= RENDER_ERROR_BURST_COUNT identical `kind: "error"` records inside
+        RENDER_ERROR_BURST_WINDOW_MS whose message or stack names `_render` or
+        "already running". One finding and one page a ride: the rider can act
+        (force-quit the app), and the burst goes on for minutes.
+        """
+        msg = str(obj.get("message") or "")
+        stack = str(obj.get("stack") or "")
+        if not any(m in msg or m in stack for m in RENDER_ERROR_MARKERS):
+            return
+        key = msg[:200]
+        recent = [x for x in trip.render_errors.get(key, [])
+                  if t - x <= RENDER_ERROR_BURST_WINDOW_MS]
+        recent.append(t)
+        trip.render_errors[key] = recent
+        if trip.render_error_fired or len(recent) < RENDER_ERROR_BURST_COUNT:
+            return
+        trip.render_error_fired = True
+        self._finding(
+            trip, t, "render-error-burst", "page",
+            "%d identical render errors in %d s — the map has stopped drawing:"
+            " %s" % (len(recent), (recent[-1] - recent[0]) // 1000, key[:100]),
+            {"message": key, "count": len(recent), "firstMs": recent[0],
+             "windowMs": RENDER_ERROR_BURST_WINDOW_MS,
+             "stack": stack[:300]},
+            push_body="The map has stopped drawing. Force-quit and reopen the"
+                      " app; navigation keeps tracking underneath.")
 
     def _rule_wake_lock_denied(self, trip, t, obj):
         """The phone refused to stay awake while a trip was running.
