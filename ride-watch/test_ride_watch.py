@@ -1543,15 +1543,16 @@ class TestPageRanking(RuleTestCase):
         page_rules = {"stop-count-collapse", "itinerary-backwards",
                       "missed-bus-still-coming",
                       "missed-bus-while-riding", "replan-not-converging",
-                      "unreachable-but-routable", "notification-repeat",
-                      "aboard-swap", "session-restart-while-aboard",
+                      "unreachable-but-routable", "render-error-burst",
+                      "notification-repeat", "aboard-swap", "session-restart-while-aboard",
                       "riding-flip", "position-teleport", "deviated-streak"}
         self.assertEqual(page_rules, set(ride_watch.PAGE_RANK))
         self.assertEqual(
             ["stop-count-collapse", "itinerary-backwards",
              "missed-bus-still-coming",
              "missed-bus-while-riding", "replan-not-converging",
-             "unreachable-but-routable", "notification-repeat", "aboard-swap",
+             "unreachable-but-routable", "render-error-burst",
+             "notification-repeat", "aboard-swap",
              "session-restart-while-aboard", "riding-flip",
              "position-teleport", "deviated-streak"],
             sorted(ride_watch.PAGE_RANK, key=ride_watch.PAGE_RANK.get,
@@ -11197,6 +11198,58 @@ class TestFasterRouteOffers(RuleTestCase):
         watch = self.run_stream(self.base(), finalize=False)
         text = ride_watch.RideWatch.snapshot_cadence_text(watch.trips[SESSION])
         self.assertIn("no two REROUTE_SNAPSHOTs while aboard", text)
+
+
+class TestRenderErrorBurst(RuleTestCase):
+    """59.1: a dead MapLibre render loop repeats one error until force-quit."""
+
+    MSG = "Error: Attempting to run(), but is already running."
+
+    def burst(self, n, gap=1000, msg=None, stack="run@x.js:1 <- _render@x.js:2",
+              b=None):
+        b = b or StreamBuilder().start().advance(1000).progress()
+        for _ in range(n):
+            b.advance(gap)
+            b._envelope(kind="error", message=msg or self.MSG, stack=stack,
+                        source="capacitor://localhost/index.js", line=1, col=1)
+        return b
+
+    def hits(self, b):
+        watch = self.run_stream(b, finalize=False)
+        return watch, self.find(watch, "render-error-burst")
+
+    def test_five_in_a_minute_fires_once_and_pages(self):
+        watch, hits = self.hits(self.burst(30))
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["severity"], "page")
+        self.assertEqual(hits[0]["context"]["count"], 5)
+        sent = [p for p in watch.push_log if p.get("sent")]
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Force-quit", sent[0]["body"])
+
+    def test_four_does_not_fire(self):
+        _, hits = self.hits(self.burst(4))
+        self.assertEqual(hits, [])
+
+    def test_five_spread_over_more_than_a_minute_does_not_fire(self):
+        _, hits = self.hits(self.burst(5, gap=20000))
+        self.assertEqual(hits, [])
+
+    def test_unrelated_identical_errors_do_not_fire(self):
+        _, hits = self.hits(self.burst(10, msg="TypeError: boom",
+                                       stack="foo@x.js:1 <- bar@x.js:2"))
+        self.assertEqual(hits, [])
+
+    def test_render_in_stack_alone_counts(self):
+        _, hits = self.hits(self.burst(5, msg="TypeError: x is not a function"))
+        self.assertEqual(len(hits), 1)
+
+    def test_different_messages_do_not_pool(self):
+        b = StreamBuilder().start().advance(1000).progress()
+        for i in range(8):
+            self.burst(1, msg="Error: already running %d" % i, b=b)
+        _, hits = self.hits(b)
+        self.assertEqual(hits, [])
 
 
 if __name__ == "__main__":
