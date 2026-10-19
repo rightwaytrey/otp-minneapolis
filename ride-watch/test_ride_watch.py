@@ -5033,6 +5033,89 @@ class TestFollowerDiagnostics(unittest.TestCase):
         self.assertEqual(d["firstT"], T0)
         self.assertEqual(d["lastT"], T0 + 1000)
 
+    # -- 16.7: the mirror rewrites the day file in place under our offset ----
+
+    def rrec(self, i):
+        """Envelope shaped like the sink's: recv first, then an id."""
+        return {"recv": 1000.0 + i, "id": "r%d" % i, "t": T0 + i * 1000,
+                "session": SESSION, "type": "UPDATE_PROGRESS",
+                "payload": {"i": i}}
+
+    def ids(self, seen):
+        return [json.loads(l)["id"] for l in seen]
+
+    def test_in_place_rewrite_with_a_big_extra_line_loses_nothing(self):
+        self.append([self.rrec(i) for i in range(5)])
+        rewrites = []
+        tailer = ride_watch.Tailer(
+            self.log, on_rewrite=lambda why, d: rewrites.append(why))
+        self.addCleanup(tailer._close)
+        seen = []
+        tailer.poll(seen.append)
+        self.assertEqual(self.ids(seen), ["r0", "r1", "r2", "r3", "r4"])
+        old_offset = tailer.offset
+        # The house probe: a 900 KB line lands in the middle with an OLD recv
+        # (not newer than what was delivered), then the server's records catch
+        # up in place, growing the file well past the old offset.
+        probe = {"recv": 1002.5, "id": "probe", "payload": "x" * 900000}
+        recs = [self.rrec(i) for i in range(5)]
+        with open(self.path, "w") as f:
+            for r in recs[:3] + [probe] + recs[3:] + \
+                    [self.rrec(i) for i in range(5, 9)]:
+                f.write(json.dumps(r) + "\n")
+        self.assertGreater(os.path.getsize(self.path), old_offset + 900000)
+        tailer.poll(seen.append)
+        ids = self.ids(seen)
+        # r5..r8 each exactly once; nothing delivered twice.
+        self.assertEqual(ids[5:], ["r5", "r6", "r7", "r8"])
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(rewrites), 1)
+        self.assertIn("rewritten in place", rewrites[0])
+        # and the follower keeps following afterwards
+        self.append([self.rrec(9)])
+        tailer.poll(seen.append)
+        self.assertEqual(self.ids(seen)[-1], "r9")
+        self.assertEqual(len(rewrites), 1)
+
+    def test_a_shrunk_file_resyncs_instead_of_seeking_to_the_end(self):
+        self.append([self.rrec(i) for i in range(6)])
+        rewrites = []
+        tailer = ride_watch.Tailer(
+            self.log, on_rewrite=lambda why, d: rewrites.append(why))
+        self.addCleanup(tailer._close)
+        seen = []
+        tailer.poll(seen.append)
+        # Rewritten shorter (a dropped record), then newer records arrive.
+        with open(self.path, "w") as f:
+            for i in (0, 1, 2, 6, 7):
+                f.write(json.dumps(self.rrec(i)) + "\n")
+        self.assertLess(os.path.getsize(self.path), tailer.offset)
+        tailer.poll(seen.append)
+        self.assertEqual(self.ids(seen)[6:], ["r6", "r7"])
+        self.assertEqual(len(rewrites), 1)
+        self.assertIn("shrank", rewrites[0])
+
+    def test_normal_appends_and_partial_lines_are_not_a_rewrite(self):
+        rewrites = []
+        tailer = ride_watch.Tailer(
+            self.log, on_rewrite=lambda why, d: rewrites.append(why))
+        self.addCleanup(tailer._close)
+        seen = []
+        self.append([self.rrec(0), self.rrec(1)])
+        tailer.poll(seen.append)
+        half = json.dumps(self.rrec(2)) + "\n"
+        with open(self.path, "a") as f:
+            f.write(half[:20])
+        tailer.poll(seen.append)
+        with open(self.path, "a") as f:
+            f.write(half[20:])
+            f.write(json.dumps(self.rrec(3)) + "\n")
+        tailer.poll(seen.append)
+        self.append([self.rrec(4)])
+        tailer.poll(seen.append)
+        self.assertEqual(self.ids(seen), ["r0", "r1", "r2", "r3", "r4"])
+        self.assertEqual(rewrites, [])
+
     def test_a_poll_that_delivers_nothing_leaves_no_trace(self):
         """Otherwise the ring is 12 empty polls deep by the time it matters:
         the loop polls twice a second and a ride is mostly silence."""

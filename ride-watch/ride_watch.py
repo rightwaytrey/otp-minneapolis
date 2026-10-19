@@ -10352,9 +10352,34 @@ class RideWatch:
         self.write_status(force=True)
 
 
+    def note_stream_rewrite(self, why, detail):
+        """The follower found the day file rewritten under it (16.7): say so on
+        every active trip, because a stretch of records may never be read."""
+        now = int(time.time() * 1000)
+        seen = set()
+        for trip in list(self.trips.values()):
+            if id(trip) in seen:
+                continue
+            seen.add(id(trip))
+            self._finding(
+                trip, now, "stream-rewritten", "warn",
+                "the debug-log file was %s; the follower resynced by recv and "
+                "records written while it was off may be missing" % why,
+                dict(detail), thread_push=False)
+
+
 # ---------------------------------------------------------------------------
 # File following
 # ---------------------------------------------------------------------------
+
+
+_PEEK_RECV_RE = re.compile(rb'^\{"recv":\s*([0-9]+(?:\.[0-9]+)?)')
+
+
+def _peek_recv(raw):
+    """The envelope's leading `recv` (seconds) without parsing the line."""
+    m = _PEEK_RECV_RE.match(raw[:64])
+    return float(m.group(1)) if m else None
 
 
 def current_log_path():
@@ -10367,8 +10392,15 @@ class Tailer:
     """Follows the current UTC-day JSONL file; handles rollover, absence,
     truncation, and partial trailing lines."""
 
-    def __init__(self, log, drains=None):
+    def __init__(self, log, drains=None, on_rewrite=None):
         self.log = log
+        # Called as on_rewrite(reason, detail) after a rewrite/shrink resync,
+        # so the rule engine can file a `stream-rewritten` warn (backlog 16.7).
+        self.on_rewrite = on_rewrite
+        # `recv` of the last record handed to the rules: the one thing that
+        # still identifies "where we were" after the file was rewritten under
+        # our offset.
+        self.last_recv = None
         self.path = None
         self.fh = None
         self.offset = 0
@@ -10399,6 +10431,7 @@ class Tailer:
             return
         self.path = path
         self.buf = b""
+        self.last_recv = None
         if lookback_cb:
             # Startup: look at only the tail of the file and replay the last
             # few minutes, so an already-in-progress trip is picked up without
@@ -10421,6 +10454,8 @@ class Tailer:
                     recv = json.loads(raw).get("recv") or 0
                 except (ValueError, AttributeError):
                     continue
+                if recv:
+                    self.last_recv = recv
                 if recv >= cutoff:
                     lookback_cb(raw.decode("utf-8", "replace"))
                     n += 1
@@ -10468,12 +10503,16 @@ class Tailer:
         except OSError:
             return
         if size < self.offset:
-            # Truncated/replaced: reopen, skip anything stale.
-            self.log.warn("%s shrank (%d < %d); reopening at end" % (
-                self.path, size, self.offset))
-            self._open(self.path, seek_end=True)
+            # Shrunk (replaced, or rsync --append-verify rewrote it shorter).
+            # Seeking to the end here used to drop everything written since
+            # the last delivered record; resync by `recv` instead.
+            self._resync(on_line, "shrank (%d < %d)" % (size, self.offset))
             return
         if size == self.offset:
+            return
+        if self.offset > 0 and not self._offset_on_line_boundary():
+            self._resync(on_line, "rewritten in place (offset %d is not on a "
+                         "line boundary, size %d)" % (self.offset, size))
             return
         start_offset = self.offset
         self.fh.seek(self.offset)
@@ -10485,7 +10524,78 @@ class Tailer:
         delivered = [raw for raw in lines if raw.strip()]
         for raw in delivered:
             on_line(raw.decode("utf-8", "replace"))
+        for raw in reversed(delivered):
+            recv = _peek_recv(raw)
+            if recv is not None:
+                self.last_recv = recv
+                break
         self._note_drain(start_offset, delivered)
+
+    def _offset_on_line_boundary(self):
+        """True when the bytes we think we have already consumed still end in a
+        newline. The mirror (rsync --append-verify) rewrites a day file in
+        place when the local copy diverged from the server's (the nightly's
+        900 KB probe, written locally); our offset then lands mid-file."""
+        boundary = self.offset - len(self.buf)
+        if boundary <= 0:
+            return True
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(boundary - 1)
+                return f.read(1) == b"\n"
+        except OSError:
+            return True
+
+    def _resync(self, on_line, why):
+        """Find where we were by `recv`, not by byte offset (backlog 16.7).
+
+        Rescans from 0 for the first line whose recv is greater than the last
+        one delivered and resumes there. Repeats are the id dedupe's problem.
+        """
+        last = self.last_recv
+        self.log.warn("%s %s; resyncing by recv (last delivered %s)" % (
+            self.path, why, last))
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return
+        resume = None
+        pos = 0
+        skipped = 0
+        if last is not None:
+            try:
+                with open(self.path, "rb") as f:
+                    for raw in f:
+                        if not raw.endswith(b"\n"):
+                            resume = pos      # partial tail: leave for later
+                            break
+                        recv = _peek_recv(raw)
+                        if recv is not None and recv > last:
+                            resume = pos
+                            break
+                        pos += len(raw)
+                        skipped += 1
+                    else:
+                        resume = pos
+            except OSError:
+                return
+        if resume is None:
+            # Nothing delivered yet to anchor on: old behaviour, the end.
+            resume = size
+        self.log.warn("%s resuming at offset %d after skipping %d line(s)"
+                      % (self.path, resume, skipped))
+        self.offset = resume
+        self.buf = b""
+        if self.fh:
+            self.fh.seek(resume)
+        if self.on_rewrite:
+            try:
+                self.on_rewrite(why, {"resumeOffset": resume, "size": size,
+                                      "lastRecv": last})
+            except Exception as exc:  # never let a filing bug stop the tail
+                self.log.error("on_rewrite failed: %r" % exc)
+        if resume < size:
+            self._drain(on_line)
 
     def _note_drain(self, start_offset, delivered):
         """Record — and, at a rate limit, log — what one poll handed over.
@@ -10565,7 +10675,8 @@ def run_live(watch_dir=None):
              % (DAEMON_GIT_SHA, watch.dry_run, DEBUG_LOG_DIR, watch.watch_dir))
     # One ring, shared: the follower fills it, the rule engine prints it when
     # a trip opens. See Tailer._note_drain.
-    tailer = Tailer(log, drains=watch.stream_drains)
+    tailer = Tailer(log, drains=watch.stream_drains,
+                    on_rewrite=watch.note_stream_rewrite)
     stop = {"flag": False}
 
     def on_signal(signum, _frame):
