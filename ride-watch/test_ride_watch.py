@@ -3342,7 +3342,8 @@ class TestReportDeadline(RuleTestCase):
         path = watch.report_deadlines[0]["reportPath"]
         with open(path, "w") as f:
             f.write("# ride report\n")
-        watch.clock_ms += ride_watch.REPORT_DEADLINE_MS + 1000
+        watch.check_timers()
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS + 1000   # 64.4
         watch.check_timers()
         self.assertEqual(self.fallbacks(watch), [])
         self.assertEqual(watch.report_deadlines, [])
@@ -3751,6 +3752,8 @@ class TestWrapUpPaneOutlivesTheNextRide(RuleTestCase):
         with open(watch.report_deadlines[0]["reportPath"], "w") as f:
             f.write("# ride report\n")
         watch.check_timers()
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS + 1000
+        watch.check_timers()
         fake = FakeTmux([pane])
         watch._tmux = fake
         watch._kill_previous_threads(keep="ride-9999")
@@ -4137,6 +4140,8 @@ class TestRideConsoleWrapsUpOnComplete(RuleTestCase):
         pane = thread.spawns[0][0]
         self.land_report(watch)
         watch.check_timers()
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS + 1000
+        watch.check_timers()
         self.assertEqual(thread.kills, [], "reaped before the grace period")
         watch.clock_ms += ride_watch.THREAD_REAP_GRACE_MS + 1000
         watch.check_timers()
@@ -4183,6 +4188,8 @@ class TestRideConsoleWrapsUpOnComplete(RuleTestCase):
         self.assertEqual(fake.killed(), [])
         # ...and then the wrap-up lands, and the second sweep closes it.
         self.land_report(watch)
+        watch.check_timers()
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS + 1000
         watch.check_timers()
         watch.clock_ms += ride_watch.THREAD_REAP_GRACE_MS + 1000
         watch.check_timers()
@@ -7944,17 +7951,46 @@ class TestPromotionGate(RuleTestCase):
         self.assertEqual(watch.report_deadlines, [])
         self.assertEqual(self.fallbacks(watch), [])
 
-    def test_a_report_with_nothing_to_promote_settles_at_once(self):
-        """The terminating condition that matters most: a clean ride must not
-        hold a console open for eight minutes."""
+    def test_a_zero_report_settles_only_after_it_stops_changing(self):
+        """64.4: a clean ride must not hold a console open for eight minutes,
+        but a 0 is only final once the report has been quiet for
+        REPORT_QUIET_MS."""
         watch = self.ended_ride()
         self.write_report(n=0)
         watch.clock_ms += 1000
+        watch.check_timers()
+        watch.clock_ms += 120 * 1000
+        watch.check_timers()
+        self.assertEqual(len(watch.report_deadlines), 1)   # old code reaped here
+        self.assertEqual(watch.thread_reaps, [])
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS
         watch.check_timers()
         self.assertEqual(watch.report_deadlines, [])
         self.assertEqual([r["why"] for r in watch.thread_reaps],
                          ["wrap-up landed, nothing to promote"])
         self.assertEqual(self.fallbacks(watch), [])
+
+    def test_a_zero_report_rewritten_with_bugs_opens_the_hold(self):
+        watch = self.ended_ride()
+        self.write_report(n=0)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        watch.clock_ms += 110 * 1000
+        watch.check_timers()
+        self.write_report(n=3)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines[0]["realBugs"], 3)
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS + 1000
+        watch.check_timers()
+        self.assertEqual(len(watch.report_deadlines), 1)   # held, not reaped
+        self.assertEqual(watch.thread_reaps, [])
+        self.promote(self.plan)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertEqual([r["why"] for r in watch.thread_reaps],
+                         ["wrap-up landed and promoted"])
 
     def test_the_window_expires_and_pages_once(self):
         watch = self.ended_ride()
