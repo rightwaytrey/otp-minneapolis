@@ -188,7 +188,10 @@ The steps:
    (it appends `-ride2`, `-ride3`, … when it must). Triage
    every finding and every rider note as **real-bug**, **app-behaved-correctly**,
    **watcher-false-positive**, or **no-rule-covers-this**, each with the
-   telemetry that decides it — timestamps and values, not adjectives. Correlate
+   telemetry that decides it — timestamps and values, not adjectives. Write the
+   whole report in one go, verdicts included: the daemon counts real bugs from
+   what is on disk, and a first draft with the verdicts left for later reads as
+   a clean ride. Correlate
    a note with a machine finding within a minute or two: one incident, one
    entry. `ride-watch/report-prompt.md` is the long-form brief for this and is
    still worth reading if the ride was complicated.

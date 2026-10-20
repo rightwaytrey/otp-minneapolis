@@ -1030,6 +1030,14 @@ THREAD_REAP_GRACE_MS = 2 * 60 * 1000
 # enough that the console still closes inside twenty minutes of the ride. A
 # report with nothing to promote never enters the window at all.
 PROMOTION_DEADLINE_MS = 8 * 60 * 1000
+# A report that counts 0 real bugs is not settled until it has stopped
+# changing for this long (64.4). The count used to be taken once, when the file
+# first existed, and a 0 reaped the console 120 s later; but the report agent
+# writes a first draft and then rewrites it with the verdicts, and the drafts
+# were ~110 s apart, so a 60 s wait would still have missed the second one.
+# Three minutes clears that gap. A clean ride's console stays up that much
+# longer; a ride with a real bug in its second draft is no longer lost.
+REPORT_QUIET_MS = 3 * 60 * 1000
 # The one backlog, and the record file beside it. Either moving counts: a
 # wrap-up whose findings all dedupe onto existing rows edits the backlog, and
 # one that also closes a row moves it into the record — both are the promotion
@@ -5428,10 +5436,17 @@ class RideWatch:
                 if entry.get("reportLandedMs") is None:
                     entry["reportLandedMs"] = int(now)
                     entry["realBugs"] = self._report_real_bugs(path)
+                    entry["reportSig"] = self._report_signature(path)
+                    entry["reportChangedMs"] = int(now)
                     changed = True
                     self.log.info(
                         "wrap-up landed for %s: %s (%s real bug(s) named)"
                         % (entry.get("session"), path, entry["realBugs"]))
+                if not entry.get("realBugs") and \
+                        self._report_still_changing(entry, path, now):
+                    changed = True
+                    keep.append(entry)
+                    continue
                 if self._settle_promotion(entry, now):
                     changed = True
                     continue
@@ -5488,6 +5503,40 @@ class RideWatch:
             # moment a window opens or closes rather than on the next event
             # that happens to dirty it.
             self._mark_dirty()
+
+    @staticmethod
+    def _report_signature(path):
+        """Size + hash of the report, or None if unreadable. (64.4)"""
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+        return (len(data), hashlib.md5(data).hexdigest())
+
+    def _report_still_changing(self, entry, path, now):
+        """True while a zero-bug report may yet be rewritten. (64.4)
+
+        Re-reads the report on every tick. A changed signature restarts the
+        quiet clock (the daemon's own `now`, so no test needs utime) and
+        recounts; a count that rose opens the normal promotion hold by moving
+        reportLandedMs to now. A 0 is only final once REPORT_QUIET_MS has
+        passed with no change.
+        """
+        sig = self._report_signature(path)
+        if sig is not None and sig != entry.get("reportSig"):
+            entry["reportSig"] = sig
+            entry["reportChangedMs"] = int(now)
+            entry["realBugs"] = self._report_real_bugs(path)
+            self.log.info(
+                "report for %s changed: now %s real bug(s) named"
+                % (entry.get("session"), entry["realBugs"]))
+            if entry["realBugs"]:
+                entry["reportLandedMs"] = int(now)
+                return False
+            return True
+        quiet = now - entry.get("reportChangedMs", entry.get("reportLandedMs", now))
+        return quiet < REPORT_QUIET_MS
 
     def _report_real_bugs(self, path):
         """How many findings this report calls real bugs. 0 = nothing to promote.
