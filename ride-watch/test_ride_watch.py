@@ -10234,6 +10234,86 @@ def board_live(b, board_ms, realtime=True, floor=False, leg=1):
         "alightEpoch": board_ms + 600000, "realtime": True}})
 
 
+class TestProgressWithoutMotionRejoin(RuleTestCase):
+    """67.5: a genuine route rejoin is not progress without motion.
+
+    2026-10-20 09:16:58 — the projection sat at 1.0 % through a deviated run
+    whose distanceFromRoute was live (127 -> 207 -> 177 -> 99 m, 270 m of GPS
+    travel), then the first on-route tick read 91 %. 2026-09-22 09:27:43 is
+    the opposite shape: distanceFromRoute pinned bit for bit at 101.52 m, a
+    stuck projection released on an on_track tick — 12.17's freeze, a defect.
+    """
+
+    def ride(self):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=1.0)
+        return b
+
+    def run_off(self, b, dists, prog, status="deviated"):
+        for i, d in enumerate(dists):
+            b.advance(1000).position_metres_north(5 * (i + 1))
+            self.last_m = 5 * (i + 1)
+            b.route_match(d, leg=0, on_route=False)
+            b.progress(leg=0, prog=prog, status=status)
+        return b
+
+    def suppressed_logged(self, watch):
+        with open(watch.log.path) as f:
+            return "rejoin after a real excursion" in f.read()
+
+    def test_live_run_then_release_is_suppressed_with_a_log_line(self):
+        b = self.ride()
+        self.run_off(b, [127.1, 160.0, 207.6, 177.3, 140.0, 108.7], 1.0)
+        b.advance(1000).position_metres_north(self.last_m + 2).route_match(
+            90.2, leg=0, on_route=True)
+        b.progress(leg=0, prog=91.3, status="behind")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "progress-without-motion"), [],
+                         self.rules(watch))
+        self.assertTrue(self.suppressed_logged(watch))
+
+    def test_suppression_spends_the_cooldown(self):
+        b = self.ride()
+        self.run_off(b, [127.1, 207.6, 108.7], 1.0)
+        b.advance(1000).position_metres_north(self.last_m + 2).progress(
+            leg=0, prog=91.3, status="behind")
+        b.advance(60000).position_metres_north(self.last_m + 4).progress(
+            leg=0, prog=99.0, status="behind")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "progress-without-motion"), [])
+
+    def test_pinned_distance_run_still_fires(self):
+        """09-22 09:27:43: 101.5 m bit for bit, then 5.635 -> 23.15 %."""
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=5.6)
+        self.run_off(b, [101.52468578276265] * 19, 5.635)
+        b.advance(1000).position_metres_north(5 * 19 + 2).route_match(
+            99.0, leg=0, on_route=True)
+        b.progress(leg=0, prog=23.15)
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1,
+                         self.rules(watch))
+
+    def test_pinned_distance_run_fires_even_when_far(self):
+        """A stuck projection is stuck at any distance."""
+        b = self.ride()
+        self.run_off(b, [250.0] * 10, 1.0)
+        b.advance(1000).position_metres_north(self.last_m + 2).progress(
+            leg=0, prog=40.0, status="behind")
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1,
+                         self.rules(watch))
+
+    def test_live_run_under_the_threshold_still_fires(self):
+        b = self.ride()
+        self.run_off(b, [60.0, 90.0, 133.8, 110.0, 80.0], 1.0)
+        b.advance(1000).position_metres_north(self.last_m + 2).progress(
+            leg=0, prog=60.0, status="behind")
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1,
+                         self.rules(watch))
+
+
 class TestBoardArrivalBusNotHere(RuleTestCase):
     """54.3: "Bus here - 539" at 21:39:31 with the live board at 21:53:00."""
 
