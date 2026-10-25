@@ -184,6 +184,11 @@ cross-referenced here in one line>
 min/km, Switch / Keep mine / expired, push; then the aboard recorder cadence
 median — about 360 s once the settled-aboard cadence works, 90 s if not)>
 
+## Auto
+<only when the request has an `autoSection` (the trip had Auto on): paste its
+lines verbatim — preset(s), each switch, undos, holds counted by why. Omit the
+heading entirely when there is no `autoSection`.>
+
 ## Rule tuning
 <any rule that misfired, and the threshold or guard that would stop it; plus
 any rule that *should exist* because a note caught something no rule did>

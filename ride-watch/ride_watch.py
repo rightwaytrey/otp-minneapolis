@@ -662,6 +662,19 @@ ROUTE_POLL_KEEP = 32
 # explain the gap.
 BOARD_ARRIVAL_FAR_BASE_M = 400.0
 BOARD_ARRIVAL_FAR_SPEED_MPS = 15.0
+# auto-switch-flap (65.2 B5): Auto mode's own switches. More than this many in
+# one trip, or a switch undone / reversed inside the window, is Auto changing
+# its mind. Auto's re-plans (AUTO_REPLAN reason auto-switch*, auto-board-stop)
+# are exempt from reroute-storm; this rule is what watches them instead.
+AUTO_FLAP_MAX_SWITCHES = 3
+AUTO_FLAP_WINDOW_MS = 10 * 60 * 1000
+
+
+def is_auto_switch_reason(reason):
+    return isinstance(reason, str) and (
+        reason.startswith("auto-switch") or reason.startswith("auto-board-stop"))
+
+
 # faster-route-storm (56.1): the app caps itself at 3 offers and 2 pushes a ride
 # (faster-route.ts MAX_FASTER_ROUTE_*); "more than 2 offers in 10 min" and "more
 # than 2 pushes" are the daemon's own tighter reading of the same thing.
@@ -2221,6 +2234,12 @@ class Trip:
         self.faster_entries = []
         self.faster_storm_fired = set()
         self.faster_switch_expect = None           # {"tMs","expectedEndMs",...}
+        # 65.2 B5: Auto mode. Every SET_AUTO_MODE [(tMs, on, preset)] and
+        # every AUTO_SWITCH entry [{"tMs", ...payload}]; empty on any ride
+        # that never turned Auto on (the report then has no Auto section).
+        self.auto_modes = []
+        self.auto_entries = []
+        self.auto_flap_fired = set()
         # 56.2: every REROUTE_SNAPSHOT as (tMs, aboard) for the cadence line.
         self.snapshot_marks = []
         # 29.2: the newest SET_LIVE_LEG_TIMES entry per leg key ("1"), with
@@ -2911,6 +2930,10 @@ class RideWatch:
                 self._on_reroute_snapshot(trip, t, obj.get("payload") or {})
             elif typ == "FASTER_ROUTE_OFFER":
                 self._on_faster_route_offer(trip, t, obj.get("payload") or {})
+            elif typ == "SET_AUTO_MODE":
+                self._on_set_auto_mode(trip, t, obj.get("payload") or {})
+            elif typ == "AUTO_SWITCH":
+                self._on_auto_switch(trip, t, obj.get("payload") or {})
             elif typ in ("REMEMBER_SEARCH", "ROUTING_REQUEST"):
                 self._note_search(trip, t, typ, obj.get("payload"))
             elif typ == "ROUTING_RESPONSE":
@@ -8113,6 +8136,11 @@ class RideWatch:
         # Whatever this re-plan turns out to be, its AUTO_REPLAN verdict is
         # still to come and is the SAME re-plan; park it so the counter does
         # not see one event twice (17.9d).
+        if is_auto_switch_reason(p.get("reason")):
+            # 65.2: Auto's own switch is a decision the rider asked for, not
+            # the app re-planning in circles; flapping has its own rule.
+            self._note_replan(trip, t, p.get("reason") or "reroute")
+            return
         self._park_pending_reroute(trip, t, p.get("reason"))
         if p.get("autoApply") is not True:
             self._note_replan(trip, t, p.get("reason") or "reroute")
@@ -8164,6 +8192,9 @@ class RideWatch:
             return
         reason = p.get("reason")
         self._rule_replan_refused_with_live_slack(trip, t, p)
+        if is_auto_switch_reason(reason):
+            # 65.2: exempt from the reroute-storm rule (see auto-switch-flap).
+            return
         paired = self._pair_pending_reroute(trip, t, reason)
         if paired is not None:
             # The verdict on a START_REROUTE that was already counted: give
@@ -8373,6 +8404,143 @@ class RideWatch:
              "offeredArrivalMs": exp["expectedEndMs"],
              "arrivedMs": trip.arrived_ms,
              "lateMin": round(late / 60000.0, 1)})
+
+    # --- 65.2 B5: Auto mode ------------------------------------------------
+
+    def _on_set_auto_mode(self, trip, t, p):
+        """The rider's Auto chip / preset sheet: { on, preset, source }."""
+        if not isinstance(p, dict) or p.get("__summary"):
+            return
+        trip.auto_modes.append((int(t), bool(p.get("on")), p.get("preset")))
+
+    def _on_auto_switch(self, trip, t, p):
+        """One no-tap Auto decision with a pick: switched | undone | held.
+
+        Scalar payload (otprr go-mode.ts recordAutoSwitch): outcome, why,
+        preset, aboard, fromRouteSet, toRouteSet, route, stop, savingMin,
+        bikeSavedKm, changesSaved, switches, push, undoUntilMs, switchId.
+        """
+        if not isinstance(p, dict) or p.get("__summary"):
+            return
+        entry = dict(p)
+        entry["tMs"] = t
+        trip.auto_entries.append(entry)
+        if p.get("outcome") in ("switched", "undone"):
+            self._rule_auto_switch_flap(trip, t, entry)
+
+    def _rule_auto_switch_flap(self, trip, t, entry):
+        """auto-switch-flap: Auto changing its mind instead of helping.
+
+        Once per cause a ride: more than AUTO_FLAP_MAX_SWITCHES switches, a
+        switch undone within AUTO_FLAP_WINDOW_MS, or a switch that goes back
+        to the route set the previous one left within the same window.
+        """
+        switched = [e for e in trip.auto_entries
+                    if e.get("outcome") == "switched"]
+        preset = entry.get("preset")
+        if entry.get("outcome") == "switched":
+            if (len(switched) > AUTO_FLAP_MAX_SWITCHES
+                    and "count" not in trip.auto_flap_fired):
+                trip.auto_flap_fired.add("count")
+                self._finding(
+                    trip, t, "auto-switch-flap", "warn",
+                    "Auto (%s) switched %d times in one trip"
+                    % (preset, len(switched)),
+                    {"cause": "count", "preset": preset,
+                     "switches": len(switched)})
+            prev = switched[-2] if len(switched) > 1 else None
+            if (prev is not None and "reversed" not in trip.auto_flap_fired
+                    and t - prev["tMs"] <= AUTO_FLAP_WINDOW_MS
+                    and entry.get("toRouteSet") is not None
+                    and entry.get("toRouteSet") == prev.get("fromRouteSet")
+                    and entry.get("fromRouteSet") == prev.get("toRouteSet")):
+                trip.auto_flap_fired.add("reversed")
+                self._finding(
+                    trip, t, "auto-switch-flap", "warn",
+                    "Auto (%s) switched back to %s %.1f min after leaving it"
+                    % (preset, entry.get("toRouteSet"),
+                       (t - prev["tMs"]) / 60000.0),
+                    {"cause": "reversed", "preset": preset,
+                     "fromRouteSet": entry.get("fromRouteSet"),
+                     "toRouteSet": entry.get("toRouteSet"),
+                     "gapMin": round((t - prev["tMs"]) / 60000.0, 1)})
+        elif "undone" not in trip.auto_flap_fired:
+            mate = None
+            for e in reversed(switched):
+                if (entry.get("switchId") is not None
+                        and e.get("switchId") == entry.get("switchId")):
+                    mate = e
+                    break
+            if mate is None and switched:
+                mate = switched[-1]
+            gap = (t - mate["tMs"]) if mate else None
+            if gap is None or gap <= AUTO_FLAP_WINDOW_MS:
+                trip.auto_flap_fired.add("undone")
+                self._finding(
+                    trip, t, "auto-switch-flap", "warn",
+                    "Auto (%s) switch undone%s" % (
+                        preset, "" if gap is None
+                        else " %.1f min after it" % (gap / 60000.0)),
+                    {"cause": "undone", "preset": preset,
+                     "route": (mate or entry).get("route"),
+                     "gapMin": None if gap is None
+                     else round(gap / 60000.0, 1)})
+
+    def auto_lines(self, trip):
+        """Report section for a trip that had Auto on; [] for any other."""
+        if not trip.auto_modes and not trip.auto_entries:
+            return []
+        presets = []
+        for _, _, preset in trip.auto_modes:
+            if preset and preset not in presets:
+                presets.append(preset)
+        for e in trip.auto_entries:
+            if e.get("preset") and e["preset"] not in presets:
+                presets.append(e["preset"])
+        L = ["## Auto", ""]
+        L.append("- Preset%s: %s" % ("s" if len(presets) > 1 else "",
+                                     ", ".join(presets) or "(unknown)"))
+        for ms, on, preset in trip.auto_modes:
+            L.append("- %s Auto %s (%s)" % (
+                fmt_hms(ms), "on" if on else "off", preset))
+        held = collections.Counter()
+        switches = 0
+        undos = 0
+        for e in trip.auto_entries:
+            outcome = e.get("outcome")
+            if outcome == "held":
+                held[e.get("why") or "unknown"] += 1
+                continue
+            if outcome == "switched":
+                switches += 1
+                bits = []
+                if e.get("savingMin") is not None:
+                    bits.append("saves %s min" % e["savingMin"])
+                if e.get("bikeSavedKm"):
+                    bits.append("%s km less biking" % e["bikeSavedKm"])
+                if e.get("changesSaved"):
+                    bits.append("%s fewer changes" % e["changesSaved"])
+                L.append("- %s switch %s -> %s (%s)%s [%s%s]" % (
+                    fmt_hms(e["tMs"]), e.get("fromRouteSet") or "?",
+                    e.get("toRouteSet") or e.get("route") or "?",
+                    ", ".join(bits) or "no saving recorded",
+                    " at %s" % e["stop"] if e.get("stop") else "",
+                    "aboard" if e.get("aboard") else "off the bus",
+                    ", push %s" % e["push"] if e.get("push") else ""))
+            elif outcome == "undone":
+                undos += 1
+                L.append("- %s undone by %s" % (
+                    fmt_hms(e["tMs"]), e.get("why") or "rider"))
+        L.append("- Switches: %d, undos: %d" % (switches, undos))
+        if held:
+            L.append("- Held: %d (%s)" % (
+                sum(held.values()),
+                ", ".join("%s x%d" % (k, v) for k, v in
+                          sorted(held.items(), key=lambda kv: (-kv[1], kv[0])))))
+        else:
+            L.append("- Held: 0")
+        L.append("")
+        return L
 
     def faster_route_lines(self, trip):
         """Report section: each offer of the ride, and the aboard cadence."""
@@ -9482,6 +9650,8 @@ class RideWatch:
             # recorder cadence, ready to paste.
             "fasterRouteSection": self.faster_route_lines(trip),
         }
+        if trip.auto_modes or trip.auto_entries:
+            req["autoSection"] = self.auto_lines(trip)
         path = self._report_request_path(trip)
         with open(path, "w") as f:
             json.dump(req, f, indent=2)
@@ -9874,6 +10044,7 @@ class RideWatch:
         L.extend(self._testable_rows_block(trip))
         L.append("")
         L.extend(self.faster_route_lines(trip))
+        L.extend(self.auto_lines(trip))
         L.append("## Where the evidence is")
         L.append("")
         L.append("- Raw telemetry: %s (filter on session `%s`)"
