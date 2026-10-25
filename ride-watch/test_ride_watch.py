@@ -11403,6 +11403,167 @@ class TestRowsThisRideCanTest(RuleTestCase):
         self.assertIn("## Rows this ride can test", p)
 
 
+class TestAutoMode(RuleTestCase):
+    """65.2 B5: the Auto report section, auto-switch-flap, storm exemption."""
+
+    def base(self):
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=40.0)
+        return b
+
+    def mode(self, b, on=True, preset="fastest"):
+        return b.action("SET_AUTO_MODE", {"on": on, "preset": preset,
+                                          "source": "chip"})
+
+    def sw(self, b, outcome="switched", frm="14", to="18", why=None,
+           preset="fastest", aboard=False, sid="s1", saving=4.2):
+        return b.action("AUTO_SWITCH", {
+            "aboard": aboard, "bikeSavedKm": None, "changesSaved": None,
+            "fromRouteSet": frm, "outcome": outcome, "preset": preset,
+            "push": "sent" if outcome == "switched" else None,
+            "route": to, "savingMin": saving, "stop": None, "switches": 1,
+            "switchId": sid, "tMs": b.t, "toRouteSet": to,
+            "undoUntilMs": None, "why": why})
+
+    def replan(self, b, reason):
+        return b.action("AUTO_REPLAN", {
+            "accepted": True, "autoApply": True, "heldBoardMissed": False,
+            "originGapM": None, "planLeftByRider": False,
+            "projectedAtMs": None, "projectedM": 0, "reason": reason,
+            "refusedBecause": None, "tMs": b.t})
+
+    def flaps(self, watch):
+        return self.find(watch, "auto-switch-flap")
+
+    def test_section_lists_preset_switch_undo_and_counts_holds(self):
+        b = self.base()
+        self.mode(b, preset="leastBike")
+        b.advance(60000)
+        self.sw(b, preset="leastBike", frm="14", to="18")
+        b.advance(120000)
+        self.sw(b, "undone", why="rider", preset="leastBike")
+        for _ in range(3):
+            b.advance(30000)
+            self.sw(b, "held", why="confirming", preset="leastBike")
+        b.advance(30000)
+        self.sw(b, "held", why="cap", preset="leastBike")
+        watch = self.run_stream(b, finalize=False)
+        text = "\n".join(watch.auto_lines(watch.trips[SESSION]))
+        self.assertIn("## Auto", text)
+        self.assertIn("Preset: leastBike", text)
+        self.assertIn("switch 14 -> 18 (saves 4.2 min)", text)
+        self.assertIn("undone by rider", text)
+        self.assertIn("Switches: 1, undos: 1", text)
+        self.assertIn("Held: 4 (confirming x3, cap x1)", text)
+
+    def test_section_is_in_the_status_doc_and_request(self):
+        b = self.base()
+        self.mode(b)
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips[SESSION]
+        self.assertIn("## Auto", "\n".join(watch.auto_lines(trip)))
+
+    def test_four_switches_flap(self):
+        b = self.base()
+        self.mode(b)
+        routes = ["14", "18", "21", "5", "9"]
+        for i in range(4):
+            b.advance(15 * 60000)
+            self.sw(b, frm=routes[i], to=routes[i + 1], sid="s%d" % i)
+        watch = self.run_stream(b, finalize=False)
+        f = self.flaps(watch)
+        self.assertEqual(len(f), 1, self.rules(watch))
+        self.assertEqual(f[0]["context"]["cause"], "count")
+        self.assertEqual(f[0]["context"]["preset"], "fastest")
+
+    def test_three_switches_do_not_flap(self):
+        b = self.base()
+        self.mode(b)
+        routes = ["14", "18", "21", "5"]
+        for i in range(3):
+            b.advance(15 * 60000)
+            self.sw(b, frm=routes[i], to=routes[i + 1], sid="s%d" % i)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.flaps(watch), [])
+
+    def test_undone_within_ten_minutes_flaps(self):
+        b = self.base()
+        self.mode(b, preset="simplest")
+        b.advance(60000)
+        self.sw(b, preset="simplest")
+        b.advance(4 * 60000)
+        self.sw(b, "undone", why="rider", preset="simplest")
+        watch = self.run_stream(b, finalize=False)
+        f = self.flaps(watch)
+        self.assertEqual(len(f), 1, self.rules(watch))
+        self.assertEqual(f[0]["context"]["cause"], "undone")
+        self.assertEqual(f[0]["context"]["preset"], "simplest")
+
+    def test_undone_after_ten_minutes_does_not(self):
+        b = self.base()
+        self.mode(b)
+        self.sw(b)
+        b.advance(11 * 60000)
+        self.sw(b, "undone", why="rider")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.flaps(watch), [])
+
+    def test_reversal_within_ten_minutes_flaps(self):
+        b = self.base()
+        self.mode(b)
+        b.advance(60000)
+        self.sw(b, frm="14", to="18", sid="a")
+        b.advance(5 * 60000)
+        self.sw(b, frm="18", to="14", sid="b")
+        watch = self.run_stream(b, finalize=False)
+        f = self.flaps(watch)
+        self.assertEqual(len(f), 1, self.rules(watch))
+        self.assertEqual(f[0]["context"]["cause"], "reversed")
+
+    def test_reversal_after_ten_minutes_does_not(self):
+        b = self.base()
+        self.mode(b)
+        self.sw(b, frm="14", to="18", sid="a")
+        b.advance(12 * 60000)
+        self.sw(b, frm="18", to="14", sid="b")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.flaps(watch), [])
+
+    def test_auto_replans_are_exempt_from_the_storm(self):
+        b = self.base()
+        self.mode(b)
+        for reason in ("auto-switch", "auto-switch-aboard", "auto-switch-undo",
+                       "auto-board-stop", "auto-switch", "auto-board-stop"):
+            b.advance(20000)
+            self.replan(b, reason)
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(self.find(watch, "reroute-storm"), [])
+        self.assertEqual(len(watch.trips[SESSION].reroute_times), 0)
+
+    def test_other_replans_still_storm(self):
+        b = self.base()
+        for _ in range(6):
+            b.advance(20000)
+            self.replan(b, "quiet-replan-scoped")
+        watch = self.run_stream(b, finalize=False)
+        self.assertEqual(len(self.find(watch, "reroute-storm")), 1,
+                         self.rules(watch))
+
+    def test_no_auto_records_means_no_section_and_no_finding(self):
+        watch = self.run_stream(self.base(), finalize=False)
+        trip = watch.trips[SESSION]
+        self.assertEqual(watch.auto_lines(trip), [])
+        self.assertEqual(self.flaps(watch), [])
+        self.assertFalse(trip.auto_modes or trip.auto_entries)
+
+    def test_auto_off_only_still_reports_the_mode(self):
+        b = self.base()
+        self.mode(b, on=False)
+        watch = self.run_stream(b, finalize=False)
+        text = "\n".join(watch.auto_lines(watch.trips[SESSION]))
+        self.assertIn("Auto off", text)
+
+
 class TestFasterRouteOffers(RuleTestCase):
     """56.1: the offer section, faster-route-storm, and the 56.2 cadence."""
 
