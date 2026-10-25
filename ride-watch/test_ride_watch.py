@@ -404,10 +404,14 @@ class StreamBuilder:
             ntype="DESTINATION_UNREACHABLE",
             nid="DESTINATION_UNREACHABLE_destination_%d" % self.t)
 
-    def route_match(self, dist, leg=1, on_route=True):
-        return self.action("UPDATE_ROUTE_MATCH", {
-            "legIndex": leg, "distanceFromRoute": dist,
-            "progressAlongLeg": 0.1, "isOnRoute": on_route})
+    def route_match(self, dist, leg=1, on_route=True, stamp=None):
+        """`stamp` = matchedAtMs (the client sends it since otprr 033f0be52);
+        omitted = an older client, which the rejoin rule treats as unknown."""
+        p = {"legIndex": leg, "distanceFromRoute": dist,
+             "progressAlongLeg": 0.1, "isOnRoute": on_route}
+        if stamp is not None:
+            p["matchedAtMs"] = stamp
+        return self.action("UPDATE_ROUTE_MATCH", p)
 
     def location(self, pathname, first=False):
         """A `@@router/LOCATION_CHANGE`, in the shape the real records carry.
@@ -10237,81 +10241,196 @@ def board_live(b, board_ms, realtime=True, floor=False, leg=1):
 class TestProgressWithoutMotionRejoin(RuleTestCase):
     """67.5: a genuine route rejoin is not progress without motion.
 
-    2026-10-20 09:16:58 — the projection sat at 1.0 % through a deviated run
-    whose distanceFromRoute was live (127 -> 207 -> 177 -> 99 m, 270 m of GPS
-    travel), then the first on-route tick read 91 %. 2026-09-22 09:27:43 is
-    the opposite shape: distanceFromRoute pinned bit for bit at 101.52 m, a
-    stuck projection released on an on_track tick — 12.17's freeze, a defect.
+    2026-10-20 09:16:58 — a deviated run whose matches carried fresh
+    `matchedAtMs` stamps (an honest projection, 588 m off at the farthest),
+    then a first on-route tick that read 91 %. 2026-09-22 09:27:43 is the
+    opposite shape: one stamp and a bit-identical 101.52 m for 18 of 19 ticks,
+    a frozen projection released on an on_track tick — 12.17's freeze, a
+    defect. The discriminator is the hold class of the last deviated match.
     """
+
+    LIVE = [127.1, 160.0, 207.6, 177.3, 140.0, 108.7]
 
     def ride(self):
         b = StreamBuilder().start(missed_bus_itinerary())
         b.advance(1000).position().progress(leg=0, prog=1.0)
         return b
 
-    def run_off(self, b, dists, prog, status="deviated"):
+    def run_off(self, b, dists, prog=1.0, stamps="fresh", status="deviated"):
+        """stamps: "fresh" (new stamp every tick), "held" (one stamp, live
+        distances), "verbatim" (one stamp), "none" (no matchedAtMs)."""
+        base = 1000000
         for i, d in enumerate(dists):
             b.advance(1000).position_metres_north(5 * (i + 1))
             self.last_m = 5 * (i + 1)
-            b.route_match(d, leg=0, on_route=False)
+            stamp = {"fresh": base + 1000 * i, "held": base,
+                     "verbatim": base, "none": None}[stamps]
+            b.route_match(d, leg=0, on_route=False, stamp=stamp)
             b.progress(leg=0, prog=prog, status=status)
+        return b
+
+    def release(self, b, prog=91.3, dist=90.2, on_route=True, stamp=2000000,
+                status="behind", wait=1000):
+        b.advance(wait).position_metres_north(self.last_m + 2).route_match(
+            dist, leg=0, on_route=on_route, stamp=stamp)
+        b.progress(leg=0, prog=prog, status=status)
         return b
 
     def suppressed_logged(self, watch):
         with open(watch.log.path) as f:
-            return "rejoin after a real excursion" in f.read()
+            return "rejoin after an off-route run" in f.read()
 
-    def test_live_run_then_release_is_suppressed_with_a_log_line(self):
+    def fired(self, watch):
+        return len(self.find(watch, "progress-without-motion"))
+
+    def test_fresh_stamp_run_then_release_is_suppressed_with_a_log_line(self):
         b = self.ride()
-        self.run_off(b, [127.1, 160.0, 207.6, 177.3, 140.0, 108.7], 1.0)
-        b.advance(1000).position_metres_north(self.last_m + 2).route_match(
-            90.2, leg=0, on_route=True)
-        b.progress(leg=0, prog=91.3, status="behind")
+        self.run_off(b, self.LIVE)
+        self.release(b)
         watch = self.run_stream(b)
         self.assertEqual(self.find(watch, "progress-without-motion"), [],
                          self.rules(watch))
         self.assertTrue(self.suppressed_logged(watch))
 
+    def test_held_stamp_live_distance_tail_is_suppressed(self):
+        b = self.ride()
+        self.run_off(b, self.LIVE[:3])
+        self.run_off(b, self.LIVE[3:], stamps="held")
+        self.release(b)
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 0, self.rules(watch))
+        self.assertTrue(self.suppressed_logged(watch))
+
+    def test_probe_a_catch_up_over_two_ticks_is_suppressed(self):
+        """The excuse survives a first release tick that is not itself
+        firing-eligible (4.0 % is under MOTION_PROGRESS_PCT of 1.0 %)."""
+        b = self.ride()
+        self.run_off(b, self.LIVE)
+        self.release(b, prog=4.0)
+        self.release(b, prog=91.3, wait=1000, stamp=2001000)
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 0, self.rules(watch))
+
     def test_suppression_spends_the_cooldown(self):
         b = self.ride()
-        self.run_off(b, [127.1, 207.6, 108.7], 1.0)
-        b.advance(1000).position_metres_north(self.last_m + 2).progress(
-            leg=0, prog=91.3, status="behind")
+        self.run_off(b, [127.1, 207.6, 108.7])
+        self.release(b)
         b.advance(60000).position_metres_north(self.last_m + 4).progress(
             leg=0, prog=99.0, status="behind")
         watch = self.run_stream(b)
-        self.assertEqual(self.find(watch, "progress-without-motion"), [])
+        self.assertEqual(self.fired(watch), 0)
 
     def test_pinned_distance_run_still_fires(self):
-        """09-22 09:27:43: 101.5 m bit for bit, then 5.635 -> 23.15 %."""
+        """09-22 09:27:43: one stamp, 101.5 m bit for bit, then 5.635 ->
+        23.15 % on an on-route tick."""
         b = StreamBuilder().start(missed_bus_itinerary())
         b.advance(1000).position().progress(leg=0, prog=5.6)
-        self.run_off(b, [101.52468578276265] * 19, 5.635)
-        b.advance(1000).position_metres_north(5 * 19 + 2).route_match(
-            99.0, leg=0, on_route=True)
-        b.progress(leg=0, prog=23.15)
+        self.run_off(b, [101.52468578276265] * 19, 5.635, stamps="verbatim")
+        self.release(b, prog=23.15, dist=99.0, status="on_track")
         watch = self.run_stream(b)
-        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1,
-                         self.rules(watch))
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
+
+    def test_honest_run_with_a_frozen_outright_tail_fires(self):
+        b = self.ride()
+        self.run_off(b, self.LIVE)
+        self.run_off(b, [177.3] * 4, stamps="verbatim")
+        self.release(b)
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
+
+    def test_jump_tick_off_route_fires(self):
+        """09-01 11:10:06: the jump tick is isOnRoute false at 132 m."""
+        b = self.ride()
+        self.run_off(b, self.LIVE)
+        self.release(b, prog=100.0, dist=132.0, on_route=False,
+                     status="completed")
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
+
+    def test_no_stamp_run_fires(self):
+        """Older clients send no matchedAtMs: unknown, not excused."""
+        b = self.ride()
+        self.run_off(b, self.LIVE, stamps="none")
+        self.release(b, stamp=None)
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
+
+    def test_probe_b_nearly_pinned_distance_run_fires(self):
+        """[250.0] x 10 + [250.1], one stamp: not a distinct-value count."""
+        b = self.ride()
+        self.run_off(b, [250.0] * 10, stamps="none")
+        self.run_off(b, [250.1], stamps="none")
+        self.release(b, prog=40.0, stamp=None)
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
 
     def test_pinned_distance_run_fires_even_when_far(self):
-        """A stuck projection is stuck at any distance."""
         b = self.ride()
-        self.run_off(b, [250.0] * 10, 1.0)
-        b.advance(1000).position_metres_north(self.last_m + 2).progress(
-            leg=0, prog=40.0, status="behind")
+        self.run_off(b, [250.0] * 10, stamps="verbatim")
+        self.release(b, prog=40.0)
         watch = self.run_stream(b)
-        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1,
-                         self.rules(watch))
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
 
-    def test_live_run_under_the_threshold_still_fires(self):
+    def test_probe_c_stale_far_excursion_does_not_excuse_a_later_run(self):
+        """dists [600, 590, 300] then 40 ticks at ~120 m: only the LAST
+        match's class counts, and here it is frozen."""
         b = self.ride()
-        self.run_off(b, [60.0, 90.0, 133.8, 110.0, 80.0], 1.0)
-        b.advance(1000).position_metres_north(self.last_m + 2).progress(
-            leg=0, prog=60.0, status="behind")
+        self.run_off(b, [600.0, 590.0, 300.0])
+        self.run_off(b, [120.0] * 40, stamps="verbatim")
+        self.release(b, prog=60.0)
         watch = self.run_stream(b)
-        self.assertEqual(len(self.find(watch, "progress-without-motion")), 1,
-                         self.rules(watch))
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
+
+    def test_jump_more_than_the_grace_after_the_release_fires(self):
+        b = self.ride()
+        self.run_off(b, self.LIVE)
+        self.release(b, prog=1.2)          # release tick, not eligible
+        self.release(b, prog=91.3, wait=12000, stamp=2012000)
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
+
+    def test_a_swap_inside_the_run_forgets_it(self):
+        """Distances measured against the OLD route must not excuse a release
+        on the NEW one: the rejoin marker is never made after a swap."""
+        b = self.ride()
+        self.run_off(b, self.LIVE)
+        b.advance(500).swap()
+        self.release(b, prog=1.2)
+        watch = self.run_stream(b, finalize=False)
+        trip = watch.trips.get(SESSION)
+        self.assertIsNotNone(trip, "trip finalised; cannot inspect")
+        self.assertIsNone(trip.rejoin)
+
+    def test_last_deviated_match_older_than_two_seconds_fires(self):
+        b = self.ride()
+        self.run_off(b, self.LIVE)
+        b.advance(3000).position_metres_north(self.last_m + 1)
+        b.progress(leg=0, prog=1.0, status="deviated")   # no fresh match
+        self.release(b)
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 1, self.rules(watch))
+
+    def test_live_run_under_the_old_threshold_is_also_excused_now(self):
+        """A shallow honest rejoin (< 170 m) is a rejoin too."""
+        b = self.ride()
+        self.run_off(b, [60.0, 90.0, 133.8, 110.0, 80.0])
+        self.release(b, prog=60.0)
+        watch = self.run_stream(b)
+        self.assertEqual(self.fired(watch), 0, self.rules(watch))
+
+    REAL_LOG_1020 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                                 "debug-2026-10-20.jsonl")
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_1020),
+                         "debug-2026-10-20.jsonl not present")
+    def test_the_real_1020_rejoin_is_suppressed(self):
+        """09:16:58 on `mvgr2jqp-b81j4g`: window 09:07-09:17."""
+        watch = replay_real_window(self, self.REAL_LOG_1020,
+                                   (1792505220000, 1792505830000),
+                                   types=RIDE_TYPES_0921)
+        self.assertEqual(hits_of(watch, "progress-without-motion"), [])
+        with open(watch.log.path) as f:
+            self.assertIn("rejoin after an off-route run", f.read())
 
 
 class TestBoardArrivalBusNotHere(RuleTestCase):

@@ -468,19 +468,26 @@ MOTION_COOLDOWN_MS = 5 * 60 * 1000
 # 159 m early (ride-0901 ride 3), a real defect.
 MOTION_MIN_LEG_M = 50.0
 # 67.5: a genuine route REJOIN is not "progress without motion". 2026-10-20
-# 09:16:58 the rider walked 270 m, 207 m off the route at the farthest, with
-# the projection held at 1.0 % through a deviated run whose distanceFromRoute
-# was LIVE (127 -> 207 -> 177 -> 99 m); the first on-route tick read 91 %.
-# The rider really had moved: the bar caught up on a real rejoin. A deviated
-# run only excuses the release tick when it was a real excursion (at least
-# this far off the route) AND the match was live (more than one distinct
-# distanceFromRoute) -- 09-22 09:27:43's 12.17 freeze pinned
-# distanceFromRoute bit for bit at 101.5 m, which is a stuck projection and
-# stays a finding. The replay over all day files put 170 m between the two (see
-# the 67.5 commit): 09-01 11:10:06, a real defect to keep, followed a run
-# that peaked at ~134 m; 10-20 09:16:58 peaked at 207 m.
-REJOIN_MIN_OFFROUTE_M = 170.0
-REJOIN_PENDING_MAX = 600
+# 09:16:58 (session mvgr2jqp-b81j4g) the rider was on a 809 m BICYCLE leg and
+# ran 09:09:08-09:16:57 `deviated`, up to 588 m off it (distanceFromRoute took
+# 404 distinct values); 431 of 467 route matches carried a fresh
+# `matchedAtMs`, the projection sat at the leg's first point (1.03 %), and the
+# first on-route tick, 99.5 m from the route, read 91.34 %. The bar caught up
+# on a real rejoin; it was not frozen. What tells that run from 12.17's freeze
+# is the app's own HOLD CLASS on the last deviated match: a fresh `matchedAtMs`
+# (or the off-corridor hold, which keeps the stamp but reports a LIVE
+# distance) is an honest projection; the same stamp AND a bit-identical
+# distance is the jump-budget hold, i.e. frozen (2026-09-22 09:27:43: 18 of 19
+# ticks frozen at 101.52 m); no stamp at all (older clients) is unknown and
+# fires. The jump tick itself must also be ON the route: 2026-09-01 11:10:06
+# snapped 0 % -> 100 % with isOnRoute false at 132 m and stays a finding.
+# Magnitude and distinct-value tests were tried and fail (the real 10-20 run
+# has 9 bit-identical ticks; a stale 600 m max excuses a later 120 m run).
+# A route match lands 3-10 ms before its progress tick; REJOIN_GRACE_MS is how
+# long after the release tick the excuse is still valid (the nearest kept
+# finding after a deviated tick is 09-18 20:54:01, 25 s later).
+REJOIN_GRACE_MS = 10000
+REJOIN_MATCH_FRESH_MS = 2000
 # ...and the anchor has to be dropped when the DENOMINATOR changes, not only
 # when the rider moves. An itinerary swap re-bases currentLegProgress onto a
 # new leg 0, so the two ticks straddling it describe different quantities:
@@ -2167,10 +2174,11 @@ class Trip:
         # (2026-09-09 09:35:12: "moved 3.4 m"), which is the least interesting
         # second of the episode; the 44 s and 74 m before it are the finding.
         self.progress_freeze = None
-        # 67.5: UPDATE_ROUTE_MATCH distances seen since the last progress tick,
-        # and the deviated run those distances have been folded into.
-        self.rm_pending = []
+        # 67.5: the run of `deviated` ticks on one leg ({"leg", "swapSeq",
+        # "lastMatch"}) and the rejoin marker left when it ended (see
+        # REJOIN_GRACE_MS); both are keyed on leg AND swap_seq.
         self.deviated_run = None
+        self.rejoin = None
         # legIndex -> last currentLegProgress seen on it. Read by
         # early-leg-transition, which needs the leg the rider is LEAVING.
         self.leg_progress_last = {}
@@ -6214,7 +6222,7 @@ class RideWatch:
         if not isinstance(prog, (int, float)) or trip.last_fix is None:
             return
         span = self._note_progress_freeze(trip, t, leg, prog)
-        rejoin_run = self._note_deviated_run(trip, leg, p.get("status"))
+        rejoin = self._note_deviated_run(trip, t, leg, p.get("status"))
         # 26.8: a percentage that does not measure travel cannot be evidence
         # of travel — a tick the app labels `deviated`, or a leg shorter than
         # MOTION_MIN_LEG_M. Such a tick runs through ALL of the bookkeeping
@@ -6246,12 +6254,13 @@ class RideWatch:
             leg_m = (trip.leg(leg) or {}).get("distance")
             if isinstance(leg_m, (int, float)) and leg_m < MOTION_MIN_LEG_M:
                 untrusted = "leg only %.1fm long" % leg_m
-        if untrusted is None and rejoin_run is not None \
-                and len(rejoin_run["dists"]) > 1 \
-                and rejoin_run["max"] >= REJOIN_MIN_OFFROUTE_M:
-            untrusted = ("rejoin after a real excursion: deviated run %.0fm"
-                         " off the route at the farthest, live match"
-                         % rejoin_run["max"])
+        now_rm = self._fresh_route_match(trip, t, leg)
+        if untrusted is None and rejoin is not None and rejoin["honest"] \
+                and now_rm is not None and now_rm["isOnRoute"] is True:
+            untrusted = ("rejoin after an off-route run: last match %s"
+                         " %.0fm off, now on the route at %.0fm"
+                         % (rejoin["hold"], rejoin["lastDist"],
+                            now_rm["distanceFromRoute"] or 0.0))
         anchor = trip.motion_anchor
         fresh = {"fix": trip.last_fix, "progress": prog, "leg": leg, "tMs": t,
                  "swapSeq": trip.swap_seq, "afterSwap": None}
@@ -6285,6 +6294,7 @@ class RideWatch:
         if trip.motion_fired_ms and t - trip.motion_fired_ms <= MOTION_COOLDOWN_MS:
             return
         trip.motion_fired_ms = t
+        trip.rejoin = None
         if untrusted:
             self.log.info(
                 "progress-without-motion suppressed at %s (%s): leg progress"
@@ -6313,28 +6323,52 @@ class RideWatch:
         trip.motion_anchor = fresh
 
     @staticmethod
-    def _note_deviated_run(trip, leg, status):
+    def _fresh_route_match(trip, t, leg):
+        """The last UPDATE_ROUTE_MATCH if it is this tick's (same leg, landed
+        within REJOIN_MATCH_FRESH_MS), else None."""
+        rm = trip.last_route_match
+        if rm is not None and rm["legIndex"] == leg \
+                and 0 <= t - rm["tMs"] <= REJOIN_MATCH_FRESH_MS:
+            return rm
+        return None
+
+    @staticmethod
+    def _note_deviated_run(trip, t, leg, status):
         """Track the run of `deviated` progress ticks on one leg (67.5).
 
-        Returns the run that ENDED at this tick (this tick is the first
-        non-deviated one after it, on the same leg), else None. A run holds
-        the distinct distanceFromRoute values seen inside it and their max.
-        Route matches are folded in only for deviated ticks; those that
-        precede the release tick belong to the rejoin, not the excursion.
+        A deviated tick extends the run (reset when the leg or swap_seq
+        changed) and remembers the fresh match it carried, or None. The first
+        non-deviated tick on the same leg and swap turns the run into
+        `trip.rejoin`, whose `honest` flag says the last deviated match was an
+        honest projection (fresh stamp or off-corridor hold) off the route.
+        The marker is returned, still valid, until it is spent by a
+        firing-eligible tick, a new deviated tick, or REJOIN_GRACE_MS.
         """
-        pending, trip.rm_pending = trip.rm_pending, []
-        run = trip.deviated_run
         if status == "deviated":
-            if run is None or run["leg"] != leg:
-                run = {"leg": leg, "dists": set(), "max": 0.0}
-            for rm_leg, d in pending:
-                if rm_leg == leg:
-                    run["dists"].add(d)
-                    run["max"] = max(run["max"], d)
+            run = trip.deviated_run
+            if run is None or run["leg"] != leg \
+                    or run["swapSeq"] != trip.swap_seq:
+                run = {"leg": leg, "swapSeq": trip.swap_seq}
+            run["lastMatch"] = RideWatch._fresh_route_match(trip, t, leg)
             trip.deviated_run = run
+            trip.rejoin = None
             return None
-        trip.deviated_run = None
-        return run if run is not None and run["leg"] == leg else None
+        run, trip.deviated_run = trip.deviated_run, None
+        if run is not None and run["leg"] == leg \
+                and run["swapSeq"] == trip.swap_seq:
+            lm = run["lastMatch"]
+            trip.rejoin = {
+                "leg": leg, "swapSeq": trip.swap_seq, "releasedMs": t,
+                "hold": lm["hold"] if lm else None,
+                "lastDist": (lm["distanceFromRoute"] or 0.0) if lm else 0.0,
+                "honest": bool(lm and lm["hold"] in ("accepted", "held")
+                               and lm["isOnRoute"] is False)}
+        rj = trip.rejoin
+        if rj is not None and (rj["leg"] != leg
+                               or rj["swapSeq"] != trip.swap_seq
+                               or t - rj["releasedMs"] > REJOIN_GRACE_MS):
+            trip.rejoin = rj = None
+        return rj
 
     @staticmethod
     def _note_progress_freeze(trip, t, leg, prog):
@@ -6468,17 +6502,32 @@ class RideWatch:
         thread, which gets asked things like "is it actually following me?" and
         needs the last number the app computed, not a rule's verdict on it.
         """
+        # 67.5: classify this match against the previous one by the app's
+        # own hold evidence. `matchedAtMs` is the fix the projection was last
+        # ACCEPTED at: a new stamp = "accepted"; the same stamp with a live
+        # distance = "held" (off-corridor hold); the same stamp and an
+        # identical distance = "verbatim" (jump-budget hold, frozen); no
+        # stamp = None (unknown).
+        prev = trip.last_route_match
+        ms = p.get("matchedAtMs")
+        hold = None
+        if isinstance(ms, (int, float)) and not isinstance(ms, bool):
+            if prev is None or prev["legIndex"] != p.get("legIndex") \
+                    or prev.get("matchedAtMs") != ms:
+                hold = "accepted"
+            elif prev["distanceFromRoute"] == p.get("distanceFromRoute"):
+                hold = "verbatim"
+            else:
+                hold = "held"
         trip.last_route_match = {
             "tMs": t,
             "legIndex": p.get("legIndex"),
             "distanceFromRoute": p.get("distanceFromRoute"),
             "isOnRoute": p.get("isOnRoute"),
             "progressAlongLeg": p.get("progressAlongLeg"),
+            "matchedAtMs": ms,
+            "hold": hold,
         }
-        d = p.get("distanceFromRoute")
-        if isinstance(d, (int, float)) and not isinstance(d, bool):
-            trip.rm_pending.append((p.get("legIndex"), float(d)))
-            del trip.rm_pending[:-REJOIN_PENDING_MAX]
         self._rule_distance_spike(trip, t, p)
 
     def _on_vehicle_match(self, trip, t, p):
