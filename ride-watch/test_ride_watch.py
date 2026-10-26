@@ -9077,6 +9077,8 @@ REAL_LOG_0921 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
                              "debug-2026-09-21.jsonl")
 # Everything the four 09-20/09-21 rules read, plus the records that open and
 # close a trip. Narrow on purpose: these two files are 8 MB and 39 MB.
+REAL_LOG_1020 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
+                             "debug-2026-10-20.jsonl")
 RIDE_TYPES_0921 = {"START_GO_MODE", "STOP_GO_MODE", "UPDATE_PROGRESS",
                    "UPDATE_POSITION", "UPDATE_ROUTE_MATCH", "SET_RIDING",
                    "CLEAR_RIDING", "CONFIRM_VEHICLE", "TRANSITION_LEG",
@@ -9272,6 +9274,68 @@ class TestStopCollapseReadsTheLeg(RuleTestCase):
         watch = self.drop_to_one(self.STOP_B + 177.0, prog=97.0)
         self.assertEqual(self.find(watch, "stop-count-collapse"), [],
                          self.rules(watch))
+
+    def swapped_itinerary(self, n_stops):
+        """A different plan whose bus leg carries `n_stops` stop calls (the
+        last is the alight stop), all well north of the builder's origin."""
+        payload = replacement_itinerary()
+        bus = payload["itinerary"]["legs"][1]
+        bus["intermediatePlaces"] = [
+            {"name": "Mid %d" % i,
+             "lat": StreamBuilder.LAT + (300.0 * (i + 1)) * 9.0e-6,
+             "lon": StreamBuilder.LON} for i in range(n_stops - 1)]
+        bus["to"] = {"name": "Washington",
+                     "lat": StreamBuilder.LAT + 4000.0 * 9.0e-6,
+                     "lon": StreamBuilder.LON}
+        return payload
+
+    def swap_to_count(self, n_stops):
+        b = StreamBuilder().start(self.itinerary_with_stops())
+        b.advance(1000).position()
+        b.progress(leg=1, prog=20.0, stops=3, next_stop="Stop B")
+        b.advance(1000).start(self.swapped_itinerary(n_stops))
+        b.advance(1000).position()
+        b.progress(leg=1, prog=5.0, stops=1, next_stop="Washington")
+        return self.run_stream(b)
+
+    def test_a_swap_onto_a_one_stop_leg_is_a_new_baseline_not_a_page(self):
+        """22.3, 2026-10-20 16:29:34: 3 -> swap -> 1 on a leg whose only stop
+        is the one the rider just picked. The count of 3 was the old plan's."""
+        watch = self.swap_to_count(1)
+        self.assertEqual(self.find(watch, "stop-count-collapse"), [],
+                         self.rules(watch))
+
+    def test_a_swap_onto_a_four_stop_leg_that_reads_one_still_pages(self):
+        watch = self.swap_to_count(4)
+        found = self.find(watch, "stop-count-collapse")
+        self.assertEqual(len(found), 1, self.rules(watch))
+
+    def test_the_summary_says_when_the_count_was_the_old_plans(self):
+        b = StreamBuilder().start(self.itinerary_with_stops())
+        b.advance(1000).position()
+        b.progress(leg=1, prog=20.0, stops=5, next_stop="Stop B")
+        b.advance(1000).start(self.swapped_itinerary(2))
+        b.advance(1000).position()
+        b.progress(leg=1, prog=5.0, stops=1, next_stop="Washington")
+        found = self.find(self.run_stream(b), "stop-count-collapse")
+        self.assertEqual(len(found), 1)
+        self.assertIn("previous plan", found[0]["summary"])
+        self.assertNotIn("no stop coordinates", found[0]["summary"])
+
+    @unittest.skipUnless(os.path.exists(REAL_LOG_1020),
+                         "%s not present" % REAL_LOG_1020)
+    def test_the_real_1020_1629_page_is_gone(self):
+        """The 16:29:34 page: the rider changed their get-off stop aboard and
+        the daemon called the correct "one stop left" wrong."""
+        watch = replay_real_window(self, REAL_LOG_1020,
+                                   (1792530000000, 1792531860000))
+        self.assertEqual(hits_of(watch, "stop-count-collapse"), [],
+                         [(f["time"], f["summary"])
+                          for f in watch.all_findings])
+        # the window really holds the swap and the count of 1 after it
+        recs = log_records(REAL_LOG_1020, 1792531774000, 1792531776000,
+                           types={"START_GO_MODE", "UPDATE_PROGRESS"})
+        self.assertIn("START_GO_MODE", [r["type"] for r in recs])
 
     @unittest.skipUnless(os.path.exists(REAL_LOG_0921),
                          "%s not present" % REAL_LOG_0921)

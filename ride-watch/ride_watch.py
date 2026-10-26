@@ -5999,7 +5999,7 @@ class RideWatch:
                         and trip.swap_seq not in trip.collapse_fired_seq):
                     verdict = self._stop_collapse_verdict(
                         trip, p.get("currentLegIndex"), int(prev_stops),
-                        progress)
+                        progress, swap_pending=trip.stops_swap_pending)
                     if verdict["wrong"]:
                         trip.collapse_fired_seq.add(trip.swap_seq)
                         ctx = {"prevStops": prev_stops, "stops": stops,
@@ -6133,7 +6133,8 @@ class RideWatch:
         else:
             self._finding(trip, t, "position-teleport", "warn", summary, context)
 
-    def _stop_collapse_verdict(self, trip, leg_index, prev_stops, progress):
+    def _stop_collapse_verdict(self, trip, leg_index, prev_stops, progress,
+                               swap_pending=False):
         """Is a `stopsRemaining` that just fell to 1 actually WRONG? (22.3)
 
         The old test was a percentage: below STOP_COLLAPSE_MAX_PROGRESS of the
@@ -6165,15 +6166,40 @@ class RideWatch:
             if isinstance(leg, dict):
                 stops = leg.get("stops")
         implied = None
+        if isinstance(stops, list) and stops and swap_pending \
+                and len(stops) == 1:
+            # 22.3 (2026-10-20 16:29:34): the rider changed their get-off
+            # stop aboard, the new plan's leg has exactly one stop call, and
+            # the first count after the swap is 1. `prev_stops` was taken on
+            # the PREVIOUS plan, so comparing it to this leg means nothing:
+            # the count equals the leg's full stop count, a new baseline.
+            return {
+                "wrong": False,
+                "summary": ("on the first count after an itinerary swap, which"
+                            " equals the new leg's only stop — a new"
+                            " baseline"),
+                "push": "",
+                "context": {"stopGeometry": "leg", "newBaseline": True,
+                            "legStopCount": len(stops)},
+            }
         if isinstance(stops, list) and 1 <= prev_stops <= len(stops):
             implied = stops[-prev_stops]
         if implied is None or trip.last_fix is None:
             wrong = progress < STOP_COLLAPSE_MAX_PROGRESS
+            if not (isinstance(stops, list) and stops):
+                why = ("the leg carries no stop coordinates, so the"
+                       " percentage decided")
+            elif prev_stops > len(stops):
+                why = ("the previous count of %d was taken on the previous"
+                       " plan and this leg has %d stops, so the percentage"
+                       " decided" % (prev_stops, len(stops)))
+            else:
+                why = ("no fix to measure the stop from, so the percentage"
+                       " decided")
             return {
                 "wrong": wrong,
-                "summary": ("at %.0f%% of transit leg %s (the leg carries no"
-                            " stop coordinates, so the percentage decided)"
-                            % (progress, leg_index)),
+                "summary": ("at %.0f%% of transit leg %s (%s)"
+                            % (progress, leg_index, why)),
                 "push": "at %.0f%% of the leg" % progress,
                 "context": {"stopGeometry": "unavailable",
                             "maxProgressPct": STOP_COLLAPSE_MAX_PROGRESS},
