@@ -7839,6 +7839,191 @@ class TestNoteUnverifiable(RuleTestCase):
         self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
 
 
+class TestAppendDaemonSections(RuleTestCase):
+    """72.2: the daemon appends its own Faster-route offers / Auto blocks.
+
+    The 10-26 12:14 wrap-up wrote its own layout and dropped both blocks that
+    the request carried; 28 of 29 October reports lacked the offers heading.
+    """
+
+    FASTER = ["## Faster-route offers (0)", "", "- (none)", "",
+              "## Aboard recorder cadence", "",
+              "- median spacing of REROUTE_SNAPSHOTs while aboard: 364 s over"
+              " 3 gaps (min 363 s, max 364 s; 18 snapshots in all)", ""]
+    AUTO = ["## Auto", "", "- Presets: leastBike, simplest, fastest",
+            "- 12:14:09 Auto on (leastBike)", "- Switches: 0, undos: 0",
+            "- Held: 0", ""]
+
+    def setUp(self):
+        super().setUp()
+        self.plan = os.path.join(self.tmp, "backlog.md")
+        self.record = os.path.join(self.tmp, "record.md")
+        for p in (self.plan, self.record):
+            with open(p, "w") as f:
+                f.write("# open rows\n")
+
+    def ended_ride(self, faster=True, auto=True, request=True):
+        thread = StubThread()
+        b = StreamBuilder().start().advance(1000).progress(stops=6, prog=20.0)
+        b.advance(1000).progress(stops=1, prog=21.0)
+        b.advance(1000).stop()
+        watch = self.run_stream(b, finalize=False, thread=thread)
+        entry = watch.report_deadlines[0]
+        self.report = entry["reportPath"]
+        self.req = entry["requestPath"]
+        if request:
+            with open(self.req) as f:
+                req = json.load(f)
+            req.pop("fasterRouteSection", None)
+            req.pop("autoSection", None)
+            if faster:
+                req["fasterRouteSection"] = self.FASTER
+            if auto:
+                req["autoSection"] = self.AUTO
+            with open(self.req, "w") as f:
+                json.dump(req, f)
+        else:
+            os.remove(self.req)
+        return watch
+
+    def write_report(self, body, bugs=0):
+        with open(self.report, "w") as f:
+            f.write("# Ride report\n\n" + body)
+            if bugs:
+                f.write("## 1. Broken - REAL BUG\n\nevidence\n")
+            else:
+                f.write("## 1. Fine - app-behaved-correctly\n")
+
+    def text(self):
+        with open(self.report) as f:
+            return f.read()
+
+    def settle_zero(self, watch):
+        watch.clock_ms += 1000
+        watch.check_timers()
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS
+        watch.check_timers()
+
+    def test_a_zero_report_gets_both_blocks_verbatim_after_the_quiet_period(self):
+        watch = self.ended_ride()
+        self.write_report("Triage.\n\n")
+        watch.clock_ms += 1000
+        watch.check_timers()
+        watch.clock_ms += 120 * 1000
+        watch.check_timers()
+        self.assertNotIn("## Faster-route offers", self.text())   # not before
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS
+        watch.check_timers()
+        t = self.text()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertTrue(t.endswith("\n".join(self.FASTER).strip("\n") + "\n\n"
+                                   + "\n".join(self.AUTO).strip("\n") + "\n"), t)
+        self.assertEqual(t.count("## Faster-route offers"), 1)
+        self.assertEqual(t.count("\n## Auto\n"), 1)
+
+    def test_a_second_call_changes_nothing(self):
+        watch = self.ended_ride()
+        self.write_report("Triage.\n\n")
+        self.settle_zero(watch)
+        once = self.text()
+        watch._append_daemon_sections({"reportPath": self.report,
+                                       "requestPath": self.req})
+        self.assertEqual(self.text(), once)
+
+    def test_an_existing_offers_heading_is_not_duplicated_but_auto_is_added(self):
+        watch = self.ended_ride()
+        self.write_report("## Faster-route offers\n\nwritten by hand\n\n")
+        self.settle_zero(watch)
+        t = self.text()
+        self.assertEqual(t.count("## Faster-route offers"), 1)
+        self.assertIn("written by hand", t)
+        self.assertTrue(t.endswith("\n".join(self.AUTO).strip("\n") + "\n"), t)
+
+    def test_no_auto_section_means_no_auto_heading(self):
+        watch = self.ended_ride(auto=False)
+        self.write_report("Triage.\n\n")
+        self.settle_zero(watch)
+        t = self.text()
+        self.assertIn("## Faster-route offers (0)", t)
+        self.assertNotIn("\n## Auto", t)
+
+    def test_a_real_bug_report_waits_for_promotion(self):
+        watch = self.ended_ride()
+        self.write_report("Triage.\n\n", bugs=1)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        watch.clock_ms += ride_watch.REPORT_QUIET_MS + 1000
+        watch.check_timers()
+        self.assertEqual(len(watch.report_deadlines), 1)       # held
+        self.assertNotIn("## Faster-route offers", self.text())
+        with open(self.plan, "a") as f:
+            f.write("\n| 18.1 | **a new row** | ride `%s` |\n" % SESSION)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertIn("## Faster-route offers (0)", self.text())
+        self.assertIn("\n## Auto\n", self.text())
+
+    def test_a_real_bug_report_gets_the_blocks_when_the_window_expires(self):
+        watch = self.ended_ride()
+        self.write_report("Triage.\n\n", bugs=1)
+        watch.clock_ms += 1000
+        watch.check_timers()
+        watch.clock_ms += ride_watch.PROMOTION_DEADLINE_MS + 1000
+        watch.check_timers()
+        self.assertEqual(watch.report_deadlines, [])
+        self.assertIn("## Faster-route offers (0)", self.text())
+
+    def test_a_missing_request_leaves_the_report_alone_and_raises_nothing(self):
+        watch = self.ended_ride(request=False)
+        self.write_report("Triage.\n\n")
+        before = self.text()
+        self.settle_zero(watch)
+        self.assertEqual(self.text(), before)
+        self.assertEqual(watch.report_deadlines, [])
+
+    def test_an_unreadable_request_or_missing_report_is_skipped(self):
+        watch = self.ended_ride()
+        with open(self.req, "w") as f:
+            f.write("{not json")
+        self.write_report("Triage.\n\n")
+        before = self.text()
+        watch._append_daemon_sections({"reportPath": self.report,
+                                       "requestPath": self.req})
+        self.assertEqual(self.text(), before)
+        watch._append_daemon_sections({"reportPath": self.report + ".none",
+                                       "requestPath": self.req})
+        watch._append_daemon_sections({})
+
+    def test_the_10_26_request_regression(self):
+        """Request report-request-mvpik996-01erej-1214.json, the sections
+        inlined: the wrap-up wrote Triage / Rows this ride tested / Replay
+        only and neither block."""
+        faster = ["## Faster-route offers (0)", "", "- (none)", "",
+                  "## Aboard recorder cadence", "",
+                  "- median spacing of REROUTE_SNAPSHOTs while aboard: 364 s"
+                  " over 3 gaps (min 363 s, max 364 s; 18 snapshots in all)",
+                  ""]
+        auto = ["## Auto", "", "- Presets: leastBike, simplest, fastest",
+                "- 12:14:09 Auto on (leastBike)",
+                "- 12:17:21 Auto on (leastBike)",
+                "- 12:17:26 Auto on (simplest)",
+                "- 12:17:30 Auto on (fastest)",
+                "- Switches: 0, undos: 0", "- Held: 0", ""]
+        watch = self.ended_ride()
+        with open(self.req) as f:
+            req = json.load(f)
+        req["fasterRouteSection"], req["autoSection"] = faster, auto
+        with open(self.req, "w") as f:
+            json.dump(req, f)
+        self.write_report("## Triage\n\nx\n\n## Rows this ride tested\n\n"
+                          "y\n\n## Replay only\n\nz\n\n")
+        self.settle_zero(watch)
+        t = self.text()
+        self.assertTrue(t.endswith("\n".join(faster).strip("\n") + "\n\n"
+                                   + "\n".join(auto).strip("\n") + "\n"), t)
+
+
 class TestPromotionGate(RuleTestCase):
     """15.8's second mechanism: a wrap-up is not done when the file appears.
 

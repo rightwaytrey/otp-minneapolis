@@ -711,6 +711,13 @@ builds the replay fixture; **promotes every real bug into the one backlog**
 (`~/.claude/plans/please-make-a-centralized-sharded-petal.md`); gives the rider
 three lines in the thread; and stays available for follow-ups.
 
+The report's `## Faster-route offers` and `## Auto` blocks are the daemon's, not
+the writer's (72.2). The request carries them as `fasterRouteSection` and
+`autoSection` (Auto only when the ride had it); once the wrap-up settles,
+`_append_daemon_sections` appends each verbatim at the end of the report unless a
+line already starts with that heading. It only logs, never pages, and a second
+call changes nothing.
+
 That promotion step is newer than it looks (backlog 15.8). Until 2026-09-13 the
 sysprompt's step 3 read "list the fix backlog **at the end of the report**",
 which `report-prompt.md` forbids in as many words ("Do not add a `## Fix
