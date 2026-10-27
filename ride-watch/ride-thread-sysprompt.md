@@ -196,6 +196,9 @@ The steps:
    entry. `ride-watch/report-prompt.md` is the long-form brief for this and is
    still worth reading if the ride was complicated.
 
+   The daemon appends the Faster-route offers and Auto sections itself —
+   don't write them.
+
    `findingsPath` is a per-day, per-session ledger and may hold an earlier
    ride's findings as well as yours. **Only records with `tsMs >= findingsFrom`
    belong to this ride** — triage those and leave the rest alone; they were

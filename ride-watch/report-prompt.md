@@ -179,6 +179,10 @@ cross-referenced here in one line>
 **Evidence:** <action types + timestamps you read>
 **Fix:** <category> — <one or two sentences> · `<file>` (real-bug only)
 
+<The daemon appends the Faster-route offers and Auto sections itself — don't
+write them. (72.2: it pastes the request's `fasterRouteSection` and
+`autoSection` verbatim at the end of the report once the wrap-up settles.)>
+
 ## Faster-route offers
 <paste the request's `fasterRouteSection` lines verbatim (each offer: time, kind,
 min/km, Switch / Keep mine / expired, push; then the aboard recorder cadence

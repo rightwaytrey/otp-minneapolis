@@ -5497,6 +5497,7 @@ class RideWatch:
                     keep.append(entry)
                     continue
                 if self._settle_promotion(entry, now):
+                    self._append_daemon_sections(entry)
                     changed = True
                     continue
                 keep.append(entry)
@@ -5649,6 +5650,66 @@ class RideWatch:
             return False
         cells = [c.strip() for c in row.strip("|").split("|")]
         return any(VERDICT_CELL_RE.match(c) for c in cells)
+
+    def _append_daemon_sections(self, entry):
+        """72.2: put the daemon's verbatim blocks at the end of the settled
+        report when the writer left them out.
+
+        The request carries `fasterRouteSection` and, when the ride had Auto,
+        `autoSection`, both built by the daemon. The wrap-up thread was never
+        told to paste them (ride-thread-sysprompt.md did not mention either),
+        so 28 of the 29 October reports lacked `## Faster-route offers`. The
+        daemon owns those blocks, so it appends them itself once the report
+        has settled. A block whose heading already starts a line is left
+        alone, which also makes a second call a no-op. Log-only: it never
+        raises and never pages.
+        """
+        try:
+            path = entry.get("reportPath")
+            req_path = entry.get("requestPath")
+            if not path or not req_path:
+                self.log.info("72.2: no report or request path for %s;"
+                              " not appending daemon sections"
+                              % entry.get("session"))
+                return
+            with open(req_path) as f:
+                req = json.load(f)
+            with open(path) as f:
+                text = f.read()
+            have_heads = [ln for ln in text.splitlines()]
+            added = []
+            for key, heading in (("fasterRouteSection",
+                                  "## Faster-route offers"),
+                                 ("autoSection", "## Auto")):
+                block = req.get(key)
+                if not block:
+                    continue
+                if any(ln.startswith(heading) for ln in have_heads):
+                    continue
+                if isinstance(block, list):
+                    block = "\n".join(str(x) for x in block)
+                block = str(block).strip("\n")
+                if not block.strip():
+                    continue
+                added.append(block)
+                have_heads.extend(block.splitlines())
+            if not added:
+                self.log.info("72.2: %s already has the daemon sections"
+                              " (or the request has none)"
+                              % os.path.basename(path))
+                return
+            sep = "" if not text or text.endswith("\n\n") else (
+                "\n" if text.endswith("\n") else "\n\n")
+            with open(path, "a") as f:
+                f.write(sep + "\n\n".join(added) + "\n")
+            self.log.info("72.2: appended %d daemon section(s) to %s"
+                          % (len(added), os.path.basename(path)))
+        except Exception as e:  # noqa: BLE001 - never raise from here
+            try:
+                self.log.warn("72.2: could not append daemon sections for"
+                              " %s: %s" % (entry.get("session"), e))
+            except Exception:
+                pass
 
     def _settle_promotion(self, entry, now):
         """Is this wrap-up over? True when the deadline entry can be dropped.
