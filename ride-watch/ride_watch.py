@@ -212,6 +212,9 @@ ADOPT_START_LOOKBACK_MS = 15 * 60 * 1000
 # itinerary: records 69/144/309/325 of 09-15 are 27 KB, 112 KB, 110 KB and
 # 110 KB. 8 MB is ~70 such records, far more than one Go Mode run.
 ADOPT_START_LOOKBACK_BYTES = 8 * 1024 * 1024
+# ...and how many sessions' read-backs are kept between asks (75.25). Only a
+# session the adopt path keeps declining asks twice; one is the usual number.
+READBACK_CACHE_MAX = 16
 
 # Follower diagnostics. A poll that delivers lines logs one INFO line, at most
 # this often, so a 1 Hz telemetry stream does not turn daemon.log into a second
@@ -221,6 +224,16 @@ ADOPT_START_LOOKBACK_BYTES = 8 * 1024 * 1024
 TAILER_DRAIN_LOG_INTERVAL_S = 60.0
 TAILER_DRAIN_RING = 12
 SESSION_TIMEOUT_MS = 15 * 60 * 1000        # trip ends after this much silence
+# The live loop's tick: run_live calls check_timers this often whatever the
+# stream is doing, and --replay now does the same in record time (75.26a).
+LIVE_TICK_MS = 5 * 1000
+# 75.26a: run_replay walks the clock through a quiet stretch at LIVE_TICK_MS,
+# but no further than this into any one stretch. Every silence rule here has
+# matured long before it (the longest is MULTI_STOP_PAUSE_MAX_MS, 4 h); past
+# it the clock jumps to the next record as it always did, so an overnight gap,
+# a three-day .gz (75.28) or one record with a far-future `t` costs a few
+# thousand idle ticks, not millions.
+REPLAY_TICK_SPAN_MAX_MS = 6 * 60 * 60 * 1000
 # ...and this long after arrival, whether or not the app ever goes quiet.
 # Every trip-end this daemon had was a silence: STOP_GO_MODE, the timeout
 # above, or replay EOF. On 2026-08-31 the rider arrived at 18:52:14, the app
@@ -548,6 +561,23 @@ TELEPORT_PAGE_COUNT = 5
 # progress-without-motion uses, and an escalation to `page` is allowed through
 # it once — a worsening stream is news even mid-cooldown.
 TELEPORT_COOLDOWN_MS = 5 * 60 * 1000
+# 75.26b. A day file written by a browser REPLAY (or the itinerary-derived GPS
+# simulation) is the app re-living a ride at 6-12x: entry `t` is wall time,
+# and the ride's own time is only in each fix — otprr createMockPosition
+# (lib/actions/go-mode.ts) stamps `source: 'replay'` ('sim' for the
+# simulation) and the simulated clock in `timestamp`, "the reason a replayed
+# day file can be told apart from the ride it reproduces". On the 10-28 sweep
+# file judging `t` made 14 `position-teleport` ("jumped 263 m in 1.1 s" was 8
+# sim-seconds) and all 162 `action-storm` findings. So:
+#   position-teleport  times a simulated fix by its own `timestamp`: the pair
+#                      the app saw, on the ride's clock — a real two-track
+#                      stream in a recorded ride is still caught on replay;
+#   action-storm       is not judged for a session that has sent one: an
+#                      action carries no ride clock, and under compression no
+#                      single clock is right (per-fix actions run on the
+#                      simulated one, wall timers and render loops on `t`).
+# Real phones send 'native' or 'browser' (every fix in 10-20..10-29: native).
+SIMULATED_POSITION_SOURCES = frozenset(("replay", "sim"))
 # replan-not-converging (8/28 afternoon). The destination was inside the State
 # Fairgrounds, where the street graph stops at the fence. The app re-planned
 # into the venue interior for 32 minutes, never got inside 427 m, and told the
@@ -1255,6 +1285,26 @@ NOT_A_PANEL_ROUTE = frozenset(("/account", "/account/create", "/signedin"))
 
 
 MAX_PAGES_PER_TRIP = 2
+# 75.24: "2 per ride" (README), and a ride is not one Trip object. STOP then
+# START re-picks a plan and opens a fresh Trip under the same session id: on
+# 2026-10-20 `mvh6ypt8-rtb6ih` ended `stop` 16:42:22 and re-opened 16:42:41,
+# and the second Trip started a fresh two: its 16:48:06 "Connection at risk"
+# went out after the first Trip's 16:29:59 and 16:35:39 — three pages in
+# 18 min from one ride on one phone (daemon.log of that day; the prod app's
+# concurrent ride, another phone and session, sent two more).
+# 08-27 13:09 -> 15:05 is the same shape over 3m14s and 2m31s gaps. So a Trip
+# that opens on a session id (or alias) whose previous Trip ended, without
+# having arrived, no more than this long before it is the same ride, and
+# shares that ride's budget. Measured on the replays of every day file
+# (2026-10-29): consecutive Trips of one session id were 3-102 s apart 31
+# times (STOP -> START re-picks), 152-233 s apart three times (08-27 twice,
+# 09-21) and otherwise never closer than 351 s; five minutes is also the gap
+# the 75.24 episode scan merged on. An arrival ends a ride outright (09-09
+# re-opened 147 s after one), so a Trip that had arrived starts no chain.
+# A SECOND PHONE on the same ride is another session and device and is not
+# merged: whether two apps on one ride share two interrupts is the product
+# call 75.24 leaves open.
+RIDE_PAGE_CHAIN_MS = 5 * 60 * 1000
 PUSH_MIN_INTERVAL_MS = 120 * 1000
 # ...except the one page that says a ride produced findings and no report.
 #
@@ -2325,7 +2375,10 @@ class Trip:
         self.thread_pushes = 0
         self.last_thread_push_ms = 0
         self.findings = []
-        self.pages_sent = 0
+        self.pages_sent = 0           # pages THIS Trip sent
+        # ...and what the cap reads: the RIDE's count, one dict shared by
+        # every Trip of the ride (75.24, RideWatch._join_ride_budget).
+        self.page_budget = {"sent": 0}
         self.pending_pages = []                   # page candidates in the window
         self.pending_until_ms = None              # when the window closes
         self.end_ms = None
@@ -2391,9 +2444,23 @@ class RideWatch:
         # session -> (asOfMs, [(startMs, endMs, what)]). See
         # _reported_ride_windows.
         self._reported_windows_cache = collections.OrderedDict()
+        # session -> how far the adopt path has read the stream back for it,
+        # and the START/STOP records it found there (75.25). See
+        # _stream_go_mode_marks.
+        self._readback = collections.OrderedDict()
         # Sessions whose ride this daemon closed at arrival. Re-adopting one
         # is how a single 8/27 ride became nine (see _maybe_adopt).
         self.ended_arrived = set()
+        # ...and its `timeout` twin (75.23): session -> the START_GO_MODE t
+        # of a ride opened from its own start and closed by silence. That
+        # ride's later records do not re-open it; a new START does.
+        self.ended_timeout = {}
+        # session -> records refused because they were already more than
+        # SESSION_TIMEOUT_MS behind the stream (75.23); logged once each.
+        self._declined_late = collections.OrderedDict()
+        # (session, t) of each START_GO_MODE refused for the same reason, so
+        # the ride opened from it later says what actually happened.
+        self._late_starts = collections.OrderedDict()
         # Onboard-flow anomalies seen BEFORE a trip exists. The "I'm already on
         # a bus" flow runs entirely pre-START_GO_MODE, so its findings have no
         # trip to hang on yet; they are flushed when the trip opens.
@@ -2511,6 +2578,8 @@ class RideWatch:
         # ACTION_STORM_WINDOW_MS, and (session, type) -> last warn ms.
         self.action_rate = {}
         self.action_storm_last = {}
+        # session -> the simulated `source` its fixes carry (75.26b).
+        self.simulated_sessions = collections.OrderedDict()
         # The relaunch gap (37.2): session -> (t, label) of its latest record,
         # the one before it, and the record before the latest boot marker.
         self.session_last_record = {}
@@ -2522,6 +2591,9 @@ class RideWatch:
         self.duplicate_records = 0
         self.last_trip_summary = self._load_state()
         self.clock_ms = 0             # replay: max event t; live: wall clock
+        # replay only: the next record-time instant the live loop would have
+        # ticked check_timers at (75.26a). None until the first record.
+        self._replay_tick_ms = None
         self.last_push_ms = 0         # global rate limit (shared w/ fallback)
         # ...which the "report pending" page is now exempt from; it spends
         # REPORT_PAGE_MIN_INTERVAL_MS of its own instead.
@@ -2675,6 +2747,59 @@ class RideWatch:
             self.log.error("event processing failed: %r (line type=%s)" % (
                 exc, obj.get("type") or obj.get("event")))
 
+    def replay_line(self, raw):
+        """process_line for --replay: first the 5 s ticks the live loop would
+        have run before this record arrived (75.26a), then the record.
+
+        Without them the replay clock moved only on records, so every rule
+        that matures in SILENCE fired late, with the silence's numbers, or
+        not at all: 10-20 `mvgr2jqp-b81j4g`'s `arrived-never-ended` filed at
+        10:58:18 "47m58s open" against the live daemon's 10:14:51 "4m31s
+        open", because the phone slept 48 min and no record moved the clock;
+        `gps-gap` 10-26 "79s" against live "63s".
+        """
+        try:
+            obj = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(obj, dict):
+            return
+        t = obj.get("t") or int((obj.get("recv") or 0) * 1000)
+        if isinstance(t, (int, float)) and not isinstance(t, bool) and t > 0:
+            self._replay_ticks_until(int(t))
+        self.process(obj)
+
+    def _replay_ticks_until(self, t):
+        """Run check_timers at every LIVE_TICK_MS step of record time before t.
+
+        On the live loop's own cadence — every 5 s from the first record,
+        whatever the records do in between — and only forward: a tick that
+        falls before a record the clock has already passed is skipped, as a
+        late record never moves the clock back. A quiet stretch is walked for
+        at most REPLAY_TICK_SPAN_MAX_MS, then the clock jumps.
+        """
+        nxt = self._replay_tick_ms
+        if nxt is None:
+            self._replay_tick_ms = t + LIVE_TICK_MS
+            return
+        if t - nxt > REPLAY_TICK_SPAN_MAX_MS:
+            stop = nxt + REPLAY_TICK_SPAN_MAX_MS
+        else:
+            stop = t
+        while nxt < stop:
+            if nxt > self.clock_ms:
+                self.clock_ms = nxt
+                try:
+                    self.check_timers()
+                except Exception as exc:  # same contract as process()
+                    self.log.error("replay tick failed at %s: %r"
+                                   % (fmt_hms(nxt), exc))
+            nxt += LIVE_TICK_MS
+        if nxt < t:
+            # Jumped the rest of a very long gap: restart the cadence there.
+            nxt = t + LIVE_TICK_MS
+        self._replay_tick_ms = nxt
+
     def _is_duplicate_record(self, obj, t, session, kind, typ):
         """The same record, delivered twice by a client that re-POSTed a batch.
 
@@ -2778,6 +2903,8 @@ class RideWatch:
         self._note_request_timeout(session, t, typ, obj)
         self._note_href(session, obj)
         self._note_session_record(session, t, kind, typ, obj)
+        if typ == "UPDATE_POSITION":
+            self._note_position_source(session, obj.get("payload"))
         self._rule_action_storm(session, t, kind, typ, trip)
 
         if typ == "START_GO_MODE":
@@ -2963,7 +3090,7 @@ class RideWatch:
 
     # -- state machine ------------------------------------------------------
 
-    def _on_start_go_mode(self, session, t, obj):
+    def _on_start_go_mode(self, session, t, obj, recovered=False):
         payload = obj.get("payload") or {}
         summary = summarize_itinerary(payload)
         trip = self.trips.get(session)
@@ -2982,17 +3109,37 @@ class RideWatch:
                 self._end_trip(trip, trip.segment_stop_ms, "stop")
                 trip = None
         if trip is None:
+            # 75.23: a START already older than SESSION_TIMEOUT_MS behind the
+            # stream opens a trip check_timers closes on this same record, and
+            # spawns a console for it. It stays on disk: the adopt path reads
+            # it back (_recover_go_mode_starts) once the backlog it heads is
+            # within the timeout, and opens the ride from it then — one ride,
+            # with its real start. A START the adopt path recovered is that
+            # second step and is not judged again.
+            if not recovered and self._too_late_to_open(
+                    session, t, "START_GO_MODE"):
+                # Still the rider asking for a ride under this id, unless it
+                # is older than the ride this session last ended.
+                if t > self.recently_ended.get(session, 0):
+                    self.ended_arrived.discard(session)
+                    self.ended_timeout.pop(session, None)
+                    self._declined_completed.discard(session)
+                    self._bounded_put(self._late_starts, (session, int(t)),
+                                      self.now_ms() - t)
+                return
             trip = Trip(session, t, summary)
             if ms_kind == "plan":
                 trip.multi_stop = ms_plan
             # The rider asked for a ride under this id: whatever we decided
             # about the last one is history.
             self.ended_arrived.discard(session)
+            self.ended_timeout.pop(session, None)
             self._declined_completed.discard(session)
             trip.device = obj.get("device")
             trip.round_trip = bool(payload.get("roundTrip"))
             self._note_device_session(trip.device, session)
             self._stamp_trip_bundle(trip)
+            self._join_ride_budget(trip)
             self.trips[session] = trip
             self.log.info("trip started: session=%s itinerary=%s" % (
                 session, itinerary_one_liner(summary)))
@@ -3078,6 +3225,17 @@ class RideWatch:
         ended = self.recently_ended.get(session, 0)
         if t - ended <= 60 * 1000:
             return
+        # 75.23: and the record must not already be dead by this daemon's own
+        # definition. The guard above is in RECORD time, so a backlog that
+        # lands more than SESSION_TIMEOUT_MS late got past it once a minute:
+        # adopt at t, check_timers (same call) sees now - t > 15 min and ends
+        # it `timeout` at t, and the tick 60 s of record time later adopts
+        # again — the 09-05 .gz replay's 37 rides for `mtn4ui3s-xfjx8m`, and
+        # live, one console and one report request per minute of backlog.
+        # The test is the timer's own (now_ms(): wall clock live, the newest
+        # record in replay), so nothing it lets through is closed on arrival.
+        if self._too_late_to_open(session, t, "UPDATE_PROGRESS"):
+            return
         # A ride this daemon already closed at arrival does not come back
         # sixty seconds later. Replaying 8/27 with the arrival rule and
         # without this turned that afternoon's one 4.5-hour ride into NINE:
@@ -3087,6 +3245,23 @@ class RideWatch:
         # calling it `deviated`. Only an explicit START_GO_MODE re-opens this
         # session, which is the rider asking for a ride in so many words.
         if session in self.ended_arrived:
+            return
+        # The same loop through the `timeout` door (75.23), keyed on the ride
+        # rather than the clock: a ride this daemon opened from its own
+        # START_GO_MODE and closed after 15 min of silence is not re-opened
+        # by its own late records. Without this a backlog whose head is that
+        # START would still open the ride twice — once from the start, once
+        # from the read-back of the same start — and file `missed-start`
+        # about a record this daemon had processed. A new START re-opens it.
+        if session in self.ended_timeout:
+            if self._bounded_put(self._declined_late, ("timeout", session),
+                                 0):
+                self.log.info(
+                    "not adopting session %s: its ride (START_GO_MODE %s)"
+                    " already ended on a %d min silence here, and only a new"
+                    " START_GO_MODE re-opens it (75.23)"
+                    % (session, fmt_hms(self.ended_timeout[session]),
+                       SESSION_TIMEOUT_MS // 60000))
             return
         if p.get("status") == "completed":
             if session not in self._declined_completed:
@@ -3125,7 +3300,10 @@ class RideWatch:
         blocked = self._ride_already_written_up(session, candidate_start)
         if blocked is not None:
             self._log_reported_ride_declined(session, blocked, candidate_start)
+            # ...and it will be asked again on the next tick; the read-back
+            # stays cached so that ask costs only the new bytes (75.25).
             return
+        self._readback.pop(session, None)
         if recovered:
             self._open_from_recovered_start(session, t, obj, p, recovered)
             return
@@ -3136,6 +3314,7 @@ class RideWatch:
         trip = Trip(session, t, None, adopted=True)
         trip.device = obj.get("device")
         self._stamp_trip_bundle(trip)
+        self._join_ride_budget(trip)
         self.trips[session] = trip
         self.log.info("adopted mid-stream trip for session %s" % session)
         self._log_stream_window("adopt of %s" % session)
@@ -3148,6 +3327,38 @@ class RideWatch:
         self._rule_resumed_trip(trip, t, obj)
         self._on_progress(trip, t, p)
         self._mark_dirty()
+
+    @staticmethod
+    def _bounded_put(cache, key, value, limit=SESSION_CACHE_MAX):
+        """Insert into a small OrderedDict, oldest out first. True if new."""
+        new = key not in cache
+        cache[key] = value
+        while len(cache) > limit:
+            cache.popitem(last=False)
+        return new
+
+    def _too_late_to_open(self, session, t, what):
+        """Is a record that would open a trip already past the timeout? (75.23)
+
+        check_timers ends any trip whose newest record is more than
+        SESSION_TIMEOUT_MS behind now_ms(), and it runs at the end of the very
+        _process call that opened the trip — so a trip opened off a record
+        that old is closed before the next line is read, having spawned its
+        console and, with findings, written its report request. Measured
+        against the same clock as that timer, so the two can never disagree.
+        """
+        behind = self.now_ms() - t
+        if behind <= SESSION_TIMEOUT_MS:
+            return False
+        if self._bounded_put(self._declined_late, session, int(t)):
+            self.log.info(
+                "not opening a trip for %s off its %s at %s: it arrived %s"
+                " behind the stream, past the %d min timeout that would close"
+                " it on the spot (75.23). Its records open the ride once they"
+                " are within the timeout."
+                % (session, what, fmt_hms(t), fmt_ms_span(behind),
+                   SESSION_TIMEOUT_MS // 60000))
+        return True
 
     def _open_from_recovered_start(self, session, t, obj, p, recovered):
         """Open the trip off the START_GO_MODE the follower never delivered.
@@ -3173,7 +3384,8 @@ class RideWatch:
             % (session, fmt_hms(t), len(recovered), fmt_hms(recovered[0][0])))
         self._log_stream_window("recovered start for %s" % session)
         for start_ms, start_obj in recovered:
-            self._on_start_go_mode(session, start_ms, start_obj)
+            self._on_start_go_mode(session, start_ms, start_obj,
+                                   recovered=True)
         trip = self.trips.get(session)
         if trip is None:
             # _on_start_go_mode does not fail, but it is not this function's
@@ -3201,18 +3413,33 @@ class RideWatch:
         # whole cost of 09-15 was a thread spending its wrap-up disproving the
         # opposite. What is worth a finding is the thing that actually went
         # wrong -- the follower handed over none of it.
+        late_ms = self._late_starts.get((session, recovered[0][0]))
+        if late_ms is None:
+            summary = ("the daemon opened this ride %s late: %d START_GO_MODE"
+                       " record(s) from %s were in the stream and were never"
+                       " processed"
+                       % (fmt_ms_span(t - recovered[0][0]), len(recovered),
+                          fmt_hms(recovered[0][0])))
+        else:
+            # 75.23: the follower did deliver it, already older than the
+            # timeout, and a record that old cannot open a trip
+            # (_too_late_to_open). Not the 09-15 follower miss this finding
+            # is otherwise about.
+            summary = ("the phone delivered this ride %s late: its"
+                       " START_GO_MODE from %s arrived more than %d min"
+                       " behind the stream, so the ride was opened from it"
+                       " once its records caught up"
+                       % (fmt_ms_span(late_ms), fmt_hms(recovered[0][0]),
+                          SESSION_TIMEOUT_MS // 60000))
         self._finding(
-            trip, t, "missed-start", "warn",
-            "the daemon opened this ride %s late: %d START_GO_MODE record(s)"
-            " from %s were in the stream and were never processed"
-            % (fmt_ms_span(t - recovered[0][0]), len(recovered),
-               fmt_hms(recovered[0][0])),
+            trip, t, "missed-start", "warn", summary,
             {"session": session,
              "device": obj.get("device"),
              "startMs": recovered[0][0],
              "noticedMs": int(t),
              "startsRecovered": [ms for ms, _ in recovered],
              "recoveredFrom": self._stream_path(),
+             "deliveredLateMs": late_ms,
              "replayable": True})
         self._on_progress(trip, t, p)
         self._mark_dirty()
@@ -3351,9 +3578,7 @@ class RideWatch:
         """
         cutoff = t - ADOPT_START_LOOKBACK_MS
         starts = []
-        for obj in self._tail_records():
-            if obj.get("session") != session:
-                continue
+        for _offset, obj in self._stream_go_mode_marks(session):
             ot = obj.get("t")
             if not isinstance(ot, (int, float)) or ot > t or ot < cutoff:
                 continue
@@ -3364,6 +3589,75 @@ class RideWatch:
                 starts.append((int(ot), obj))
         starts.sort(key=lambda e: e[0])
         return starts
+
+    def _stream_go_mode_marks(self, session):
+        """The session's START_GO_MODE / STOP_GO_MODE records in the
+        read-back window, oldest first, as (line offset, record). (75.25)
+
+        The window is _tail_records' — the last ADOPT_START_LOOKBACK_BYTES of
+        the stream, less the partial line the seek lands in — but a session
+        is read once and then only from where its last read stopped. A
+        session the adopt path declines (24.1) asks again on every
+        UPDATE_PROGRESS, and until 75.25 every ask re-read and json-parsed
+        the whole 8 MB: 225 times for one finished session of the 09-05 .gz,
+        715,941 parses for a 13,373-line file, 0.13-0.34 s a tick on the
+        daemon's only event thread. A line is parsed at all only if it can be
+        one of the two records.
+
+        Re-read from scratch when the answer could have moved under the
+        cache: another file (UTC rollover, or a replay), another inode, a
+        file shorter than the last read (rewritten, 16.7), or more new bytes
+        than the window itself.
+        """
+        path = self._stream_path()
+        hit = self._readback.get(session)
+        try:
+            with open(path, "rb") as f:
+                st = os.fstat(f.fileno())
+                size = st.st_size
+                fresh = (hit is None or hit["path"] != path
+                         or hit["ino"] != st.st_ino or size < hit["end"]
+                         or size - hit["end"] > ADOPT_START_LOOKBACK_BYTES)
+                if fresh:
+                    start = max(0, size - ADOPT_START_LOOKBACK_BYTES)
+                    marks = []
+                else:
+                    start = hit["end"]
+                    marks = list(hit["marks"])
+                f.seek(start)
+                chunk = f.read(size - start)
+        except OSError as exc:
+            self.log.warn("could not read back the stream (%s): %r"
+                          % (path, exc))
+            return []
+        # Whole lines only: a line still being written is read next time,
+        # from its start.
+        complete = chunk[:chunk.rfind(b"\n") + 1]
+        needle = (session.encode("ascii")
+                  if re.fullmatch(r"[A-Za-z0-9_.-]+", session) else None)
+        pos = start
+        for i, raw in enumerate(complete.split(b"\n")[:-1]):
+            offset, pos = pos, pos + len(raw) + 1
+            if fresh and i == 0 and start > 0:
+                continue          # the partial head the arbitrary seek lands in
+            if b"_GO_MODE" not in raw or (needle and needle not in raw):
+                continue
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            if (isinstance(obj, dict) and obj.get("session") == session
+                    and obj.get("type") in ("START_GO_MODE", "STOP_GO_MODE")):
+                marks.append((offset, obj))
+        if size > ADOPT_START_LOOKBACK_BYTES:
+            # What a full read now would no longer reach.
+            floor = size - ADOPT_START_LOOKBACK_BYTES
+            marks = [m for m in marks if m[0] > floor]
+        self._bounded_put(self._readback, session,
+                          {"path": path, "ino": st.st_ino,
+                           "end": start + len(complete), "marks": marks},
+                          limit=READBACK_CACHE_MAX)
+        return marks
 
     def _seed_last_fix_from_stream(self, trip, t):
         """Point a late-opened trip's fix clock at the newest fix on disk.
@@ -4057,7 +4351,8 @@ class RideWatch:
     SEGMENT_KEEPS = frozenset((
         "session", "sessions", "device", "bundle", "bundle_native",
         "start_ms", "adopted", "swap_seq", "swap_times", "last_event_ms",
-        "findings", "pages_sent", "pending_pages", "pending_until_ms",
+        "findings", "pages_sent", "page_budget", "pending_pages",
+        "pending_until_ms",
         "thread", "thread_events", "thread_cursor", "thread_pushes",
         "last_thread_push_ms", "notes", "report_path", "console_seen",
         "searches", "last_rider_action_ms", "wake_lock_bursts",
@@ -5127,6 +5422,12 @@ class RideWatch:
             self.recently_ended[key] = t
             if reason == "arrived":
                 self.ended_arrived.add(key)
+            elif reason == "timeout" and not trip.adopted:
+                # 75.23: see _maybe_adopt. Only a ride with its own START: an
+                # adopted one has no start to be the same ride as, and the
+                # timeout guard in _maybe_adopt is what keeps its late
+                # records from looping.
+                self.ended_timeout[key] = trip.start_ms
         self.ended_trips.append(trip)
         n = len(trip.findings)
         self.log.info("trip ended: session=%s reason=%s findings=%d" % (
@@ -6109,8 +6410,15 @@ class RideWatch:
             return
         lat, lon = coords.get("latitude"), coords.get("longitude")
         if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            # A simulated fix is timed by its own clock (75.26b).
+            clock = None
+            ts = p.get("timestamp")
+            if (p.get("source") in SIMULATED_POSITION_SOURCES
+                    and isinstance(ts, (int, float))
+                    and not isinstance(ts, bool) and ts > 0):
+                clock = int(ts)
             self._check_position_teleport(trip, t, lat, lon,
-                                          coords.get("accuracy"))
+                                          coords.get("accuracy"), clock=clock)
             trip.last_fix = (lat, lon)
             # Stall anchor: the oldest fix the rider has not meaningfully left.
             anchor = trip.stall_anchor
@@ -6120,7 +6428,8 @@ class RideWatch:
             else:
                 trip.fixes_since_anchor += 1
 
-    def _check_position_teleport(self, trip, t, lat, lon, accuracy):
+    def _check_position_teleport(self, trip, t, lat, lon, accuracy,
+                                 clock=None):
         """Two consecutive fixes that cannot both be true. (18.3a)
 
         Called BEFORE trip.last_fix is overwritten, so the pair being judged is
@@ -6137,12 +6446,19 @@ class RideWatch:
         Deliberately NOT gated on the rider being on a particular leg or mode:
         the defect is in the phone, and it fired on a bike leg on 09-17 and on
         a bus leg on 09-15.
+
+        `clock` is the time the pair is judged on: the fix's own `timestamp`
+        for a replayed or simulated fix (75.26b), `t` otherwise. The finding
+        is still filed at `t`, where the ledger and the ride window are.
         """
+        own_clock = clock is not None
+        if clock is None:
+            clock = t
         prev = trip.last_fix_meta
-        trip.last_fix_meta = (t, lat, lon, accuracy)
+        trip.last_fix_meta = (clock, lat, lon, accuracy)
         if prev is None:
             return
-        gap = t - prev[0]
+        gap = clock - prev[0]
         if gap < 0 or gap > TELEPORT_MAX_GAP_MS:
             return
         # Both ends must claim to be sure of themselves. A missing accuracy is
@@ -6155,8 +6471,9 @@ class RideWatch:
         meters = meters_between((prev[1], prev[2]), (lat, lon))
         if meters <= TELEPORT_MIN_M:
             return
-        trip.teleports.append((t, meters, gap, prev[3], accuracy))
-        while trip.teleports and t - trip.teleports[0][0] > TELEPORT_WINDOW_MS:
+        trip.teleports.append((clock, meters, gap, prev[3], accuracy))
+        while trip.teleports and \
+                clock - trip.teleports[0][0] > TELEPORT_WINDOW_MS:
             trip.teleports.popleft()
         n = len(trip.teleports)
         if n < TELEPORT_WARN_COUNT:
@@ -6166,10 +6483,10 @@ class RideWatch:
         # holds the escalation: a stream that has got worse since the warn is
         # news, and it gets through once.
         if trip.teleport_fired_ms and \
-                t - trip.teleport_fired_ms <= TELEPORT_COOLDOWN_MS and \
+                clock - trip.teleport_fired_ms <= TELEPORT_COOLDOWN_MS and \
                 not (page and not trip.teleport_paged):
             return
-        trip.teleport_fired_ms = t
+        trip.teleport_fired_ms = clock
         biggest = max(trip.teleports, key=lambda j: j[1])
         summary = ("position jumped %.0fm in %.1fs, %d times in the last"
                    " minute (accuracy %.0f/%.0fm — both fixes trusted)"
@@ -6184,6 +6501,8 @@ class RideWatch:
                    "minMeters": TELEPORT_MIN_M,
                    "maxGapMs": TELEPORT_MAX_GAP_MS,
                    "maxAccuracyM": TELEPORT_MAX_ACCURACY_M}
+        if own_clock:
+            context["clock"] = "fix timestamp (simulated source, 75.26b)"
         if page:
             trip.teleport_paged = True
             self._finding(
@@ -7166,15 +7485,30 @@ class RideWatch:
             return boot[0]
         return self.session_prior_record.get(session)
 
+    def _note_position_source(self, session, payload):
+        """Remember a session whose fixes say they are simulated (75.26b)."""
+        source = payload.get("source") if isinstance(payload, dict) else None
+        if source in SIMULATED_POSITION_SOURCES \
+                and session not in self.simulated_sessions:
+            self._bounded_put(self.simulated_sessions, session, source)
+            self.log.info(
+                "session %s is a %s (fix source %r): action-storm is not"
+                " judged on it, position-teleport uses each fix's own clock"
+                % (session, "browser replay" if source == "replay"
+                   else "GPS simulation", source))
+
     def _rule_action_storm(self, session, t, kind, typ, trip):
         """One action type dispatched in a loop. 37.2 (warn, never a page).
 
         Counted for every session, filed only inside a trip: the finding
         belongs to a ride's report, and a storm on the planner screen with no
         ride open has nobody to read it. See ACTION_STORM_EXCLUDED for the
-        measurement that set the threshold and the exclusions.
+        measurement that set the threshold and the exclusions — and
+        SIMULATED_POSITION_SOURCES for why a replayed session is not judged.
         """
         if kind != "action" or not typ or typ in ACTION_STORM_EXCLUDED:
+            return
+        if session in self.simulated_sessions:
             return
         key = (session, typ)
         window = self.action_rate.get(key)
@@ -9538,14 +9872,52 @@ class RideWatch:
         self._mark_dirty()
 
     def _page(self, trip, body):
-        """Send a page if the trip's budget and the rate limit allow it."""
-        if trip.pages_sent >= MAX_PAGES_PER_TRIP:
-            self.log.info("page suppressed (cap %d/trip): %s" % (MAX_PAGES_PER_TRIP, body))
+        """Send a page if the ride's budget and the rate limit allow it.
+
+        The budget is the ride's, not this Trip's (75.24): a STOP -> START
+        re-pick a few seconds later is the same ride on the rider's lock
+        screen, and _join_ride_budget hands the new Trip the old one's count.
+        """
+        budget = trip.page_budget
+        if budget["sent"] >= MAX_PAGES_PER_TRIP:
+            self.log.info("page suppressed (cap %d/ride%s): %s"
+                          % (MAX_PAGES_PER_TRIP,
+                             "" if budget["sent"] == trip.pages_sent
+                             else ", %d spent by the ride's earlier trip(s)"
+                             % (budget["sent"] - trip.pages_sent), body))
             return False
         if self._send_push("Ride watch", body, kind="page"):
             trip.pages_sent += 1
+            budget["sent"] += 1
             return True
         return False
+
+    def _join_ride_budget(self, trip):
+        """Hand a newly opened Trip its ride's page budget. (75.24)
+
+        The ride is the newest ended Trip that answers to one of this Trip's
+        session ids, ended no more than RIDE_PAGE_CHAIN_MS before this one
+        opened, and had not arrived. Chains: a third re-pick inherits the
+        budget the second inherited. Anything else starts a fresh two.
+        """
+        sessions = set(trip.sessions or [trip.session])
+        for prior in reversed(self.ended_trips):
+            if prior is trip or prior.end_ms is None:
+                continue
+            if not sessions.intersection(prior.sessions or [prior.session]):
+                continue
+            if (prior.arrived_ms is None
+                    and trip.start_ms - prior.end_ms <= RIDE_PAGE_CHAIN_MS):
+                trip.page_budget = prior.page_budget
+                self.log.info(
+                    "%s opened %s after the trip before it ended: same ride,"
+                    " %d of %d page(s) already spent"
+                    % (trip.session, fmt_ms_span(
+                        max(0, trip.start_ms - prior.end_ms)),
+                       prior.page_budget["sent"], MAX_PAGES_PER_TRIP))
+            # Only the newest Trip of the session can be the one this opens
+            # after; ended_trips is in end order.
+            return
 
     def _send_push(self, title, body, kind="page", bypass_rate_limit=False):
         """Send a Pushover message. Returns True if sent (or dry-run-logged).
@@ -10562,7 +10934,9 @@ class RideWatch:
         else:
             lines.append("- Last fix: none yet (trip opened %ds ago)"
                          % max(0, (now - trip.start_ms) // 1000))
-        lines.append("- Pages sent: %d/%d" % (trip.pages_sent, MAX_PAGES_PER_TRIP))
+        # The ride's count (75.24): what is left of the rider's two.
+        lines.append("- Pages sent: %d/%d"
+                     % (trip.page_budget["sent"], MAX_PAGES_PER_TRIP))
         if trip.thread:
             lines.append("- Ride thread: `tmux -L %s attach -t %s` (%s), %d event(s)" % (
                 THREAD_TMUX_SOCKET, trip.thread["tmux"],
@@ -10764,6 +11138,8 @@ class RideWatch:
     def note_stream_rewrite(self, why, detail):
         """The follower found the day file rewritten under it (16.7): say so on
         every active trip, because a stretch of records may never be read."""
+        # The read-back offsets point into the old bytes (75.25).
+        self._readback.clear()
         now = int(time.time() * 1000)
         seen = set()
         for trip in list(self.trips.values()):
@@ -11072,7 +11448,7 @@ def run_replay(path, watch=None, watch_dir=None):
     watch.stream_path = path
     with open(path, "rb") as f:
         for raw in f:
-            watch.process_line(raw.decode("utf-8", "replace"))
+            watch.replay_line(raw.decode("utf-8", "replace"))
     watch.finalize_replay()
     return watch
 
@@ -11102,7 +11478,7 @@ def run_live(watch_dir=None):
     while not stop["flag"]:
         tailer.poll(watch.process_line)
         now = time.time()
-        if now - last_tick >= 5.0:
+        if now - last_tick >= LIVE_TICK_MS / 1000.0:
             last_tick = now
             watch.check_timers()
         watch.maybe_write_status()

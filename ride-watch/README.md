@@ -51,6 +51,15 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
   8/31's two phantom rides were both adopted off post-arrival ticks), or the
   daemon closed that session at arrival already (only a fresh `START_GO_MODE`
   re-opens it).
+- **Nothing opens a trip off a record already more than 15 minutes behind
+  the stream** (75.23) — not an adoption, not a `START_GO_MODE` — because the
+  silence timeout would close that trip on the same record. A backlog the
+  phone delivers late opens its ride once its records come within the
+  timeout, from the backlog's own `START_GO_MODE` when it has one; until
+  then it opened one phantom ride, console and report request per minute of
+  backlog. And a ride opened from its own start and closed by the timeout is
+  not re-opened by its own late records: like an arrival, only a new
+  `START_GO_MODE` re-opens the session.
 - A new session id that is plainly the **same ride re-mounted** — same
   device, no `START_GO_MODE` of its own, within 2 minutes, same leg at the
   same point in it — is adopted as an alias of the running trip rather than
@@ -77,7 +86,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `notification-repeat` | the same alert (id stem + title) twice in 5 minutes — and the same message too, where the stem's titles differ only in their numbers | page |
 | `deviated-streak` | `status='deviated'` continuously >90s | warn (page on a transit leg) |
 | `gps-gap` | no `UPDATE_POSITION` for >60s mid-trip, measured from the newest fix TIMESTAMP the stream holds — never from when the daemon last looked (19.2) | warn |
-| `position-teleport` | consecutive fixes >150m apart within 2s with **both** accuracies <30m, twice in a rolling minute | warn (page at 5 in a minute) |
+| `position-teleport` | consecutive fixes >150m apart within 2s with **both** accuracies <30m, twice in a rolling minute. A replayed or simulated fix (`source: 'replay'` / `'sim'`) is timed by its own `timestamp`, the ride's clock, not the replay's wall time (75.26b) | warn (page at 5 in a minute) |
 | `progress-without-motion` | leg progress gains >5 points in the time the rider covers 15m (the anchor's percentage is re-based on an itinerary swap, which changes the denominator and not the rider). Never on a tick the app labels `deviated` or on a leg shorter than 50 m — those are suppressed, not skipped: they still re-anchor and spend the cooldown (26.8) | warn |
 | `reroute-storm` | more than 3 automatic re-plans in 5 minutes: **`autoApply: true`** `START_REROUTE`, plus every `AUTO_REPLAN` that has no `START_REROUTE` behind it (the quiet re-plan dispatches none) | warn |
 | `replan-not-converging` | 4 re-plans with no 50m gain on `distanceToDestination`, and the app never said so | page |
@@ -92,7 +101,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 | `arrived-far-from-destination` | arrival latched while the same tick's `distanceToDestination` is past the client's own 75 m `ARRIVAL_RADIUS_M` (not on a round trip's outbound pause) | warn, once an arrival |
 | `riding-fact-dropped` | a bare `CLEAR_RIDING` after a `CONFIRM_VEHICLE`, with no `TRANSITION_LEG` or `STOP_GO_MODE` to explain it | warn, once a ride |
 | `resumed-trip` | a ride that began with no `START_GO_MODE` **anywhere in the stream**, so it has no replay fixture | warn (info when it is the daemon that restarted) |
-| `missed-start` | the ride's `START_GO_MODE` was in the stream and the follower never delivered it; the trip is opened from it rather than adopted | warn |
+| `missed-start` | the ride's `START_GO_MODE` was in the stream and the follower never delivered it — or delivered it more than 15 min late (75.23, "the phone delivered this ride … late") — so the trip is opened from it rather than adopted | warn |
 | `vehicle-match-never` | a transit leg polled >=30 times and the live matcher never named a vehicle | warn |
 | `bike-egress-missing` | a bike+transit search whose transit results all end on foot | warn |
 | `panel-torn-down` | a settings/detail screen unmounted by the rider's own query change (one finding per episode, with the count) | warn |
@@ -412,7 +421,11 @@ the rider actually talks to; see *The ride thread* below.
 
 **2. Pushover — the interrupt.** Only `page`-severity findings, at most
 **2 per ride**, with a **120s minimum gap**. Everything beyond the cap is
-logged, not sent. Message copy follows the rider's rule: only the numbers
+logged, not sent. A ride is not one trip object (75.24): a trip that opens on
+the same session id within 5 minutes of the previous one ending — a STOP →
+START re-pick, 19 s apart on 2026-10-20 — shares that ride's two, unless the
+previous one had arrived. A second phone on the same ride keeps its own
+budget (an open product call). Message copy follows the rider's rule: only the numbers
 they can act on, under 120 characters, no coaching phrases, no exclamation
 marks. Credentials come from `~/.config/pushover/credentials`
 (`USER_KEY=` / `API_TOKEN=`, one per line).
@@ -1250,18 +1263,37 @@ cannot clobber the live status file. Use `--watch-dir DIR` to send output
 somewhere else. It prints every finding with its local time and the pushes that
 *would* have gone out.
 
+**The replay clock.** Replay drives its clock off the records
+(`clock_ms = max(event t)`) and, between them, runs the live loop's 5 s
+`check_timers` tick in record time (75.26a), so a rule that matures in
+silence — `gps-gap`, `stalled-progress`, the arrival close and
+`arrived-never-ended`, a page's coalescing window — fires when it would have
+live, with the live numbers. Before that, 10-20's `arrived-never-ended` came
+out at 10:58:18 "47m58s open" against the live 10:14:51 "4m31s open" (now
+10:14:52 "4m32s"), and 2026-09-21's real 80 s hole at 16:06:05 — every
+record stopped — was in the file and no replay reported it (now `gps-gap`
+16:07:07 "62s"). A quiet stretch is walked for at most 6 hours, then the
+clock jumps.
+
+A day file written by a **browser replay** (positions tagged `source:
+'replay'`, the simulated clock in `timestamp`) runs at 6-12x: the daemon
+times its fixes by that `timestamp` and does not judge `action-storm` on it at
+all (75.26b) — on the 10-28 sweep both were pure compression.
+
 **What a replay cannot show, and it is not a small thing.** Replay reads
-*every* line and drives its clock off the events (`clock_ms = max(event t)`),
-so two whole classes of live failure do not exist in it:
+*every* line in file order on record time, so whole classes of live failure
+do not exist in it:
 
 - **the daemon's own blindness.** A backlog the follower skipped, or a batch
   that had not reached this host's rsync mirror yet, is simply read here. The
   2026-09-19 `gps-gap "no GPS fix for 99s"` and the 2026-09-21 `"136 s"` (19.2)
   are both invisible to `--replay` on the code that produced them — replaying
   those two day files on 888fc96 files neither.
-- **an outage that stops ALL telemetry.** With no events the replay clock does
-  not advance, so the gap never opens. 2026-09-21's real 80 s hole at 16:06:05
-  is in the file and no replay of it reports a thing.
+- **late delivery.** The clock is the records' `t`, not when they arrived. A
+  phone that slept through its arrival and uploaded it 30 min later (10-20
+  `mvh6ypt8-rtb6ih`: `SET_ARRIVED` t 17:51:51, recv 18:22:21) is closed
+  `arrived` at 17:56 by a replay and `timeout` by the live daemon, which
+  never saw the arrival in time.
 
 So a rule about *staleness* is verified against the live shape, not a replay:
 hand the daemon the tail of a real day file with `watch.stream_path` pointing
