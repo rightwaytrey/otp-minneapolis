@@ -2208,6 +2208,10 @@ class Trip:
         self.boarding_prompt_fired = False
         self.prev_stops = None
         self.stops_swap_pending = False   # itinerary swapped since last count
+        # ...and that swap was the rider's own onboard pick (CLEAR_ONBOARD
+        # inside ONBOARD_COMMIT_WINDOW_MS). Only such a swap can make the
+        # first count after it a new baseline (22.3); see _stop_collapse_verdict.
+        self.stops_swap_pick = False
         self.collapse_fired_seq = set()
         self.stop_increase_last_ms = 0
         self.deviated_since_ms = None
@@ -3013,9 +3017,10 @@ class RideWatch:
             # (17.9b). Stamped as a rider action before _rule_aboard_swap
             # reads last_rider_action_ms, which is the gate it already has for
             # every other explicit pick.
-            if (trip.clear_onboard_ms
-                    and 0 <= t - trip.clear_onboard_ms
-                    <= ONBOARD_COMMIT_WINDOW_MS):
+            onboard_pick = bool(trip.clear_onboard_ms
+                                and 0 <= t - trip.clear_onboard_ms
+                                <= ONBOARD_COMMIT_WINDOW_MS)
+            if onboard_pick:
                 trip.last_rider_action_ms = t
                 self.log.info(
                     "itinerary swap is a rider onboard pick: session=%s "
@@ -3036,8 +3041,13 @@ class RideWatch:
                 trip.itinerary = summary
             # Keep prev_stops: a stop count that collapses to 1 *because of*
             # a swap is exactly the anomaly rule (a) exists to catch. Only
-            # rule (b) (stop-count-increase) is excused across a swap.
+            # rule (b) (stop-count-increase) is excused across a swap — and,
+            # since 22.3, the rider's own onboard pick of a one-stop leg they
+            # are on, which is why the pick is remembered with the swap. The
+            # app's own re-plan never is: 2026-07-29 17:28:52 auto-applied a
+            # leg that started 5.5 km ahead of the rider.
             trip.stops_swap_pending = True
+            trip.stops_swap_pick = onboard_pick
             trip.prev_dist = None
             self.log.info("itinerary swap #%d: session=%s -> %s" % (
                 trip.swap_seq, session, itinerary_one_liner(summary)))
@@ -6060,7 +6070,8 @@ class RideWatch:
                         and trip.swap_seq not in trip.collapse_fired_seq):
                     verdict = self._stop_collapse_verdict(
                         trip, p.get("currentLegIndex"), int(prev_stops),
-                        progress, swap_pending=trip.stops_swap_pending)
+                        progress, swap_pending=trip.stops_swap_pending,
+                        swap_pick=trip.stops_swap_pick)
                     if verdict["wrong"]:
                         trip.collapse_fired_seq.add(trip.swap_seq)
                         ctx = {"prevStops": prev_stops, "stops": stops,
@@ -6086,11 +6097,13 @@ class RideWatch:
                          "legIndex": p.get("currentLegIndex")})
             trip.prev_stops = int(stops)
             trip.stops_swap_pending = False
+            trip.stops_swap_pick = False
         else:
             # Street leg: stopsRemaining is absent, so there is nothing to
             # compare against on the next transit leg.
             trip.prev_stops = None
             trip.stops_swap_pending = False
+            trip.stops_swap_pick = False
 
         self._check_progress_without_motion(trip, t, p)
 
@@ -6194,8 +6207,59 @@ class RideWatch:
         else:
             self._finding(trip, t, "position-teleport", "warn", summary, context)
 
+    def _swap_baseline(self, trip, leg, stop, swap_pick):
+        """May a count of 1 right after a swap onto a one-stop leg stand as a
+        new baseline? (22.3)
+
+        A one-stop leg's only stop equals a count of 1 BY CONSTRUCTION, so
+        "the count matches the new leg" cannot tell a correct re-pick from a
+        re-plan that starts ahead of the rider. eecfbcb (cycle 37) let any
+        swap through and lost the page this rule was written for: 2026-07-29
+        17:28:52 the app's own auto re-plan (START_REROUTE `boarded-earlier`,
+        no CLEAR_ONBOARD) installed Knox Ave & 76th St -> Knox Ave & American
+        Blvd while the rider was 5,547 m short of 76th St, with 66th, 76th and
+        American Blvd still to come — three stops, and the app said one.
+
+        So two things have to hold, and both are what 2026-10-20 16:29:34
+        (the false page eecfbcb was for) looked like:
+        - the swap was the rider's own onboard pick (CLEAR_ONBOARD 6 ms before
+          START_GO_MODE that day; 17.9b). The app's re-plans are what rule (a)
+          exists to catch.
+        - the rider is ON the new leg: no farther from its start, or from its
+          stop, than the leg is long plus STOP_COLLAPSE_NEAR_STOP_M (165 m and
+          197 m on a 356 m leg that day). A pick whose leg starts kilometres
+          away is the same lie with a finger on it.
+        With no fix, or no start coordinates on the leg, the pick decides.
+        """
+        out = {"newBaseline": False, "riderPick": bool(swap_pick)}
+        on_leg = None
+        start = None
+        if isinstance(leg, dict) and leg.get("fromLat") is not None \
+                and leg.get("fromLon") is not None:
+            start = (leg["fromLat"], leg["fromLon"])
+        if start is not None and trip.last_fix is not None:
+            end = (stop["lat"], stop["lon"])
+            span = meters_between(start, end)
+            to_start = meters_between(trip.last_fix, start)
+            to_stop = meters_between(trip.last_fix, end)
+            reach = span + STOP_COLLAPSE_NEAR_STOP_M
+            on_leg = to_start <= reach and to_stop <= reach
+            out.update({"riderToLegStartM": round(to_start, 1),
+                        "riderToLegStopM": round(to_stop, 1),
+                        "legSpanM": round(span, 1)})
+        if swap_pick and on_leg is not False:
+            out["newBaseline"] = True
+            return out
+        why = ("the swap was the rider's pick" if swap_pick
+               else "the swap was the app's own re-plan, not the rider's pick")
+        if on_leg is False:
+            why += (", and its leg starts %.0f m from the rider"
+                    % out["riderToLegStartM"])
+        out["notBaseline"] = why
+        return out
+
     def _stop_collapse_verdict(self, trip, leg_index, prev_stops, progress,
-                               swap_pending=False):
+                               swap_pending=False, swap_pick=False):
         """Is a `stopsRemaining` that just fell to 1 actually WRONG? (22.3)
 
         The old test was a percentage: below STOP_COLLAPSE_MAX_PROGRESS of the
@@ -6215,34 +6279,41 @@ class RideWatch:
         Within STOP_COLLAPSE_NEAR_STOP_M of that stop the count is simply
         true and there is nothing to say.
 
-        A leg with no stop coordinates falls back to the percentage, which is
+        A leg with no stop coordinates, or a count the leg cannot index (one
+        taken on the previous plan), falls back to the percentage, which is
         what the 7/29 incident this rule exists for needed: the count there
         collapsed to 1 at the very start of the leg, nowhere near any stop it
-        could have meant.
+        could have meant. A swap onto a one-stop leg is a new baseline only
+        on the terms of _swap_baseline.
         """
         legs = (trip.itinerary or {}).get("legs") or []
+        leg = None
         stops = None
         if isinstance(leg_index, int) and 0 <= leg_index < len(legs):
             leg = legs[leg_index]
             if isinstance(leg, dict):
                 stops = leg.get("stops")
         implied = None
-        if isinstance(stops, list) and stops and swap_pending \
-                and len(stops) == 1:
-            # 22.3 (2026-10-20 16:29:34): the rider changed their get-off
-            # stop aboard, the new plan's leg has exactly one stop call, and
-            # the first count after the swap is 1. `prev_stops` was taken on
-            # the PREVIOUS plan, so comparing it to this leg means nothing:
-            # the count equals the leg's full stop count, a new baseline.
-            return {
-                "wrong": False,
-                "summary": ("on the first count after an itinerary swap, which"
-                            " equals the new leg's only stop — a new"
-                            " baseline"),
-                "push": "",
-                "context": {"stopGeometry": "leg", "newBaseline": True,
-                            "legStopCount": len(stops)},
-            }
+        baseline = None
+        if isinstance(stops, list) and len(stops) == 1 and swap_pending:
+            baseline = self._swap_baseline(trip, leg, stops[0], swap_pick)
+            if baseline["newBaseline"]:
+                # 22.3 (2026-10-20 16:29:34): the rider changed their get-off
+                # stop aboard, the new plan's leg has exactly one stop call,
+                # they are on that leg, and the first count after the swap is
+                # 1. `prev_stops` was taken on the PREVIOUS plan, so comparing
+                # it to this leg means nothing: the count equals the leg's full
+                # stop count, a new baseline.
+                context = {"stopGeometry": "leg", "legStopCount": len(stops)}
+                context.update(baseline)
+                return {
+                    "wrong": False,
+                    "summary": ("on the first count after the rider's own"
+                                " onboard pick, which equals the new leg's"
+                                " only stop — a new baseline"),
+                    "push": "",
+                    "context": context,
+                }
         if isinstance(stops, list) and 1 <= prev_stops <= len(stops):
             implied = stops[-prev_stops]
         if implied is None or trip.last_fix is None:
@@ -6250,6 +6321,9 @@ class RideWatch:
             if not (isinstance(stops, list) and stops):
                 why = ("the leg carries no stop coordinates, so the"
                        " percentage decided")
+            elif baseline is not None:
+                why = ("%s, so the count of 1 is not a new baseline and the"
+                       " percentage decided" % baseline["notBaseline"])
             elif prev_stops > len(stops):
                 why = ("the previous count of %d was taken on the previous"
                        " plan and this leg has %d stops, so the percentage"
@@ -6257,13 +6331,16 @@ class RideWatch:
             else:
                 why = ("no fix to measure the stop from, so the percentage"
                        " decided")
+            context = {"stopGeometry": "unavailable",
+                       "maxProgressPct": STOP_COLLAPSE_MAX_PROGRESS}
+            if baseline is not None:
+                context.update(baseline)
             return {
                 "wrong": wrong,
                 "summary": ("at %.0f%% of transit leg %s (%s)"
                             % (progress, leg_index, why)),
                 "push": "at %.0f%% of the leg" % progress,
-                "context": {"stopGeometry": "unavailable",
-                            "maxProgressPct": STOP_COLLAPSE_MAX_PROGRESS},
+                "context": context,
             }
         gap = meters_between(trip.last_fix,
                              (implied["lat"], implied["lon"]))
@@ -6814,8 +6891,13 @@ class RideWatch:
                     old["tripId"], new["tripId"], new["legIndex"]),
                 {"oldTripId": old["tripId"], "newTripId": new["tripId"],
                  "vehicleId": new["vehicleId"], "legIndex": new["legIndex"]},
-                push_body="Trip id flipped %s to %s on the same leg. Board state suspect."
-                          % (old["tripId"], new["tripId"]))
+                # 75.27: the lock screen gets the route, never a feed trip id
+                # ("1:1273254", "2:t64A-b156-sl1C-v64") — the ids stay in the
+                # summary and context, where triage reads them.
+                push_body=("App moved you onto a different %s trip. Check the"
+                           " trip sheet still shows your bus."
+                           % (new["headsign"] or old.get("headsign")
+                              or "bus")))
         trip.riding = new
         self._mark_dirty()
 
@@ -7787,11 +7869,14 @@ class RideWatch:
             return
         trip.board_early_fired.add(key)
         stop = leg.get("from") or stop_id
+        # 75.27: builds before ~10-19 send no boardSource; say nothing rather
+        # than "(source None)".
+        source = live.get("source")
         self._finding(
             trip, t, "board-arrival-bus-not-here", "warn",
             "\"Bus here\" at %s but the live board for trip %s is %.1f min"
-            " away (source %s)" % (stop, trip_id, ahead / 60000.0,
-                                   live.get("source")),
+            " away%s" % (stop, trip_id, ahead / 60000.0,
+                         " (source %s)" % source if source else ""),
             {"notificationId": p.get("id"), "tripId": trip_id,
              "stopId": stop_id, "stop": leg.get("from"),
              "liveBoardEpoch": live["boardEpoch"], "aheadSec": round(ahead / 1000.0, 1),

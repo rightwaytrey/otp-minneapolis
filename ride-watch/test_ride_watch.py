@@ -13,7 +13,9 @@ Three layers:
 Nothing here spawns a process, touches tmux, or reaches the network.
 """
 
+import atexit
 import glob
+import gzip
 import json
 import os
 import re
@@ -54,7 +56,21 @@ def quiet_watch(watch_dir, replay=True, spawn_thread=None, push_line=None,
     only hashing them, so leaving the default would have every ride-ending
     test read a megabyte of the rider's real backlog. Tests about the
     promotion gate write to these two.
+
+    thread_enabled is pinned for the fourth (75.27): left as None, RideWatch
+    falls back to the module constant THREAD_ENABLED, which is read from
+    RIDE_THREAD_ENABLED at import — and the documented way to run anything
+    near this daemon safely sets it to 0. That turned 88 tests red (every one
+    that hands in a stub thread and expects it spawned). True is what a
+    plain `python3 ride-watch/test_ride_watch.py` has always run with: a test
+    that wants a thread hands in its stub, a replay with no stub never spawns
+    (_begin_ride_thread), and the two live (replay=False) watchers here open
+    no trip. With tmux, claude and curl stubbed on PATH the suite calls none
+    of them, with the switch at 0 or unset. A test about the kill switch
+    passes False.
     """
+    if thread_enabled is None:
+        thread_enabled = True
     log = Log(os.path.join(watch_dir, "daemon.log"), echo=False)
     reports = os.path.join(watch_dir, "reports")
     os.makedirs(reports, exist_ok=True)
@@ -80,8 +96,53 @@ def report_requests(watch_dir):
     return sorted(glob.glob(os.path.join(
         watch_dir, "report-request-%s-*.json" % SESSION)))
 
-REAL_LOG = os.path.join(
-    os.path.expanduser("~"), "otp-debug-logs", "debug-2026-07-29.jsonl")
+# Where the real day files are looked for: the sink's mirror first, then any
+# directories in RIDE_WATCH_REAL_LOGS (os.pathsep-separated) — a place to keep
+# a day the prune has already deleted.
+REAL_LOG_DIRS = [os.path.join(os.path.expanduser("~"), "otp-debug-logs")] + [
+    d for d in os.environ.get("RIDE_WATCH_REAL_LOGS", "").split(os.pathsep)
+    if d]
+REAL_LOGS_MISSING = []
+_REAL_LOG_INFLATED = []
+
+
+def real_log(name):
+    """The real day file `name` as a plain path a test can open, or a path
+    that does not exist (so the test's own skip names it).
+
+    75.27: scripts/prune-debug-logs.sh gzips a closed day after 3 days and
+    deletes the .gz after 90. The 07-29 / 07-31 / 08-10 incident days existed
+    only as .jsonl.gz from the prune's first run (cae049c, 2026-08-17), so
+    every test that looked for the plain file skipped — 14 of them, the
+    founding incident's among them — and the suite still said OK; the 07-29
+    .gz itself went on 2026-10-29. That is how eecfbcb removed the 07-29 page
+    (22.3) without one red test. So: the plain file if there is one (09-03..
+    09-06 and 10-03 have both, and the plain one is what these tests were
+    written against), else the .gz inflated once per run into a temp dir that
+    is removed at exit. A file that is in neither form is listed on stderr
+    when the suite loads: a skip is not a pass.
+    """
+    for d in REAL_LOG_DIRS:
+        plain = os.path.join(d, name)
+        if os.path.exists(plain):
+            return plain
+    for d in REAL_LOG_DIRS:
+        packed = os.path.join(d, name + ".gz")
+        if os.path.exists(packed):
+            if not _REAL_LOG_INFLATED:
+                tmp = tempfile.mkdtemp(prefix="ride-watch-real-logs-")
+                atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+                _REAL_LOG_INFLATED.append(tmp)
+            out = os.path.join(_REAL_LOG_INFLATED[0], name)
+            if not os.path.exists(out):
+                with gzip.open(packed, "rb") as src, open(out, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            return out
+    REAL_LOGS_MISSING.append(name)
+    return os.path.join(REAL_LOG_DIRS[0], name)
+
+
+REAL_LOG = real_log("debug-2026-07-29.jsonl")
 
 # The 2026-07-29 incident: the app swapped the itinerary out from under the
 # rider while they were aboard the Orange Line, flipped the trip id, and then
@@ -802,6 +863,21 @@ class TestRules(RuleTestCase):
         self.assertEqual(hits[0]["severity"], "page")
         self.assertEqual(hits[0]["context"]["newTripId"], "1:222")
 
+    def test_d_the_flip_page_names_the_route_not_the_trip_ids(self):
+        """75.27: "Trip id flipped 1:1273254 to 1:1273216 on the same leg.
+        Board state suspect." reached the lock screen (09-28 twice in replay,
+        the live 10-19 ride 17:19:23). A feed trip id is nothing a rider can
+        act on; the route is. The ids stay in the summary for triage."""
+        b = StreamBuilder().start().advance(1000).progress(stops=5)
+        b.advance(1000).riding(trip_id="1:100", vehicle="1:900")
+        b.advance(30000).riding(trip_id="1:222", vehicle="1:901")
+        watch = self.run_stream(b)
+        sent = [p["body"] for p in watch.push_log if p.get("sent")]
+        self.assertEqual(sent, ["App moved you onto a different Downtown trip."
+                                " Check the trip sheet still shows your bus."])
+        self.assertIn("1:100 -> 1:222",
+                      self.find(watch, "riding-flip")[0]["summary"])
+
     def test_d_no_flip_when_the_trip_id_is_unchanged(self):
         b = StreamBuilder().start().advance(1000).progress(stops=5)
         b.advance(1000).riding(trip_id="1:100")
@@ -1506,7 +1582,7 @@ class TestPageRanking(RuleTestCase):
         self.assertEqual(len(dropped), 1)
         self.assertEqual(dropped[0]["suppressed"],
                          "superseded-by-stop-count-collapse")
-        self.assertIn("Trip id flipped", dropped[0]["body"])
+        self.assertIn("App moved you onto a different", dropped[0]["body"])
         flip = self.find(watch, "riding-flip")[0]
         self.assertEqual(flip["paged"], False)
         self.assertEqual(flip["supersededBy"], "stop-count-collapse")
@@ -1517,7 +1593,8 @@ class TestPageRanking(RuleTestCase):
             self._flip_then_collapse(ride_watch.PAGE_COALESCE_MS + 20000))
         sent = self.sent_bodies(watch)
         self.assertEqual(len(sent), 1)
-        self.assertIn("Trip id flipped", sent[0])   # the flip won its own window
+        # the flip won its own window
+        self.assertIn("App moved you onto a different", sent[0])
         rate_limited = [p for p in watch.push_log
                         if p.get("suppressed") == "rate-limit"]
         self.assertEqual(len(rate_limited), 1)
@@ -1540,7 +1617,11 @@ class TestPageRanking(RuleTestCase):
         watch = self.run_stream(b)
         sent = self.sent_bodies(watch)
         self.assertEqual(len(sent), 1)
-        self.assertIn("1:222", sent[0])
+        # The page names the route, not the trip (75.27), so ask the findings
+        # which flip it was.
+        self.assertEqual([f["context"]["newTripId"]
+                          for f in self.find(watch, "riding-flip")
+                          if f["paged"] is True], ["1:222"])
 
     def test_the_ranking_covers_every_page_rule(self):
         """A page rule with no rank would silently fall back to mid-pack."""
@@ -2416,7 +2497,7 @@ class TestThreadCadenceOnRealRides(unittest.TestCase):
     ride of ~1 Hz telemetry must come out as a handful of lines.
     """
 
-    LOGS = [os.path.join(os.path.expanduser("~"), "otp-debug-logs", name)
+    LOGS = [real_log(name)
             for name in ("debug-2026-07-29.jsonl", "debug-2026-07-31.jsonl")]
 
     def replay(self, path):
@@ -2578,12 +2659,19 @@ class TestRealIncidentReplay(unittest.TestCase):
         self.assertEqual(collapse[0]["paged"], True)
 
     def test_the_17_28_cascade_costs_the_rider_one_interrupt(self):
-        """Five page-worthy findings in eight seconds, one page.
+        """Three page-worthy findings in eight seconds, one page.
 
         Four until 2026-08-31, when notification-repeat gained a stable key
         and started seeing the two "Off Route" pushes at 17:28:49 / 17:28:53
-        that its byte key had counted as separate alerts. One more finding in
-        the window, still one interrupt — which is what the ranking is for.
+        that its byte key had counted as separate alerts: five. Three since
+        754ed18 (17.9a, 2026-09-17), whose route-preserving exemption covers
+        both of this window's aboard-swaps — swaps #5 and #6 (17:28:48,
+        17:28:52) kept routes 1:904 > 1:546 and the 17:58:49 arrival. That
+        change was replayed "against ~/otp-debug-logs", where 07-29 was
+        already only a .gz, so it landed with this test skipped (75.27). What
+        is left is riding-flip and notification-repeat, both superseded by
+        the stop-count page — still one interrupt, which is what the ranking
+        is for.
         """
         cascade = [p for p in self.watch.push_log
                    if INCIDENT_START_MS <= p["tsMs"] <= INCIDENT_END_MS]
@@ -2591,9 +2679,14 @@ class TestRealIncidentReplay(unittest.TestCase):
         superseded = [p for p in cascade
                       if p.get("suppressed", "").startswith("superseded-by")]
         self.assertEqual(len(sent), 1)
-        self.assertEqual(len(superseded), 4)
+        self.assertIn("Stop count wrong", sent[0]["body"])
+        self.assertEqual(len(superseded), 2)
         for p in superseded:
             self.assertEqual(p["suppressed"], "superseded-by-stop-count-collapse")
+        rules = {f["rule"] for f in self.watch.all_findings
+                 if INCIDENT_START_MS <= f["tsMs"] <= INCIDENT_END_MS
+                 and f.get("supersededBy") == "stop-count-collapse"}
+        self.assertEqual(rules, {"riding-flip", "notification-repeat"})
 
     def test_replay_never_sends_a_real_push(self):
         for p in self.watch.push_log:
@@ -2604,20 +2697,31 @@ class TestRealIncidentReplay(unittest.TestCase):
             self.assertLess(len(p["body"]), 120, p["body"])
             self.assertNotIn("!", p["body"])
 
-    def test_the_progress_teleports_are_caught(self):
-        """Twice on this ride the bar outran the bus; nothing used to notice.
-
-        17:05:12 (0% -> 13%) and 17:20:11 (35% -> 71%), each in one second
-        while the Orange Line covered about 6.5m.
+    def test_the_progress_jumps_on_deviated_ticks_are_left_alone(self):
+        """Twice on this ride the bar outran the bus — 17:05:12 (0% -> 13%)
+        and 17:20:11 (35% -> 71%), each in one second while the Orange Line
+        covered about 6.5 m — and until 26.8 progress-without-motion flagged
+        both. Both ticks are `deviated`, and since 3112826 (26.8, 2026-09-22)
+        a deviated tick's progress is a projection onto a route the rider is
+        not on, so the rule leaves it alone. This test said "2" and was
+        skipped from mid-August (75.27) until it was un-skipped red; it
+        now pins what 26.8 decided, and that the two ticks really were
+        deviated, so the zero is about the rule and not an empty replay.
         """
         hits = [f for f in self.watch.all_findings
                 if f["rule"] == "progress-without-motion"]
-        self.assertEqual(len(hits), 2, [f["summary"] for f in hits])
-        for f in hits:
-            self.assertEqual(f["severity"], "warn")   # diagnostic, not a page
-            self.assertLess(f["context"]["movedMeters"], 15.0)
-        self.assertEqual(hits[0]["time"][:5], "17:05")
-        self.assertEqual(hits[1]["time"][:5], "17:20")
+        self.assertEqual(hits, [], [f["summary"] for f in hits])
+        jumps = {r["t"]: r["payload"] for r in log_records(
+            REAL_LOG, 1785362712000, 1785363612000,
+            types={"UPDATE_PROGRESS"})
+            if r["t"] in (1785362712054, 1785363611056)}
+        self.assertEqual(sorted(jumps), [1785362712054, 1785363611056])
+        self.assertEqual(
+            [round(jumps[t]["currentLegProgress"], 2) for t in sorted(jumps)],
+            [13.34, 70.57])
+        for p in jumps.values():
+            self.assertEqual(p["status"], "deviated")
+            self.assertEqual(p["currentLegIndex"], 0)
 
 
 class TestNotificationStormReplay(unittest.TestCase):
@@ -2628,8 +2732,7 @@ class TestNotificationStormReplay(unittest.TestCase):
     misbehaving at them. This is that rule, against that ride.
     """
 
-    LOG = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                       "debug-2026-07-31.jsonl")
+    LOG = real_log("debug-2026-07-31.jsonl")
 
     @classmethod
     def setUpClass(cls):
@@ -2687,8 +2790,7 @@ class TestNotificationStormReplay(unittest.TestCase):
 # to stop 1:53313's realtime arrival, which the feed published as UPDATED with
 # delay 0 while its neighbours ran ~11 min late — 9m13.9s behind the clock.
 # The daemon watched the whole ride and raised nothing.
-LOG_0809 = os.path.join(
-    os.path.expanduser("~"), "otp-debug-logs", "debug-2026-08-10.jsonl")
+LOG_0809 = real_log("debug-2026-08-10.jsonl")
 SESSION_0809 = "msmhi3j5-lnt6uw"
 
 
@@ -4358,10 +4460,8 @@ class TestVehicleMatchNever(RuleTestCase):
 # The rides these rules were written from, replayed out of the raw telemetry
 # rather than restated as a fixture. Skipped when the log is not on the box.
 
-REAL_LOG_0901 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-01.jsonl")
-REAL_LOG_0831 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-08-31.jsonl")
+REAL_LOG_0901 = real_log("debug-2026-09-01.jsonl")
+REAL_LOG_0831 = real_log("debug-2026-08-31.jsonl")
 
 
 def log_slice(path, start_ms, end_ms, types):
@@ -4426,8 +4526,7 @@ class TestVehicleMatchNeverOnTheRecordedRide(unittest.TestCase):
                           if f["rule"] == "vehicle-match-never"], [])
 
 
-REAL_LOG_0909 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-09.jsonl")
+REAL_LOG_0909 = real_log("debug-2026-09-09.jsonl")
 
 
 class TestRide0909(unittest.TestCase):
@@ -6048,8 +6147,7 @@ class TestBundleBookkeeping(BootTestCase):
 
 # --- wake-lock-denied -------------------------------------------------------
 
-REAL_LOG_0904 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-04.jsonl")
+REAL_LOG_0904 = real_log("debug-2026-09-04.jsonl")
 # The 2026-09-04 ride, session mtn4ui3s-xfjx8m: START_GO_MODE at 10:52:51 and
 # the last of the four refusals at 11:05:16.
 RIDE_0904_SESSION = "mtn4ui3s-xfjx8m"
@@ -6930,8 +7028,7 @@ class TestSessionCachesAreBounded(RuleTestCase):
 
 # --- recorded slices: the 2026-09-13 ride ------------------------------------
 
-REAL_LOG_0913 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-13.jsonl")
+REAL_LOG_0913 = real_log("debug-2026-09-13.jsonl")
 
 
 def log_records(path, start_ms, end_ms, types=(), kinds=()):
@@ -7152,8 +7249,7 @@ class TestRide0909LateNote(unittest.TestCase):
         self.assertIn("finish a trip on auto", req["riderNotes"][0]["text"])
 
 
-REAL_LOG_0915 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-15.jsonl")
+REAL_LOG_0915 = real_log("debug-2026-09-15.jsonl")
 
 
 class TestRoutePreservingSwap(RuleTestCase):
@@ -8552,10 +8648,8 @@ class TestRide0915(unittest.TestCase):
                          ["session-restart-while-aboard"])
 
 
-REAL_LOG_0917 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-17.jsonl")
-REAL_LOG_0918 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-18.jsonl")
+REAL_LOG_0917 = real_log("debug-2026-09-17.jsonl")
+REAL_LOG_0918 = real_log("debug-2026-09-18.jsonl")
 
 
 class TestSwapOntoTheRiddenTrip(RuleTestCase):
@@ -9021,8 +9115,7 @@ class TestArrivedNeverEnded(RuleTestCase):
         self.assertFalse(hits[0]["context"]["positionFixesStillArriving"])
 
 
-REAL_LOG_1008 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-10-08.jsonl")
+REAL_LOG_1008 = real_log("debug-2026-10-08.jsonl")
 
 
 def replay_session(path, session, until_ms=None):
@@ -9256,14 +9349,11 @@ class TestRealBugCountReadsTheTriageTable(RuleTestCase):
         self.assertEqual(self.watch._report_real_bugs(path), 3)
 
 
-REAL_LOG_0920 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-20.jsonl")
-REAL_LOG_0921 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-21.jsonl")
+REAL_LOG_0920 = real_log("debug-2026-09-20.jsonl")
+REAL_LOG_0921 = real_log("debug-2026-09-21.jsonl")
 # Everything the four 09-20/09-21 rules read, plus the records that open and
 # close a trip. Narrow on purpose: these two files are 8 MB and 39 MB.
-REAL_LOG_1020 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-10-20.jsonl")
+REAL_LOG_1020 = real_log("debug-2026-10-20.jsonl")
 RIDE_TYPES_0921 = {"START_GO_MODE", "STOP_GO_MODE", "UPDATE_PROGRESS",
                    "UPDATE_POSITION", "UPDATE_ROUTE_MATCH", "SET_RIDING",
                    "CLEAR_RIDING", "CONFIRM_VEHICLE", "TRANSITION_LEG",
@@ -9474,19 +9564,132 @@ class TestStopCollapseReadsTheLeg(RuleTestCase):
                      "lon": StreamBuilder.LON}
         return payload
 
-    def swap_to_count(self, n_stops):
+    def swap_to_count(self, n_stops, pick=False):
         b = StreamBuilder().start(self.itinerary_with_stops())
         b.advance(1000).position()
         b.progress(leg=1, prog=20.0, stops=3, next_stop="Stop B")
-        b.advance(1000).start(self.swapped_itinerary(n_stops))
+        b.advance(1000)
+        if pick:
+            b.action("CLEAR_ONBOARD").advance(6)   # the picker's commit
+        b.start(self.swapped_itinerary(n_stops))
         b.advance(1000).position()
         b.progress(leg=1, prog=5.0, stops=1, next_stop="Washington")
         return self.run_stream(b)
 
     def test_a_swap_onto_a_one_stop_leg_is_a_new_baseline_not_a_page(self):
         """22.3, 2026-10-20 16:29:34: 3 -> swap -> 1 on a leg whose only stop
-        is the one the rider just picked. The count of 3 was the old plan's."""
-        watch = self.swap_to_count(1)
+        is the one the rider just picked. The count of 3 was the old plan's.
+        The pick is CLEAR_ONBOARD then START_GO_MODE (6 ms apart that day),
+        and it is the pick that makes the count a baseline — this leg carries
+        no start coordinates, so the pick decides alone."""
+        watch = self.swap_to_count(1, pick=True)
+        self.assertEqual(self.find(watch, "stop-count-collapse"), [],
+                         self.rules(watch))
+
+    # The 22.3 regression (2026-10-29). eecfbcb made ANY swap onto a one-stop
+    # leg a new baseline, and the 2026-07-29 17:28:53 page — the incident this
+    # rule exists for — went with it: the app's own auto re-plan
+    # (START_REROUTE `boarded-earlier` 17:28:49.073, START_GO_MODE 17:28:52.140,
+    # no CLEAR_ONBOARD) installed Knox Ave & 76th St -> Knox Ave & American
+    # Blvd (683 m, no intermediate stop) while the rider was 5,547 m short of
+    # 76th St, and the count fell 2 -> 1 at 0 % of the leg. Three stops were
+    # left. Distances below are metres north of the rider's fix.
+
+    def one_stop_leg(self, start_m, stop_m,
+                     start="Knox Ave & 76th St Station",
+                     stop="Knox Ave & American Blvd Station"):
+        payload = replacement_itinerary(route_id="1:904", trip_id="1:1082792",
+                                        short="Orange")
+        bus = payload["itinerary"]["legs"][1]
+        bus["from"] = {"name": start,
+                       "lat": StreamBuilder.LAT + start_m * 9.0e-6,
+                       "lon": StreamBuilder.LON}
+        bus["to"] = {"name": stop,
+                     "lat": StreamBuilder.LAT + stop_m * 9.0e-6,
+                     "lon": StreamBuilder.LON}
+        bus["intermediatePlaces"] = []
+        return payload
+
+    def collapse_after_swap(self, payload, pick, prev=2, prog=0.0, fix=True):
+        b = StreamBuilder().start(self.itinerary_with_stops())
+        b.advance(1000)
+        if fix:
+            b.position()
+        b.progress(leg=1, prog=7.2, stops=prev,
+                   next_stop="Knox Ave & 76th St Station")
+        b.advance(1000)
+        if pick:
+            b.action("CLEAR_ONBOARD").advance(6)
+        else:
+            b.action("START_REROUTE", {"autoApply": True,
+                                       "reason": "boarded-earlier",
+                                       "keepRouteId": "1:904"})
+            b.advance(3000)
+        b.start(payload)
+        b.advance(900)
+        if fix:
+            b.position()
+        b.progress(leg=1, prog=prog, stops=1,
+                   next_stop="Knox Ave & American Blvd Station")
+        return self.run_stream(b)
+
+    def test_the_apps_own_replan_onto_a_leg_ahead_of_the_rider_pages(self):
+        """2026-07-29 17:28:53, the founding incident."""
+        watch = self.collapse_after_swap(self.one_stop_leg(5547.0, 6230.0),
+                                         pick=False)
+        found = self.find(watch, "stop-count-collapse")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["severity"], "page")
+        ctx = found[0]["context"]
+        self.assertFalse(ctx["newBaseline"])
+        self.assertFalse(ctx["riderPick"])
+        self.assertAlmostEqual(ctx["riderToLegStartM"], 5547.0, delta=10.0)
+        self.assertIn("the app's own re-plan", found[0]["summary"])
+        self.assertRegex(found[0]["summary"],
+                         r"its leg starts 55\d\d m from the rider")
+        sent = [p["body"] for p in watch.push_log if p.get("sent")]
+        self.assertIn("Stop count wrong — app says 1 left at 0% of the leg."
+                      " Ignore the banner.", sent)
+
+    def test_a_pick_onto_the_leg_the_rider_is_on_is_a_new_baseline(self):
+        """2026-10-20 16:29:34, the page eecfbcb was for: the picked leg
+        6th St & Minnesota -> 6th St & Washington, 356 m, the rider 165 m
+        past its start and 197 m short of its stop, 3 -> 1 at 44 %."""
+        leg = self.one_stop_leg(-165.0, 197.0,
+                                start="6th St & Minnesota Station",
+                                stop="6th St & Washington Station")
+        watch = self.collapse_after_swap(leg, pick=True, prev=3, prog=43.6)
+        self.assertEqual(self.find(watch, "stop-count-collapse"), [],
+                         self.rules(watch))
+
+    def test_a_pick_onto_a_leg_that_starts_kilometres_ahead_still_pages(self):
+        """A finger on it does not make the count right: the leg's one stop
+        equals 1 by construction, wherever the leg starts."""
+        watch = self.collapse_after_swap(self.one_stop_leg(5547.0, 6230.0),
+                                         pick=True)
+        found = self.find(watch, "stop-count-collapse")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertTrue(found[0]["context"]["riderPick"])
+        self.assertRegex(found[0]["summary"],
+                         r"its leg starts 55\d\d m from the rider")
+
+    def test_the_apps_own_replan_onto_the_riders_leg_is_judged_as_before(self):
+        """Not widened past the rider's pick on purpose: a one-stop leg is
+        also what a leg whose `intermediatePlaces` went missing looks like,
+        and on an app re-plan nothing else says the count is right. This
+        is the pre-eecfbcb verdict — the percentage — which pages at 0 %."""
+        watch = self.collapse_after_swap(self.one_stop_leg(-100.0, 583.0),
+                                         pick=False)
+        found = self.find(watch, "stop-count-collapse")
+        self.assertEqual(len(found), 1, self.rules(watch))
+        self.assertEqual(found[0]["context"]["stopGeometry"], "unavailable")
+
+    def test_with_no_fix_only_the_pick_makes_a_baseline(self):
+        ahead = self.one_stop_leg(5547.0, 6230.0)
+        watch = self.collapse_after_swap(ahead, pick=False, fix=False)
+        self.assertEqual(len(self.find(watch, "stop-count-collapse")), 1,
+                         self.rules(watch))
+        watch = self.collapse_after_swap(ahead, pick=True, fix=False)
         self.assertEqual(self.find(watch, "stop-count-collapse"), [],
                          self.rules(watch))
 
@@ -9915,8 +10118,7 @@ class TestThreadPaneIsolation(RuleTestCase):
 # 26.7 / 26.8 — the missed-bus watch, and progress that is not travel
 # ---------------------------------------------------------------------------
 
-REAL_LOG_0922 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-22.jsonl")
+REAL_LOG_0922 = real_log("debug-2026-09-22.jsonl")
 # What the two 26.7 rules read, on top of what opens and moves a trip.
 RIDE_TYPES_0922 = RIDE_TYPES_0921 | {
     "ADD_NOTIFICATION", "SET_LIVE_LEG_TIMES",
@@ -10442,8 +10644,7 @@ class TestProgressWithoutMotionNeedsTravel(RuleTestCase):
 # 29.2 — live slack the re-plan gate did not see; a bus the rider watched go
 # ---------------------------------------------------------------------------
 
-REAL_LOG_0923 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                             "debug-2026-09-23.jsonl")
+REAL_LOG_0923 = real_log("debug-2026-09-23.jsonl")
 # What the two 29.2 rules read, on top of 26.7's.
 RIDE_TYPES_0923 = RIDE_TYPES_0922 | {
     "AUTO_REPLAN", "ONBOARD_CANDIDATE_SNAPSHOT", "SET_DEPARTURE_OVERRIDE"}
@@ -10667,8 +10868,7 @@ class TestProgressWithoutMotionRejoin(RuleTestCase):
         watch = self.run_stream(b)
         self.assertEqual(self.fired(watch), 0, self.rules(watch))
 
-    REAL_LOG_1020 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                                 "debug-2026-10-20.jsonl")
+    REAL_LOG_1020 = real_log("debug-2026-10-20.jsonl")
 
     @unittest.skipUnless(os.path.exists(REAL_LOG_1020),
                          "debug-2026-10-20.jsonl not present")
@@ -10703,6 +10903,27 @@ class TestBoardArrivalBusNotHere(RuleTestCase):
         self.assertAlmostEqual(found[0]["context"]["aheadSec"], 808, delta=3)
         self.assertEqual([p for p in watch.push_log if p.get("sent")], [])
 
+    def test_a_reading_with_no_source_does_not_print_none(self):
+        """75.27: builds up to at least 09-21 sent no boardSource (336 of 336
+        SET_LIVE_LEG_TIMES that day), and seven summaries across 08-28..09-21
+        read "... is 4.0 min away (source None)"."""
+        b = StreamBuilder().start(missed_bus_itinerary())
+        b.advance(1000).position().progress(leg=0, prog=40.0)
+        b.advance(1000)
+        board_live(b, b.t + 13 * 60000)
+        del b.events[-1]["payload"]["1"]["boardSource"]
+        b.advance(1000)
+        bus_here(b)
+        found = self.find(self.run_stream(b), "board-arrival-bus-not-here")
+        self.assertEqual(len(found), 1)
+        self.assertNotIn("None", found[0]["summary"])
+        self.assertTrue(found[0]["summary"].endswith("min away"),
+                        found[0]["summary"])
+        named = self.find(self.run_bus_here(13 * 60000),
+                          "board-arrival-bus-not-here")
+        self.assertTrue(named[0]["summary"].endswith("(source stop)"),
+                        named[0]["summary"])
+
     def test_sixty_seconds_ahead_is_quiet(self):
         watch = self.run_bus_here(61000)
         self.assertEqual(self.find(watch, "board-arrival-bus-not-here"), [])
@@ -10728,8 +10949,7 @@ class TestBoardArrivalBusNotHere(RuleTestCase):
         self.assertEqual(
             len(self.find(watch, "board-arrival-bus-not-here")), 1)
 
-    REAL_LOG_1016 = os.path.join(os.path.expanduser("~"), "otp-debug-logs",
-                                 "debug-2026-10-16.jsonl")
+    REAL_LOG_1016 = real_log("debug-2026-10-16.jsonl")
 
     @unittest.skipUnless(os.path.exists(REAL_LOG_1016),
                          "debug-2026-10-16.jsonl not present")
@@ -11978,6 +12198,16 @@ class TestRenderErrorBurst(RuleTestCase):
             self.burst(1, msg="Error: already running %d" % i, b=b)
         _, hits = self.hits(b)
         self.assertEqual(hits, [])
+
+
+if REAL_LOGS_MISSING:
+    # 75.27: a skip is not a pass. Fourteen real-incident tests read "OK
+    # (skipped=14)" for weeks while the 07-29 page they guard was removed.
+    sys.stderr.write(
+        "test_ride_watch: %d real day file(s) found neither as .jsonl nor as"
+        " .jsonl.gz in %s; their tests SKIP, they do not pass: %s\n"
+        % (len(set(REAL_LOGS_MISSING)), os.pathsep.join(REAL_LOG_DIRS),
+           ", ".join(sorted(set(REAL_LOGS_MISSING)))))
 
 
 if __name__ == "__main__":
