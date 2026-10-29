@@ -5502,6 +5502,517 @@ class TestResumedTripOnTheRecordedSession(unittest.TestCase):
         self.assertEqual(watch.all_findings, [])
 
 
+# --- 75.23: a late backlog opens one ride, not one per minute ---------------
+
+class TestLateBacklogOpensOneRide(RuleTestCase):
+    """75.23. A Go Mode backlog that reaches the daemon more than
+    SESSION_TIMEOUT_MS late was opened as one ride PER MINUTE: adopt at the
+    record's `t`, check_timers on the same call sees now - t > 15 min and
+    ends it `timeout`, and the tick 60 s of record time later (the only guard,
+    `recently_ended`, is in record time) adopts again. The 09-05 .gz replay:
+    37 rides for `mtn4ui3s-xfjx8m`, 35 of them adopted, each `start == end`.
+    Live (wall clock, stub spawner): 300 ticks stamped 20 min in the past
+    gave 5 rides, 5 console spawns and 5 report requests.
+
+    The live tests run with replay=False — the clock is the wall clock, which
+    is the one the phantom loop runs on — and stamp records relative to it.
+    """
+
+    def live_watch(self, thread):
+        return quiet_watch(self.tmp, replay=False, spawn_thread=thread.spawn,
+                           push_line=thread.push, kill_thread=thread.kill,
+                           thread_enabled=True)
+
+    def feed(self, watch, events):
+        """Write each record to the stream before handing it over, as the
+        follower would find it."""
+        with open(watch.stream_path, "a") as f:
+            for ev in events:
+                f.write(json.dumps(ev) + "\n")
+        for ev in events:
+            watch.process(ev)
+
+    def backlog(self, minutes, start=False):
+        now = int(time.time() * 1000)
+        b = StreamBuilder(device="phone-1", t=now - minutes * 60 * 1000)
+        if start:
+            b.start().advance(1000)
+        while b.t < now - 1000:
+            b.progress(leg=1, prog=20.0, stops=5).advance(1000)
+        return b, now
+
+    def test_a_twenty_minute_backlog_is_one_adoption(self):
+        thread = StubThread()
+        watch = self.live_watch(thread)
+        b, now = self.backlog(20)
+        self.feed(watch, b.events)
+        watch.check_timers()
+        self.assertEqual([(t.end_reason, t.adopted) for t in watch.ended_trips],
+                         [])
+        self.assertEqual(len(watch._active_trips()), 1)
+        self.assertEqual(len(thread.spawns), 1, thread.spawns)
+        self.assertEqual(report_requests(self.tmp), [])
+        self.assertEqual(len(self.find(watch, "resumed-trip")), 1)
+        # Opened off the first record the timeout would not close at once.
+        trip = watch.trips[SESSION]
+        self.assertGreaterEqual(trip.start_ms,
+                                now - ride_watch.SESSION_TIMEOUT_MS)
+        self.assertLess(trip.start_ms,
+                        now - ride_watch.SESSION_TIMEOUT_MS + 10000)
+        text = read_text(os.path.join(self.tmp, "daemon.log"))
+        self.assertEqual(text.count("past the 15 min timeout"), 1)
+
+    def test_a_backlog_headed_by_its_start_opens_the_ride_from_it(self):
+        """The START is the oldest record of the backlog, so it is the first
+        one too old to open anything. It is read back (16.7) once the
+        backlog is within the timeout, and the ride opens from it: one ride,
+        its real start, its itinerary — and a finding that says the phone
+        was late, not that the follower missed a record."""
+        thread = StubThread()
+        watch = self.live_watch(thread)
+        b, now = self.backlog(20, start=True)
+        self.feed(watch, b.events)
+        watch.check_timers()
+        self.assertEqual(watch.ended_trips, [])
+        self.assertEqual(len(thread.spawns), 1, thread.spawns)
+        trip = watch.trips[SESSION]
+        self.assertFalse(trip.adopted)
+        self.assertEqual(trip.start_ms, b.events[0]["t"])
+        self.assertIsNotNone(trip.itinerary)
+        self.assertEqual(self.find(watch, "resumed-trip"), [])
+        found = self.find(watch, "missed-start")
+        self.assertEqual(len(found), 1)
+        self.assertIn("the phone delivered this ride", found[0]["summary"])
+        self.assertGreater(found[0]["context"]["deliveredLateMs"],
+                           ride_watch.SESSION_TIMEOUT_MS)
+
+    def test_a_late_backlog_in_replay_opens_no_ride(self):
+        """The 09-05 .gz shape: the clock is already 30 min on (another
+        phone's records) when a session's five minutes of old ticks land.
+        Every one of them is past the timeout; none opens anything."""
+        watch = quiet_watch(self.tmp)
+        other = StreamBuilder(session="other-phone", device="phone-2")
+        other.at(30 * 60 * 1000).progress(leg=0, prog=1.0)
+        late = StreamBuilder(device="phone-1")
+        for _ in range(300):
+            late.progress(leg=1, prog=20.0, stops=5).advance(1000)
+        for ev in other.events + late.events:
+            watch.process(ev)
+        watch.finalize_replay()
+        mine = [t for t in watch.ended_trips if t.session == SESSION]
+        self.assertEqual(mine, [])
+        self.assertEqual([f for f in watch.all_findings
+                          if f.get("session") == SESSION], [])
+
+    def test_a_ride_closed_by_silence_is_not_reopened_by_its_own_records(self):
+        """The same loop through the `timeout` door, keyed on the ride: a
+        ride opened from its own START and closed by 15 min of silence is
+        not re-adopted off its own later records — only a new START opens
+        the session again, exactly as after an arrival."""
+        watch = quiet_watch(self.tmp)
+        b = StreamBuilder(device="phone-1").start().advance(1000)
+        b.progress(leg=1, prog=20.0, stops=5)
+        other = StreamBuilder(session="other-phone", device="phone-2")
+        other.t = b.t + ride_watch.SESSION_TIMEOUT_MS + 60000
+        other.progress(leg=0, prog=1.0)
+        for ev in b.events + other.events:
+            watch.process(ev)
+        self.assertEqual([t.end_reason for t in watch.ended_trips],
+                         ["timeout"])
+        b.t = other.t + 1000
+        mark = len(b.events)
+        for _ in range(120):
+            b.progress(leg=1, prog=40.0, stops=3).advance(1000)
+        for ev in b.events[mark:]:
+            watch.process(ev)
+        self.assertNotIn(SESSION, watch.trips)
+        self.assertEqual(len(watch.ended_trips), 1)
+        b.start()                             # the rider asks again
+        watch.process(b.events[-1])
+        self.assertIn(SESSION, watch.trips)
+        self.assertFalse(watch.trips[SESSION].adopted)
+
+    def test_a_late_start_still_reopens_a_session_closed_at_arrival(self):
+        """A late START is still the rider asking for a ride under this id.
+        Refusing to open on it must not leave `ended_arrived` standing, or
+        the ride it heads would never be opened by its own records."""
+        thread = StubThread()
+        watch = self.live_watch(thread)
+        watch.ended_arrived.add(SESSION)
+        watch.recently_ended[SESSION] = int(time.time() * 1000) - 3600 * 1000
+        b, _ = self.backlog(20, start=True)
+        self.feed(watch, b.events)
+        self.assertIn(SESSION, watch.trips)
+        self.assertEqual(watch.trips[SESSION].start_ms, b.events[0]["t"])
+
+
+# --- 75.24: two pages per RIDE, across the ride's Trip objects --------------
+
+class TestTwoPagesPerRide(RuleTestCase):
+    """75.24. The cap was charged on `trip.pages_sent`, and a ride can be
+    several Trips. 2026-10-20 `mvh6ypt8-rtb6ih`: STOP 16:42:22, START
+    16:42:41, and the second Trip's 16:48:06 page went out after the first
+    Trip's 16:29:59 and 16:35:39 — three pages in 18 min from one ride."""
+
+    @staticmethod
+    def flip(b, trip_id):
+        """A page-worthy riding flip, clear of the last page's rate limit,
+        and a tick after its coalescing window so the page goes out then."""
+        b.advance(ride_watch.PUSH_MIN_INTERVAL_MS + 10000)
+        b.riding(trip_id=trip_id)
+        b.advance(ride_watch.PAGE_COALESCE_MS + 5000).progress(stops=5)
+
+    def two_trips(self, gap_ms, arrived=False, second_session=SESSION):
+        b = StreamBuilder(device="phone-1").start().advance(1000)
+        b.progress(stops=5).advance(1000).riding(trip_id="1:100")
+        for i in range(2):                      # two page-worthy flips
+            self.flip(b, "1:%d" % (200 + i))
+        if arrived:
+            b.advance(1000).action("SET_ARRIVED")
+        b.advance(1000).stop()
+        if second_session == SESSION:
+            second = b.advance(gap_ms)
+        else:
+            second = StreamBuilder(session=second_session, device="phone-2",
+                                   t=b.t + gap_ms)
+        second.start().advance(1000).progress(stops=5)
+        second.advance(1000).riding(trip_id="1:300")
+        self.flip(second, "1:301")              # a third page-worthy flip
+        watch = quiet_watch(self.tmp)
+        events = b.events + ([] if second is b else second.events)
+        for ev in events:
+            watch.process(ev)
+        watch.finalize_replay()
+        return watch
+
+    def sent(self, watch):
+        return [p for p in watch.push_log
+                if p.get("sent") and p.get("kind") == "page"]
+
+    def test_a_stop_start_repick_shares_the_rides_two_pages(self):
+        watch = self.two_trips(19000)           # 16:42:22 -> 16:42:41
+        self.assertEqual(len(watch.ended_trips), 2)
+        self.assertEqual(len(self.find(watch, "riding-flip")), 3)
+        self.assertEqual(len(self.sent(watch)),
+                         ride_watch.MAX_PAGES_PER_TRIP)
+        first, second = watch.ended_trips
+        self.assertIs(first.page_budget, second.page_budget)
+        self.assertEqual(second.pages_sent, 0)
+        self.assertIn("cap 2/ride, 2 spent by the ride's earlier trip(s)",
+                      read_text(os.path.join(self.tmp, "daemon.log")))
+
+    def test_the_chain_reaches_across_a_three_minute_restart(self):
+        """08-27 13:16:29 -> 13:19:43 was one ride."""
+        watch = self.two_trips(194000)
+        self.assertEqual(len(self.sent(watch)), 2)
+
+    def test_a_ride_after_a_real_gap_gets_its_own_two(self):
+        watch = self.two_trips(6 * 60 * 1000)   # past RIDE_PAGE_CHAIN_MS
+        self.assertEqual(len(self.sent(watch)), 3)
+        first, second = watch.ended_trips
+        self.assertIsNot(first.page_budget, second.page_budget)
+
+    def test_an_arrival_ends_the_ride(self):
+        """09-09: arrived, then a new trip 147 s later. A ride the app had
+        arrived on is over; the next START is a new ride."""
+        watch = self.two_trips(30000, arrived=True)
+        self.assertEqual(len(self.sent(watch)), 3)
+
+    def test_another_phone_keeps_its_own_budget(self):
+        """Two apps on one ride (10-20, prod and dev) are two sessions and
+        two devices; sharing their budget is 75.24's open product call."""
+        watch = self.two_trips(19000, second_session="other-app")
+        self.assertEqual(len(self.sent(watch)), 3)
+
+    def test_the_status_counts_the_rides_pages(self):
+        b = StreamBuilder(device="phone-1").start().advance(1000)
+        b.progress(stops=5).advance(1000).riding(trip_id="1:100")
+        for i in range(2):
+            self.flip(b, "1:%d" % (200 + i))
+        b.advance(1000).stop().advance(19000).start().advance(1000)
+        b.progress(stops=5)
+        watch = quiet_watch(self.tmp)
+        for ev in b.events:
+            watch.process(ev)
+        watch.write_status(force=True)
+        status = read_text(os.path.join(self.tmp, "current-ride.md"))
+        self.assertIn("- Pages sent: 2/2", status)
+
+
+# --- 75.25: a declined session is read back once ----------------------------
+
+class TestDeclinedSessionReadBack(RuleTestCase):
+    """75.25. A session the adopt path declines (24.1: its ride is over and
+    written up) is asked about again on EVERY UPDATE_PROGRESS, and every ask
+    re-read and json-parsed the last 8 MB of the day file: `mtnf29ie-jlv2sk`
+    225 times in the 09-05 .gz, 715,941 parses for 13,373 lines, 0.13-0.34 s
+    a tick on the daemon's only event thread."""
+
+    def setUp(self):
+        super().setUp()
+        self.reads = []                 # bytes handed back per stream read
+        real_open = open
+        tracker = self
+
+        class Counting:
+            def __init__(self, f):
+                self._f = f
+
+            def read(self, *a):
+                data = self._f.read(*a)
+                tracker.reads.append(len(data))
+                return data
+
+            def __getattr__(self, name):
+                return getattr(self._f, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return self._f.__exit__(*exc)
+
+        def counting_open(path, *a, **kw):
+            f = real_open(path, *a, **kw)
+            if path == getattr(tracker, "stream_path", None):
+                return Counting(f)
+            return f
+
+        ride_watch.open = counting_open
+        self.addCleanup(delattr, ride_watch, "open")
+
+    def declined_ride(self):
+        """A finished, written-up ride whose session goes on ticking."""
+        watch = quiet_watch(self.tmp)
+        self.stream_path = watch.stream_path
+        b = StreamBuilder(device="phone-1").start().advance(1000)
+        filler = StreamBuilder(session="someone-else", device="phone-2")
+        with open(watch.stream_path, "w") as f:
+            f.write(json.dumps(b.events[0]) + "\n")
+            for _ in range(2000):               # ~0.5 MB of other traffic
+                filler.progress(leg=0, prog=1.0).advance(100)
+            for ev in filler.events:
+                f.write(json.dumps(ev) + "\n")
+        # The request file the earlier daemon wrote at its end (24.1).
+        start = b.events[0]["t"]
+        with open(os.path.join(watch.watch_dir, "report-request-%s-%s.json"
+                               % (SESSION, time.strftime(
+                                   "%H%M", time.localtime(start / 1000)))),
+                  "w") as f:
+            json.dump({"session": SESSION, "startMs": start - 60000,
+                       "endMs": b.t + 3600 * 1000, "findingsCount": 8}, f)
+        return watch, b
+
+    def tick(self, watch, b, n):
+        for _ in range(n):
+            b.advance(1000).progress(leg=1, prog=20.0, stops=5)
+            with open(watch.stream_path, "a") as f:
+                f.write(json.dumps(b.events[-1]) + "\n")
+            watch.process(b.events[-1])
+
+    def test_a_declined_session_is_read_once_not_per_tick(self):
+        watch, b = self.declined_ride()
+        size0 = os.path.getsize(watch.stream_path)
+        self.tick(watch, b, 100)
+        self.assertEqual(watch.trips, {})
+        self.assertEqual(watch.all_findings, [])
+        # One read of the window, then only what was appended since.
+        self.assertLess(sum(self.reads),
+                        size0 + 2 * (os.path.getsize(watch.stream_path)
+                                     - size0))
+        self.assertEqual(
+            read_text(os.path.join(self.tmp, "daemon.log"))
+            .count("already ended and written up"), 1)
+
+    def test_a_start_appended_after_the_decline_is_still_found(self):
+        """The cache must not go stale: a NEW ride on the same session id,
+        whose START the follower never handed over (09-15), is recovered
+        from the bytes appended since the last read."""
+        watch, b = self.declined_ride()
+        self.tick(watch, b, 20)
+        b.t += 3 * 3600 * 1000                  # well after the written-up ride
+        b.stop().advance(1000).start().advance(500)
+        with open(watch.stream_path, "a") as f:
+            for ev in b.events[-2:]:
+                f.write(json.dumps(ev) + "\n")
+        self.tick(watch, b, 1)
+        self.assertIn(SESSION, watch.trips)
+        self.assertEqual(len(self.find(watch, "missed-start")), 1)
+        self.assertEqual(watch.trips[SESSION].start_ms, b.events[-2]["t"])
+
+    def test_a_rewritten_stream_is_read_again(self):
+        """A file shorter than the last read is not the file that was read
+        (16.7's rewrite): the cached offset means nothing in it."""
+        watch, b = self.declined_ride()
+        self.tick(watch, b, 5)
+        b.t += 3 * 3600 * 1000
+        b.stop().advance(1000).start().advance(500)
+        with open(watch.stream_path, "w") as f:   # rewritten, and shorter
+            for ev in b.events[-2:]:
+                f.write(json.dumps(ev) + "\n")
+        self.tick(watch, b, 1)
+        self.assertIn(SESSION, watch.trips)
+        self.assertEqual(watch.trips[SESSION].start_ms, b.events[-2]["t"])
+
+
+# --- 75.26a: the replay clock moves through silence -------------------------
+
+class TestReplayClockTicksThroughSilence(RuleTestCase):
+    """75.26a. `--replay` advanced its clock only on records, so every rule
+    that matures in silence fired late, with the silence's numbers, or not at
+    all. 10-20 `mvgr2jqp-b81j4g`: live `arrived-never-ended` 10:14:51 "4m31s
+    open", replay 10:58:18 "47m58s open" — the phone slept 48 min and no
+    record moved the clock. run_replay now runs the live loop's 5 s
+    check_timers ticks in record time between records."""
+
+    # run_live's tick (ride_watch.LIVE_TICK_MS), written out so this class
+    # fails on its assertions, not on a missing name, against older source.
+    TICK_MS = 5000
+
+    def replay(self, builder):
+        path = os.path.join(self.tmp, "day.jsonl")
+        with open(path, "w") as f:
+            for ev in builder.events:
+                f.write(json.dumps(ev) + "\n")
+        return run_replay(path, watch=quiet_watch(self.tmp))
+
+    def stationary_then_silent(self):
+        """Standing still on leg 2 for 14m50s at 1 Hz, then ten minutes of
+        nothing at all, then one more fix."""
+        b = StreamBuilder().start().advance(1000).progress(leg=2, prog=30.0)
+        self.anchor = b.t + 1000
+        for _ in range(890):
+            b.advance(1000).position()
+        self.last_fix = b.t
+        b.advance(10 * 60 * 1000).position()
+        return b
+
+    def test_a_ten_minute_gap_fires_the_stall_rule_on_time(self):
+        watch = self.replay(self.stationary_then_silent())
+        hits = self.find(watch, "stalled-progress")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        due = self.anchor + ride_watch.STALL_MS
+        self.assertGreaterEqual(hits[0]["tsMs"], due)
+        self.assertLessEqual(hits[0]["tsMs"], due + self.TICK_MS)
+        self.assertIn("stationary 15m", hits[0]["summary"])
+
+    def test_the_gap_is_reported_with_its_own_length(self):
+        watch = self.replay(self.stationary_then_silent())
+        hits = self.find(watch, "gps-gap")
+        self.assertEqual(len(hits), 1, self.rules(watch))
+        due = self.last_fix + ride_watch.GPS_GAP_MS
+        self.assertGreater(hits[0]["tsMs"], due)
+        self.assertLessEqual(hits[0]["tsMs"], due + self.TICK_MS)
+        secs = int(re.search(r"no GPS fix for (\d+)s",
+                             hits[0]["summary"]).group(1))
+        self.assertTrue(60 <= secs <= 65, hits[0]["summary"])
+
+    def test_an_arrival_closes_on_time_while_the_phone_sleeps(self):
+        b = StreamBuilder().start().advance(1000).progress(leg=2, prog=99.0)
+        b.advance(1000).position().action("SET_ARRIVED")
+        arrived = b.t
+        b.advance(48 * 60 * 1000).position()    # the phone slept 48 min
+        watch = self.replay(b)
+        trip = watch.ended_trips[0]
+        self.assertEqual(trip.end_reason, "arrived")
+        self.assertLessEqual(trip.end_ms - arrived,
+                             ride_watch.ARRIVED_END_MS + self.TICK_MS)
+        late = self.find(watch, "arrived-never-ended")
+        self.assertEqual(len(late), 1)
+        self.assertLessEqual(late[0]["tsMs"] - arrived,
+                             ride_watch.ARRIVED_NEVER_ENDED_MS + self.TICK_MS)
+
+    def test_a_long_gap_is_walked_only_so_far(self):
+        b = StreamBuilder().progress(leg=0, prog=1.0)
+        b.advance(3 * 24 * 3600 * 1000).progress(leg=0, prog=1.0)
+        watch = quiet_watch(self.tmp)
+        calls = []
+        real = watch.check_timers
+        watch.check_timers = lambda: calls.append(1) or real()
+        path = os.path.join(self.tmp, "day.jsonl")
+        with open(path, "w") as f:
+            for ev in b.events:
+                f.write(json.dumps(ev) + "\n")
+        run_replay(path, watch=watch)
+        self.assertLessEqual(
+            len(calls), ride_watch.REPLAY_TICK_SPAN_MAX_MS
+            // ride_watch.LIVE_TICK_MS + 10)
+
+    def test_a_late_record_never_moves_the_clock_back(self):
+        b = StreamBuilder().progress(leg=0, prog=1.0)
+        b.advance(600000).progress(leg=0, prog=1.0)
+        b.advance(-300000).progress(leg=0, prog=1.0)
+        watch = self.replay(b)
+        self.assertEqual(watch.clock_ms, T0 + 600000)
+
+
+# --- 75.26b: a replayed day file is judged on the ride's clock --------------
+
+class TestReplaySourcedPositions(RuleTestCase):
+    """75.26b. A browser replay writes the ride again at 6-12x: entry `t`
+    is wall time, and each fix carries `source: 'replay'` and the simulated
+    clock in `timestamp` (otprr createMockPosition). The daemon read neither,
+    so the 10-28 sweep file filed 14 `position-teleport` ("263 m in 1.1 s"
+    was 8 sim-seconds) and 162 `action-storm` findings, all compression."""
+
+    def replay_fix(self, b, metres, sim_ms, source="replay"):
+        return b.action("UPDATE_POSITION", {
+            "coords": {"latitude": b.LAT + metres * 9.0e-6,
+                       "longitude": b.LON, "accuracy": 10.0},
+            "source": source, "timestamp": sim_ms})
+
+    def test_a_compressed_replay_is_not_a_teleport(self):
+        """263 m per fix, 1.1 s of wall time apart, 8 s of the ride's."""
+        b = StreamBuilder().start().advance(1000).progress()
+        sim = T0 - 15 * 24 * 3600 * 1000        # the ride was two weeks ago
+        for i in range(8):
+            b.advance(1100)
+            self.replay_fix(b, 263 * i, sim + 8000 * i)
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "position-teleport"), [])
+
+    def test_a_two_track_stream_in_a_replay_is_still_caught(self):
+        """Judged on the fix's own clock, a recorded two-stream defect
+        (09-17 `mu63yfrb-ekv1fl`: two tracks 200-310 m apart, 1 Hz) is
+        still a teleport when it is replayed at 8x."""
+        b = StreamBuilder().start().advance(1000).progress()
+        sim = T0 - 15 * 24 * 3600 * 1000
+        for i in range(4):                      # three jumps: one warn
+            b.advance(125)
+            self.replay_fix(b, 250 * (i % 2), sim + 1000 * i)
+        watch = self.run_stream(b)
+        hits = self.find(watch, "position-teleport")
+        self.assertEqual(len(hits), 1)
+        self.assertIn("fix timestamp", hits[0]["context"]["clock"])
+
+    def test_a_replayed_session_files_no_action_storm(self):
+        b = StreamBuilder().start().advance(1000).progress()
+        self.replay_fix(b, 0, T0 - 3600 * 1000)
+        for _ in range(60):
+            b.advance(100).action("UPDATE_SIMULATION_PROGRESS")
+        watch = self.run_stream(b)
+        self.assertEqual(self.find(watch, "action-storm"), [])
+
+    def test_a_real_phone_still_storms(self):
+        b = StreamBuilder().start().advance(1000).progress()
+        b.position()
+        for _ in range(60):
+            b.advance(100).action("UPDATE_SIMULATION_PROGRESS")
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "action-storm")), 1)
+
+    def test_a_real_phones_teleport_is_still_judged_on_t(self):
+        """Only a simulated source changes the clock: a native fix whose
+        `timestamp` is far behind its `t` is still judged on `t`."""
+        b = StreamBuilder().start().advance(1000).progress()
+        for i in range(4):
+            b.advance(1000)
+            self.replay_fix(b, 250 * (i % 2), T0 - 3600 * 1000 + 8000 * i,
+                            source="native")
+        watch = self.run_stream(b)
+        self.assertEqual(len(self.find(watch, "position-teleport")), 1)
+
+
 class TestBikeEgressMissing(RuleTestCase):
     """4.1, rider-caught on the bus: "search from here never shows bike egress
     and ride to destination".
