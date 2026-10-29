@@ -64,7 +64,7 @@ That is exactly how the crash beacons, the `bundle_health` verdict and the
 
 | rule | fires when | severity |
 | --- | --- | --- |
-| `stop-count-collapse` | `stopsRemaining` drops to 1 below 60% of a transit leg **and more than 100 m from the stop the count says was just passed** (the percentage alone when the leg carries no stop coordinates) | page |
+| `stop-count-collapse` | `stopsRemaining` drops to 1 below 60% of a transit leg **and more than 100 m from the stop the count says was just passed** (the percentage alone when the leg carries no stop coordinates). The first count after the rider's own onboard pick (`CLEAR_ONBOARD` → `START_GO_MODE`) of a one-stop leg they are on is a new baseline; the app's own re-plan never is (22.3) | page |
 | `stop-count-increase` | `stopsRemaining` rises with no itinerary swap | warn |
 | `aboard-swap` | itinerary replaced while `SET_RIDING` is held, no rider action nearby, and the new plan neither keeps the same routes arriving at the same time **nor lands the rider on the trip they are riding** | page |
 | `riding-flip` | `SET_RIDING` tripId changes on the same transit leg | page |
@@ -1314,12 +1314,17 @@ page ranking (supersession inside the window, tie-breaking, flush on a quiet log
 flush on trip end).
 
 Three suites replay real telemetry, because a rule that only works on synthetic
-data does not work:
+data does not work. They read `~/otp-debug-logs/debug-<date>.jsonl`, or the
+`.jsonl.gz` that `scripts/prune-debug-logs.sh` leaves after 3 days (inflated
+once per run into a temp dir), then the same names in any directory listed in
+`RIDE_WATCH_REAL_LOGS` — the prune deletes a `.gz` after 90 days, and 7/29 went
+on 2026-10-29. A day found in neither form is named on stderr when the suite
+loads: its tests skip, and a skip is not a pass (75.27).
 
-- `TestRealIncidentReplay` (7/29) — the 17:28 incident is caught, the four
+- `TestRealIncidentReplay` (7/29) — the 17:28 incident is caught, the three
   page-worthy findings in those eight seconds cost the rider exactly one
   interrupt, the one they get is `stop-count-collapse`, and the two progress
-  teleports (17:05, 17:20) are flagged.
+  jumps (17:05, 17:20) are left alone: both ticks are `deviated` (26.8).
 - `TestPanelTornDown.test_the_real_1504_ride_reports_all_three` (9/4) — the
   three settings teardowns of session `mtndpstb-m2vpey` collapse to one `warn`
   with `count: 3`, spanning both sides of `START_GO_MODE`, costing no page.
